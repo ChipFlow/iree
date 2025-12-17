@@ -13,7 +13,7 @@ pjrt_platform=$1
 if [ -z "${pjrt_platform}" ]; then
     set +x
     echo "Usage: run_jax_tests.sh <pjrt_platform>"
-    echo "  <pjrt_platform> can be 'cpu', 'cuda', 'rocm' or 'vulkan'"
+    echo "  <pjrt_platform> can be 'cpu', 'cuda', 'rocm', 'vulkan' or 'metal'"
     exit 1
 fi
 
@@ -52,6 +52,12 @@ diff_jax_test test/test_simple.py
 # This test verifies the sdy dialect can be deserialized and stripped
 echo "Testing Shardy dialect support..."
 JAX_PLATFORMS=$actual_jax_platform python test/test_shardy.py
+
+# Platform-specific tests
+if [ "${pjrt_platform}" = "metal" ]; then
+    echo "Running Metal-specific tests..."
+    JAX_PLATFORMS=$actual_jax_platform python test/test_metal.py
+fi
 
 # here we test if the compile options is passed to IREE PJRT plugin successfully.
 # we pass --iree-scheduling-dump-statistics-format=csv via jax.jit,
