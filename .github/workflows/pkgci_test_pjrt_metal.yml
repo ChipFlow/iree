@@ -75,10 +75,10 @@ jobs:
         with:
           path: |
             integrations/pjrt/python_packages/iree_metal_plugin/build
-          # v10: build compiler shared lib during pip install
-          key: cmake-pjrt-metal-v10-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
+          # v11: use pip iree-base-compiler instead of building from source
+          key: cmake-pjrt-metal-v11-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
           restore-keys: |
-            cmake-pjrt-metal-v10-${{ runner.os }}-${{ runner.arch }}-
+            cmake-pjrt-metal-v11-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Clean stale CMake cache if needed
         run: |
@@ -97,8 +97,9 @@ jobs:
           python -m venv ${VENV_DIR}
           source ${VENV_DIR}/bin/activate
           pip install -r runtime/bindings/python/iree/runtime/build_requirements.txt
-          # Don't install pip iree-base-compiler - we build compiler from source
-          # so the runtime uses a compatible version
+          # Install iree-base-compiler from pip for the libIREECompiler.dylib
+          # Building it from source requires Shardy tablegen which isn't built by PJRT
+          pip install iree-base-compiler
           pip install numpy jax jaxlib
 
       - name: Build and install Metal PJRT plugin
@@ -125,31 +126,15 @@ jobs:
           # This builds the compiler from source for version compatibility
           pip install -v --no-deps integrations/pjrt/python_packages/iree_metal_plugin
 
-      - name: Find compiler library
-        id: find-compiler
-        run: |
-          cd integrations/pjrt
-          echo "Searching for compiler library..."
-          find python_packages/iree_metal_plugin/build -name "libIREECompiler*" -o -name "IREECompiler*" 2>/dev/null || true
-          find python_packages/iree_metal_plugin/build -name "*.dylib" 2>/dev/null || true
-          COMPILER_LIB=$(find python_packages/iree_metal_plugin/build -name "libIREECompiler.dylib" 2>/dev/null | head -1)
-          echo "compiler_lib=$COMPILER_LIB" >> $GITHUB_OUTPUT
-          if [ -n "$COMPILER_LIB" ]; then
-            echo "Found compiler library: $COMPILER_LIB"
-          else
-            echo "WARNING: Compiler library not found in build dir"
-          fi
-
       - name: Run Metal PJRT tests
-        env:
-          IREE_PJRT_COMPILER_LIB_PATH: ${{ steps.find-compiler.outputs.compiler_lib }}
         run: |
           source ${VENV_DIR}/bin/activate
           cd integrations/pjrt
 
           # Show where the PJRT plugin was installed
           python -c "import iree._pjrt_libs.metal as m; import os; print(f'Metal PJRT plugin: {os.path.dirname(m.__file__)}')"
-          echo "IREE_PJRT_COMPILER_LIB_PATH=${IREE_PJRT_COMPILER_LIB_PATH}"
+          # Verify iree.compiler is available (from pip package)
+          python -c "from iree.compiler.api import ctypes_dl; print(f'Compiler lib: {ctypes_dl._probe_iree_compiler_dylib()}')"
 
           echo "Running Metal-specific tests..."
           JAX_PLATFORMS=iree_metal python test/test_metal.py
@@ -157,8 +142,6 @@ jobs:
           JAX_PLATFORMS=iree_metal python test/test_shardy.py
 
       - name: Run differential tests vs CPU
-        env:
-          IREE_PJRT_COMPILER_LIB_PATH: ${{ steps.find-compiler.outputs.compiler_lib }}
         run: |
           source ${VENV_DIR}/bin/activate
           cd integrations/pjrt
@@ -190,8 +173,6 @@ jobs:
           pip install pytest absl-py hypothesis
 
       - name: Run JAX test suite
-        env:
-          IREE_PJRT_COMPILER_LIB_PATH: ${{ steps.find-compiler.outputs.compiler_lib }}
         run: |
           source ${VENV_DIR}/bin/activate
           cd integrations/pjrt
