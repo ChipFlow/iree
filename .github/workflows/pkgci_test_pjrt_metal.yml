@@ -71,6 +71,9 @@ jobs:
           python -m venv ${VENV_DIR}
           source ${VENV_DIR}/bin/activate
           pip install -r runtime/bindings/python/iree/runtime/build_requirements.txt
+          # Install iree-compiler for Python bindings (probe_iree_compiler_dylib)
+          # We'll override the actual compiler path with IREE_PJRT_COMPILER_LIB_PATH
+          pip install iree-compiler
           pip install numpy jax jaxlib
 
       - name: Build and install Metal PJRT plugin
@@ -79,7 +82,8 @@ jobs:
           export CMAKE_C_COMPILER_LAUNCHER=ccache
           export CMAKE_CXX_COMPILER_LAUNCHER=ccache
           # Set architecture to arm64 to prevent x86 SSE flags being applied by abseil
-          export CMAKE_ARGS="-DCMAKE_OSX_ARCHITECTURES=arm64"
+          # The setup script reads this env var directly (line 194 of iree_pjrt_setup.py)
+          export CMAKE_OSX_ARCHITECTURES=arm64
           # Build and install the PJRT plugin with Metal support
           # Use regular install (not editable) to ensure CMake build is triggered
           pip install -v --no-deps integrations/pjrt/python_packages/iree_metal_plugin
