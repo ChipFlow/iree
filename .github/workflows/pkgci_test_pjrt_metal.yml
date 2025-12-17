@@ -72,10 +72,10 @@ jobs:
         with:
           path: |
             integrations/pjrt/python_packages/iree_metal_plugin/build
-          # v8: full compiler build with shared libs
-          key: cmake-pjrt-metal-v8-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
+          # v9: explicitly build compiler shared library
+          key: cmake-pjrt-metal-v9-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
           restore-keys: |
-            cmake-pjrt-metal-v8-${{ runner.os }}-${{ runner.arch }}-
+            cmake-pjrt-metal-v9-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Clean stale CMake cache if needed
         run: |
@@ -105,13 +105,37 @@ jobs:
           # Set architecture to arm64 to prevent x86 SSE flags being applied by abseil
           CMAKE_OSX_ARCHITECTURES: arm64
           CMAKE_SYSTEM_PROCESSOR: arm64
+          # Workaround for protobuf-bundled abseil adding x86 SIMD flags on ARM64
+          # The flags are unused but cause errors on macOS 15's stricter Clang
+          # Set via both CFLAGS/CXXFLAGS and CMAKE_*_FLAGS for maximum coverage
+          CFLAGS: "-Wno-unused-command-line-argument"
+          CXXFLAGS: "-Wno-unused-command-line-argument"
+          CMAKE_C_FLAGS: "-Wno-unused-command-line-argument"
+          CMAKE_CXX_FLAGS: "-Wno-unused-command-line-argument"
         run: |
           source ${VENV_DIR}/bin/activate
           echo "CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
           echo "CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}"
+          echo "CMAKE_C_FLAGS=${CMAKE_C_FLAGS}"
+          echo "CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}"
           # Build and install the PJRT plugin with Metal support
           # This builds the compiler from source for version compatibility
           pip install -v --no-deps integrations/pjrt/python_packages/iree_metal_plugin
+
+      - name: Build compiler shared library
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+          CFLAGS: "-Wno-unused-command-line-argument"
+          CXXFLAGS: "-Wno-unused-command-line-argument"
+        run: |
+          # The PJRT plugin loads the compiler library at runtime
+          # We need to explicitly build it since EXCLUDE_FROM_ALL excludes it
+          cd integrations/pjrt/python_packages/iree_metal_plugin/build/cmake
+          echo "Building iree_compiler_API_SharedImpl target..."
+          cmake --build . --target iree_compiler_API_SharedImpl
+          echo "Build complete, searching for library..."
+          find . -name "libIREECompiler*" -type f 2>/dev/null || true
 
       - name: Find compiler library
         id: find-compiler

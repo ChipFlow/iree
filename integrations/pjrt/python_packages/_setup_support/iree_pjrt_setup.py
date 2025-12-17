@@ -208,6 +208,11 @@ class BaseCMakeBuildPy(_build_py):
         add_env_cmake_setting(cmake_args, "CMAKE_C_COMPILER_LAUNCHER")
         add_env_cmake_setting(cmake_args, "CMAKE_CXX_COMPILER_LAUNCHER")
 
+        # Allow passing additional compiler flags (e.g., -Wno-unused-command-line-argument
+        # to work around protobuf-bundled abseil adding x86 SIMD flags on ARM64)
+        add_env_cmake_setting(cmake_args, "CMAKE_C_FLAGS")
+        add_env_cmake_setting(cmake_args, "CMAKE_CXX_FLAGS")
+
         # Only do a from-scratch configure if not already configured.
         cmake_cache_file = os.path.join(cmake_build_dir, "CMakeCache.txt")
         if not os.path.exists(cmake_cache_file):
