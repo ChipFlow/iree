@@ -196,6 +196,9 @@ class BaseCMakeBuildPy(_build_py):
         add_env_cmake_setting(
             cmake_args, "MACOSX_DEPLOYMENT_TARGET", "CMAKE_OSX_DEPLOYMENT_TARGET"
         )
+        # Force target processor for arm64 builds to prevent abseil/protobuf
+        # from enabling x86 SIMD intrinsics
+        add_env_cmake_setting(cmake_args, "CMAKE_SYSTEM_PROCESSOR")
 
         add_env_cmake_setting(cmake_args, "CMAKE_C_COMPILER_LAUNCHER")
         add_env_cmake_setting(cmake_args, "CMAKE_CXX_COMPILER_LAUNCHER")

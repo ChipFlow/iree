@@ -72,10 +72,10 @@ jobs:
         with:
           path: |
             integrations/pjrt/python_packages/iree_metal_plugin/build
-          # v5: arm64 build, runtime-only (no compiler from source)
-          key: cmake-pjrt-metal-v5-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
+          # v6: full compiler build, arm64 with CMAKE_SYSTEM_PROCESSOR fix
+          key: cmake-pjrt-metal-v6-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
           restore-keys: |
-            cmake-pjrt-metal-v5-${{ runner.os }}-${{ runner.arch }}-
+            cmake-pjrt-metal-v6-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Clean stale CMake cache if needed
         run: |
@@ -94,9 +94,8 @@ jobs:
           python -m venv ${VENV_DIR}
           source ${VENV_DIR}/bin/activate
           pip install -r runtime/bindings/python/iree/runtime/build_requirements.txt
-          # Install iree-base-compiler for the compiler library
-          # Note: Full Shardy support requires building compiler from source (future work)
-          pip install 'iree-base-compiler>=3.9.0'
+          # Don't install pip iree-base-compiler - we build compiler from source
+          # so the runtime uses a compatible version
           pip install numpy jax jaxlib
 
       - name: Build and install Metal PJRT plugin
@@ -105,14 +104,13 @@ jobs:
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
           # Set architecture to arm64 to prevent x86 SSE flags being applied by abseil
           CMAKE_OSX_ARCHITECTURES: arm64
-          # Don't build compiler from source - use pip iree-base-compiler instead
-          # This ensures runtime/compiler API version compatibility
-          IREE_BUILD_COMPILER: "OFF"
+          CMAKE_SYSTEM_PROCESSOR: arm64
         run: |
           source ${VENV_DIR}/bin/activate
           echo "CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
-          echo "IREE_BUILD_COMPILER=${IREE_BUILD_COMPILER}"
-          # Build and install the PJRT plugin with Metal support (runtime only)
+          echo "CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}"
+          # Build and install the PJRT plugin with Metal support
+          # This builds the compiler from source for version compatibility
           pip install -v --no-deps integrations/pjrt/python_packages/iree_metal_plugin
 
       - name: Run Metal PJRT tests
@@ -120,13 +118,13 @@ jobs:
           source ${VENV_DIR}/bin/activate
           cd integrations/pjrt
 
-          # Verify iree-base-compiler is installed (provides libIREECompiler.dylib)
-          python -c "import iree.compiler; print(f'Using IREE compiler from: {iree.compiler.__file__}')"
+          # Show where the PJRT plugin was installed
+          python -c "import iree._pjrt_libs.metal as m; import os; print(f'Metal PJRT plugin: {os.path.dirname(m.__file__)}')"
+          # Show the built compiler library
+          find python_packages/iree_metal_plugin/build -name "libIREECompiler.dylib" 2>/dev/null || echo "Compiler library not found in build dir"
 
           echo "Running Metal-specific tests..."
           JAX_PLATFORMS=iree_metal python test/test_metal.py
-          # Note: test_shardy.py tests basic JAX ops; full Shardy dialect support
-          # requires building compiler from source (future work)
           echo "Running Shardy dialect tests..."
           JAX_PLATFORMS=iree_metal python test/test_shardy.py
 
