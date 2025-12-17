@@ -179,6 +179,8 @@ class BaseCMakeBuildPy(_build_py):
             "--log-level=VERBOSE",
             # IREE_BUILD_COMPILER can be set via environment to OFF to use pip compiler
             get_env_cmake_option("IREE_BUILD_COMPILER", default_value=True),
+            # Build compiler as shared library (libIREECompiler.dylib) for runtime use
+            get_env_cmake_option("IREE_BUILD_COMPILER_SHARED_LIBS", default_value=True),
             "-DIREE_BUILD_SAMPLES=OFF",
             "-DIREE_BUILD_TESTS=OFF",
             "-DIREE_HAL_DRIVER_DEFAULTS=OFF",

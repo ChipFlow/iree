@@ -72,10 +72,10 @@ jobs:
         with:
           path: |
             integrations/pjrt/python_packages/iree_metal_plugin/build
-          # v7: full compiler build, arm64 with abseil SSE fix
-          key: cmake-pjrt-metal-v7-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
+          # v8: full compiler build with shared libs
+          key: cmake-pjrt-metal-v8-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
           restore-keys: |
-            cmake-pjrt-metal-v7-${{ runner.os }}-${{ runner.arch }}-
+            cmake-pjrt-metal-v8-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Clean stale CMake cache if needed
         run: |
