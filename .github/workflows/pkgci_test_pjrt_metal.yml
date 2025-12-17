@@ -68,7 +68,7 @@ jobs:
           max-size: 2G
 
       - name: Cache CMake build directory
-        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+        uses: actions/cache@v4
         with:
           path: |
             integrations/pjrt/python_packages/iree_metal_plugin/build
