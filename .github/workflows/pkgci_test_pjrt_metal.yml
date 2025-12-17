@@ -72,9 +72,10 @@ jobs:
         with:
           path: |
             integrations/pjrt/python_packages/iree_metal_plugin/build
-          key: cmake-metal-${{ matrix.runner }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**', 'third_party/llvm-project/llvm/CMakeLists.txt') }}
+          # Include 'arm64-v2' in key to invalidate old caches without CMAKE_OSX_ARCHITECTURES
+          key: cmake-metal-${{ matrix.runner }}-arm64-v2-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**', 'third_party/llvm-project/llvm/CMakeLists.txt') }}
           restore-keys: |
-            cmake-metal-${{ matrix.runner }}-
+            cmake-metal-${{ matrix.runner }}-arm64-v2-
 
       - name: Setup venv and install dependencies
         run: |
