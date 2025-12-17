@@ -26,8 +26,11 @@ jobs:
         include:
           - runner: macos-14
             name: macOS 14 (ARM64)
-          - runner: macos-15
-            name: macOS 15 (ARM64)
+          # TODO: Re-enable macOS 15 once abseil SSE4.1 flag issue is fixed
+          # The protobuf-bundled abseil incorrectly emits -msse4.1 without
+          # proper -Xarch_x86_64 prefix on macOS 15's stricter Clang 17
+          # - runner: macos-15
+          #   name: macOS 15 (ARM64)
     name: Metal PJRT - ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     env:
@@ -72,10 +75,10 @@ jobs:
         with:
           path: |
             integrations/pjrt/python_packages/iree_metal_plugin/build
-          # v9: explicitly build compiler shared library
-          key: cmake-pjrt-metal-v9-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
+          # v10: build compiler shared lib during pip install
+          key: cmake-pjrt-metal-v10-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
           restore-keys: |
-            cmake-pjrt-metal-v9-${{ runner.os }}-${{ runner.arch }}-
+            cmake-pjrt-metal-v10-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Clean stale CMake cache if needed
         run: |
@@ -121,21 +124,6 @@ jobs:
           # Build and install the PJRT plugin with Metal support
           # This builds the compiler from source for version compatibility
           pip install -v --no-deps integrations/pjrt/python_packages/iree_metal_plugin
-
-      - name: Build compiler shared library
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: ccache
-          CMAKE_CXX_COMPILER_LAUNCHER: ccache
-          CFLAGS: "-Wno-unused-command-line-argument"
-          CXXFLAGS: "-Wno-unused-command-line-argument"
-        run: |
-          # The PJRT plugin loads the compiler library at runtime
-          # We need to explicitly build it since EXCLUDE_FROM_ALL excludes it
-          cd integrations/pjrt/python_packages/iree_metal_plugin/build/cmake
-          echo "Building iree_compiler_API_SharedImpl target..."
-          cmake --build . --target iree_compiler_API_SharedImpl
-          echo "Build complete, searching for library..."
-          find . -name "libIREECompiler*" -type f 2>/dev/null || true
 
       - name: Find compiler library
         id: find-compiler

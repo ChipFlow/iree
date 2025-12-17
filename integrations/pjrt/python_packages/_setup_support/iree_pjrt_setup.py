@@ -227,3 +227,18 @@ class BaseCMakeBuildPy(_build_py):
         # so as to avoid fragility with more targeted selection criteria.
         subprocess.check_call(["cmake", "--build", "."], cwd=cmake_build_dir)
         print("Build complete.", file=sys.stderr)
+
+        # Also build the compiler shared library (libIREECompiler.dylib/so)
+        # This is needed by PJRT plugins at runtime for JIT compilation
+        # The target is excluded by EXCLUDE_FROM_ALL so we build it explicitly
+        print("Building compiler shared library...", file=sys.stderr)
+        try:
+            subprocess.check_call(
+                ["cmake", "--build", ".", "--target", "iree_compiler_API_SharedImpl"],
+                cwd=cmake_build_dir,
+            )
+            print("Compiler shared library built.", file=sys.stderr)
+        except subprocess.CalledProcessError:
+            print("WARNING: Failed to build compiler shared library. "
+                  "PJRT plugin may not work without iree-base-compiler pip package.",
+                  file=sys.stderr)
