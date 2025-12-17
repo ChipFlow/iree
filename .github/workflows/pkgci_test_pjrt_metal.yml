@@ -110,6 +110,54 @@ jobs:
             echo "PASS: ${test}"
           done
 
+      - name: Clone JAX repository for test suite
+        run: |
+          git clone --depth=1 https://github.com/jax-ml/jax.git /tmp/jax
+          echo "JAX version: $(cat /tmp/jax/jax/version.py | grep __version__)"
+
+      - name: Install JAX test dependencies
+        run: |
+          source ${VENV_DIR}/bin/activate
+          pip install pytest absl-py hypothesis
+
+      - name: Run JAX test suite
+        run: |
+          source ${VENV_DIR}/bin/activate
+          cd integrations/pjrt
+
+          # Run a subset of JAX tests against IREE Metal
+          # Start with basic tests, expand as coverage improves
+          echo "Running JAX test suite against IREE Metal..."
+          JAX_PLATFORMS=iree_metal python test/test_jax.py \
+            /tmp/jax/tests/lax_test.py \
+            -j 4 \
+            -t 120 \
+            -l /tmp/jaxtest \
+            -e test/metal_expected_passing.txt \
+            -p /tmp/metal_passing.txt \
+            -f /tmp/metal_failing.txt || true
+
+          # Report results (don't fail CI yet - baseline is being established)
+          echo ""
+          echo "=== JAX Test Suite Results ==="
+          if [ -f /tmp/metal_passing.txt ]; then
+            echo "Passing tests: $(wc -l < /tmp/metal_passing.txt)"
+          fi
+          if [ -f /tmp/metal_failing.txt ]; then
+            echo "Failing tests: $(wc -l < /tmp/metal_failing.txt)"
+          fi
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: jax-test-results-${{ matrix.runner }}
+          path: |
+            /tmp/jaxtest/
+            /tmp/metal_passing.txt
+            /tmp/metal_failing.txt
+          retention-days: 7
+
       - name: Post to Discord on Failure
         uses: sarisia/actions-status-discord@b8381b25576cb341b2af39926ab42c5056cc44ed # v1.15.5
         if: failure() && github.ref_name == 'main' && github.repository_owner == 'iree-org'

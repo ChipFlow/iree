@@ -9,11 +9,13 @@
 set -xeo pipefail
 
 pjrt_platform=$1
+run_mode=$2
 
 if [ -z "${pjrt_platform}" ]; then
     set +x
-    echo "Usage: run_jax_tests.sh <pjrt_platform>"
+    echo "Usage: run_jax_tests.sh <pjrt_platform> [--full-suite]"
     echo "  <pjrt_platform> can be 'cpu', 'cuda', 'rocm', 'vulkan' or 'metal'"
+    echo "  --full-suite: Run full JAX test suite (requires JAX_TEST_DIR env var)"
     exit 1
 fi
 
@@ -67,11 +69,46 @@ JAX_PLATFORMS=$actual_jax_platform python test/test_compile_options.py 2>&1 | te
 cat $compile_options_test_tmp_out | grep '@main_dispatch'
 
 
-# FIXME: we can also utilize the native test cases from JAX,
-# e.g. `tests/nn_test.py` from the JAX repo, as below,
-# but currently some test cases in this file will fail.
-# NOTE that `absl-py` is required to run these tests.
+# Full JAX test suite mode
+if [ "${run_mode}" = "--full-suite" ]; then
+    if [ -z "${JAX_TEST_DIR}" ]; then
+        echo "ERROR: JAX_TEST_DIR environment variable must be set for --full-suite mode"
+        echo "Example: JAX_TEST_DIR=/path/to/jax/tests ./run_jax_tests.sh metal --full-suite"
+        exit 1
+    fi
 
-# local jax_nn_test_file=$(mktemp /tmp/jax_nn_test.XXXXXX.py)
-# wget https://github.com/jax-ml/jax/blob/jax-v0.4.20/tests/nn_test.py -O $jax_nn_test_file
-# JAX_PLATFORMS=$actual_jax_platform python $jax_nn_test_file
+    echo "Running full JAX test suite from ${JAX_TEST_DIR}..."
+
+    # Configuration
+    JOBS=${JOBS:-4}
+    TIMEOUT=${TIMEOUT:-120}
+    LOG_DIR=${LOG_DIR:-/tmp/jaxtest}
+    EXPECTED_FILE="test/${pjrt_platform}_expected_passing.txt"
+    PASSING_FILE="${LOG_DIR}/${pjrt_platform}_passing.txt"
+    FAILING_FILE="${LOG_DIR}/${pjrt_platform}_failing.txt"
+
+    # Default test files - core JAX tests most likely to work
+    TEST_FILES="${JAX_TEST_FILES:-${JAX_TEST_DIR}/lax_test.py}"
+
+    echo "Test configuration:"
+    echo "  Platform: ${actual_jax_platform}"
+    echo "  Jobs: ${JOBS}"
+    echo "  Timeout: ${TIMEOUT}s"
+    echo "  Test files: ${TEST_FILES}"
+
+    # Run tests with expected results comparison
+    JAX_PLATFORMS=${actual_jax_platform} python test/test_jax.py \
+        ${TEST_FILES} \
+        -j ${JOBS} \
+        -t ${TIMEOUT} \
+        -l ${LOG_DIR} \
+        -e ${EXPECTED_FILE} \
+        -p ${PASSING_FILE} \
+        -f ${FAILING_FILE}
+
+    echo ""
+    echo "=== Test Results ==="
+    echo "Passing: $(wc -l < ${PASSING_FILE} 2>/dev/null || echo 0)"
+    echo "Failing: $(wc -l < ${FAILING_FILE} 2>/dev/null || echo 0)"
+    echo "Log directory: ${LOG_DIR}"
+fi

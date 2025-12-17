@@ -1,0 +1,20 @@
+# IREE Metal PJRT Plugin - Expected Passing JAX Tests
+#
+# This file lists JAX tests that are expected to pass on the IREE Metal backend.
+# The test runner (test_jax.py) uses this as a baseline for regression detection:
+# - If an expected test fails, CI fails (regression)
+# - If a new test passes (not in this list), it's reported but CI passes
+#
+# To generate/update this file:
+# 1. Run test_jax.py with passing output:
+#    JAX_PLATFORMS=iree_metal python test/test_jax.py \
+#      /path/to/jax/tests/api_test.py \
+#      -j 4 -t 120 -p metal_expected_passing.txt
+#
+# 2. Review and commit the updated file
+#
+# Format: test_file.py::TestClass::test_method
+# Lines starting with # are comments
+
+# Initial baseline - to be populated after first successful test run
+# Start with empty baseline to bootstrap, then add passing tests incrementally
