@@ -87,15 +87,15 @@ jobs:
           pip install numpy jax jaxlib
 
       - name: Build and install Metal PJRT plugin
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+          # Set architecture to arm64 to prevent x86 SSE flags being applied by abseil
+          CMAKE_OSX_ARCHITECTURES: arm64
         run: |
           source ${VENV_DIR}/bin/activate
-          export CMAKE_C_COMPILER_LAUNCHER=ccache
-          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
-          # Set architecture to arm64 to prevent x86 SSE flags being applied by abseil
-          # The setup script reads this env var directly (line 194 of iree_pjrt_setup.py)
-          export CMAKE_OSX_ARCHITECTURES=arm64
+          echo "CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
           # Build and install the PJRT plugin with Metal support
-          # Use regular install (not editable) to ensure CMake build is triggered
           pip install -v --no-deps integrations/pjrt/python_packages/iree_metal_plugin
 
       - name: Run Metal PJRT tests
