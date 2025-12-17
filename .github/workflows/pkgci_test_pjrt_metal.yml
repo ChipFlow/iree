@@ -71,6 +71,8 @@ jobs:
           python -m venv ${VENV_DIR}
           source ${VENV_DIR}/bin/activate
           pip install -r runtime/bindings/python/iree/runtime/build_requirements.txt
+          # Install IREE compiler and runtime (required by PJRT plugin)
+          pip install iree-compiler iree-runtime
           pip install numpy jax jaxlib
 
       - name: Build and install Metal PJRT plugin
@@ -78,8 +80,9 @@ jobs:
           source ${VENV_DIR}/bin/activate
           export CMAKE_C_COMPILER_LAUNCHER=ccache
           export CMAKE_CXX_COMPILER_LAUNCHER=ccache
-          # The pip install will build the PJRT plugin with Metal support
-          pip install -v --no-deps -e integrations/pjrt/python_packages/iree_metal_plugin
+          # Build and install the PJRT plugin with Metal support
+          # Use regular install (not editable) to ensure CMake build is triggered
+          pip install -v --no-deps integrations/pjrt/python_packages/iree_metal_plugin
 
       - name: Run Metal PJRT tests
         run: |
