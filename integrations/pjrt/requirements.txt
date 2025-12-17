@@ -1,5 +1,7 @@
 -f https://iree.dev/pip-release-links.html
 -f https://storage.googleapis.com/jax-releases/jaxlib_nightly_releases.html
 # Note: iree-base-compiler version should be kept in sync with IREE source version
-iree-base-compiler>=3.9.0
-jaxlib>=0.4.35
+# These pins are used for install_requires (pip install of the plugin)
+# CI builds compiler from source and uses --no-deps
+iree-base-compiler==3.9.0
+jaxlib==0.4.35
