@@ -16,7 +16,7 @@ on:
       write-caches:
         required: false
         type: string
-        default: "0"
+        default: "1"  # Enable cache saving by default for manual runs
 
 jobs:
   build_and_test:
@@ -65,6 +65,16 @@ jobs:
         with:
           key: pjrt-metal-${{ matrix.runner }}
           save: ${{ inputs.write-caches == '1' }}
+          max-size: 2G
+
+      - name: Cache CMake build directory
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+        with:
+          path: |
+            integrations/pjrt/python_packages/iree_metal_plugin/build
+          key: cmake-metal-${{ matrix.runner }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**', 'third_party/llvm-project/llvm/CMakeLists.txt') }}
+          restore-keys: |
+            cmake-metal-${{ matrix.runner }}-
 
       - name: Setup venv and install dependencies
         run: |
