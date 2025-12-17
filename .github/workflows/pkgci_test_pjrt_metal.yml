@@ -1,0 +1,119 @@
+# Copyright 2025 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+name: PkgCI Test PJRT Metal plugin
+on:
+  workflow_call:
+    inputs:
+      write-caches:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      write-caches:
+        required: false
+        type: string
+        default: "0"
+
+jobs:
+  build_and_test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            name: macOS 14 (ARM64)
+          - runner: macos-15
+            name: macOS 15 (ARM64)
+    name: Metal PJRT - ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      VENV_DIR: ${{ github.workspace }}/.venv
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checking out repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          submodules: true
+
+      - name: Updating git submodules
+        run: git submodule update --init --jobs 8 --depth 1
+
+      # Select latest Xcode for Metal toolchain
+      - name: Update Xcode command line tools path
+        run: |
+          sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+          xcrun metal --version
+          xcrun metallib --version
+
+      - name: Setting up Python
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Installing requirements
+        run: brew install ninja ccache coreutils bash
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639 # v1.2.20
+        with:
+          key: pjrt-metal-${{ matrix.runner }}
+          save: ${{ inputs.write-caches == '1' }}
+
+      - name: Setup venv and install dependencies
+        run: |
+          python -m venv ${VENV_DIR}
+          source ${VENV_DIR}/bin/activate
+          pip install -r runtime/bindings/python/iree/runtime/build_requirements.txt
+          pip install numpy jax jaxlib
+
+      - name: Build and install Metal PJRT plugin
+        run: |
+          source ${VENV_DIR}/bin/activate
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          # The pip install will build the PJRT plugin with Metal support
+          pip install -v --no-deps -e integrations/pjrt/python_packages/iree_metal_plugin
+
+      - name: Run Metal PJRT tests
+        run: |
+          source ${VENV_DIR}/bin/activate
+          cd integrations/pjrt
+          echo "Running Metal-specific tests..."
+          JAX_PLATFORMS=iree_metal python test/test_metal.py
+          echo "Running Shardy dialect tests..."
+          JAX_PLATFORMS=iree_metal python test/test_shardy.py
+
+      - name: Run differential tests vs CPU
+        run: |
+          source ${VENV_DIR}/bin/activate
+          cd integrations/pjrt
+          # Compare Metal results with CPU baseline
+          echo "Running differential tests (Metal vs CPU)..."
+
+          for test in test/test_add.py test/test_simple.py; do
+            echo "Testing ${test}..."
+            expected=$(JAX_PLATFORMS=cpu python ${test})
+            actual=$(JAX_PLATFORMS=iree_metal python ${test})
+            if [ "$expected" != "$actual" ]; then
+              echo "FAIL: Output mismatch for ${test}"
+              echo "Expected: $expected"
+              echo "Actual: $actual"
+              exit 1
+            fi
+            echo "PASS: ${test}"
+          done
+
+      - name: Post to Discord on Failure
+        uses: sarisia/actions-status-discord@b8381b25576cb341b2af39926ab42c5056cc44ed # v1.15.5
+        if: failure() && github.ref_name == 'main' && github.repository_owner == 'iree-org'
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          description: "The ${{ github.workflow }} workflow failed on ${{ matrix.name }}"
+          url: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}"
