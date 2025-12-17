@@ -72,10 +72,22 @@ jobs:
         with:
           path: |
             integrations/pjrt/python_packages/iree_metal_plugin/build
-          # v4: arm64 build with pip compiler (Shardy support is future work)
-          key: cmake-pjrt-metal-v4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
+          # v5: arm64 build, runtime-only (no compiler from source)
+          key: cmake-pjrt-metal-v5-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
           restore-keys: |
-            cmake-pjrt-metal-v4-${{ runner.os }}-${{ runner.arch }}-
+            cmake-pjrt-metal-v5-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Clean stale CMake cache if needed
+        run: |
+          CACHE_FILE="integrations/pjrt/python_packages/iree_metal_plugin/build/cmake/CMakeCache.txt"
+          if [ -f "$CACHE_FILE" ]; then
+            # Check if cache has wrong architecture setting
+            if grep -q "CMAKE_OSX_ARCHITECTURES:STRING=$" "$CACHE_FILE" 2>/dev/null; then
+              echo "Removing stale CMake cache with wrong architecture"
+              rm -rf integrations/pjrt/python_packages/iree_metal_plugin/build/cmake/CMakeCache.txt
+              rm -rf integrations/pjrt/python_packages/iree_metal_plugin/build/cmake/CMakeFiles
+            fi
+          fi
 
       - name: Setup venv and install dependencies
         run: |
@@ -93,10 +105,14 @@ jobs:
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
           # Set architecture to arm64 to prevent x86 SSE flags being applied by abseil
           CMAKE_OSX_ARCHITECTURES: arm64
+          # Don't build compiler from source - use pip iree-base-compiler instead
+          # This ensures runtime/compiler API version compatibility
+          IREE_BUILD_COMPILER: "OFF"
         run: |
           source ${VENV_DIR}/bin/activate
           echo "CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
-          # Build and install the PJRT plugin with Metal support
+          echo "IREE_BUILD_COMPILER=${IREE_BUILD_COMPILER}"
+          # Build and install the PJRT plugin with Metal support (runtime only)
           pip install -v --no-deps integrations/pjrt/python_packages/iree_metal_plugin
 
       - name: Run Metal PJRT tests

@@ -177,7 +177,8 @@ class BaseCMakeBuildPy(_build_py):
         cmake_args = [
             "-GNinja",
             "--log-level=VERBOSE",
-            "-DIREE_BUILD_COMPILER=ON",
+            # IREE_BUILD_COMPILER can be set via environment to OFF to use pip compiler
+            get_env_cmake_option("IREE_BUILD_COMPILER", default_value=True),
             "-DIREE_BUILD_SAMPLES=OFF",
             "-DIREE_BUILD_TESTS=OFF",
             "-DIREE_HAL_DRIVER_DEFAULTS=OFF",
