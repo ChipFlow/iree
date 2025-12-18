@@ -182,17 +182,20 @@ jobs:
           pip install pytest absl-py hypothesis
 
       - name: Run JAX test suite
+        timeout-minutes: 30  # Limit total test time to 30 minutes
         run: |
           source ${VENV_DIR}/bin/activate
           cd integrations/pjrt
 
           # Run a subset of JAX tests against IREE Metal
-          # Start with basic tests, expand as coverage improves
+          # Use shorter timeout (15s) since most tests either pass quickly or fail
+          # lax_test.py has thousands of tests - we sample what we can in 30 minutes
           echo "Running JAX test suite against IREE Metal..."
+          echo "Note: Using 15s timeout per test, 30 minute total limit"
           JAX_PLATFORMS=iree_metal python test/test_jax.py \
             /tmp/jax/tests/lax_test.py \
             -j 4 \
-            -t 120 \
+            -t 15 \
             -l /tmp/jaxtest \
             -e test/metal_expected_passing.txt \
             -p /tmp/metal_passing.txt \
