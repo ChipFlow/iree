@@ -187,9 +187,6 @@ class BaseCMakeBuildPy(_build_py):
             "-DPython3_EXECUTABLE={}".format(sys.executable),
             "-DPython_EXECUTABLE={}".format(sys.executable),
             "-DCMAKE_BUILD_TYPE={}".format(cfg),
-            # Disable abseil's hardware-specific flags that break on macOS ARM64
-            # The protobuf-bundled abseil incorrectly adds -msse4.1 without -Xarch_x86_64
-            "-DABSL_RANDOM_RANDEN_COPTS=",
         ] + list(extra_cmake_args)
         add_env_cmake_setting(cmake_args, "IREE_TRACING_PROVIDER")
         add_env_cmake_setting(cmake_args, "IREE_TRACING_PROVIDER_H")

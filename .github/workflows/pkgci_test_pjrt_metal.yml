@@ -26,11 +26,8 @@ jobs:
         include:
           - runner: macos-14
             name: macOS 14 (ARM64)
-          # TODO: Re-enable macOS 15 once abseil SSE4.1 flag issue is fixed
-          # The protobuf-bundled abseil incorrectly emits -msse4.1 without
-          # proper -Xarch_x86_64 prefix on macOS 15's stricter Clang 17
-          # - runner: macos-15
-          #   name: macOS 15 (ARM64)
+          - runner: macos-15
+            name: macOS 15 (ARM64)
     name: Metal PJRT - ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     env:

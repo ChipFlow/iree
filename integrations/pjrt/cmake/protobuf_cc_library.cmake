@@ -23,7 +23,31 @@ FetchContent_Declare(
   GIT_SHALLOW ON
 )
 
-FetchContent_MakeAvailable(protobuf)
+# Fetch protobuf content but don't configure yet
+FetchContent_GetProperties(protobuf)
+if(NOT protobuf_POPULATED)
+  FetchContent_Populate(protobuf)
+
+  # Fix abseil's CMake bug on Apple Silicon with newer Clang.
+  # The bundled abseil adds -msse4.1 without proper -Xarch_x86_64 prefix,
+  # causing "unsupported option" errors on ARM64 with Clang 17+.
+  # This patch makes abseil use ARM64-only flags when building for ARM64.
+  if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    set(_abseil_copts_file "${protobuf_SOURCE_DIR}/third_party/abseil-cpp/absl/copts/AbseilConfigureCopts.cmake")
+    if(EXISTS "${_abseil_copts_file}")
+      file(READ "${_abseil_copts_file}" _abseil_copts_content)
+      # Replace the Apple+Clang block with ARM64-only flags
+      string(REPLACE
+        "if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES [[Clang]])"
+        "if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES [[Clang]] AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES \"arm64|aarch64\")"
+        _abseil_copts_content "${_abseil_copts_content}")
+      file(WRITE "${_abseil_copts_file}" "${_abseil_copts_content}")
+      message(STATUS "Patched abseil to use ARM64-only flags on Apple Silicon")
+    endif()
+  endif()
+
+  add_subdirectory(${protobuf_SOURCE_DIR} ${protobuf_BINARY_DIR})
+endif()
 
 # make protobuf_generate() function available
 include(${protobuf_SOURCE_DIR}/cmake/protobuf-generate.cmake)
