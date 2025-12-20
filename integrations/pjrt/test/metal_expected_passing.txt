@@ -17,10 +17,10 @@
 # Lines starting with # are comments
 
 # =============================================================================
-# JitTest - 85 passing tests (79% pass rate)
+# JitTest - 81 passing tests (75% pass rate)
 # =============================================================================
-# Known failures (23 tests):
-# - XLA compiler options (1): test_*_compiler_options_invalid (XLA-specific validation)
+# Known failures (27 tests):
+# - XLA compiler options (5): tests passing xla_* options (not supported by IREE)
 # - Memory donation (6): test_dict_donation_*, test_donate_args_*, etc.
 # - Multi-backend/device (7): test_explicit_backend, test_jit_device, etc.
 # - Token/side-effects (3): test_trivial_computations*, test_print_token_*
@@ -30,7 +30,6 @@
 
 api_test.py::JitTest::test_cache_key_defaults
 api_test.py::JitTest::test_caches_depend_on_axis_env
-api_test.py::JitTest::test_compile_options_jit
 api_test.py::JitTest::test_complex_support
 api_test.py::JitTest::test_cpp_jit_raises_on_non_hashable_static_argnum
 api_test.py::JitTest::test_cpp_jit_raises_other_exceptions_when_hashing_fails
@@ -47,7 +46,6 @@ api_test.py::JitTest::test_jit_argnums_overflow_error0
 api_test.py::JitTest::test_jit_argnums_overflow_error1
 api_test.py::JitTest::test_jit_bad_input
 api_test.py::JitTest::test_jit_cache_clear
-api_test.py::JitTest::test_jit_compile_with_compiler_options_multiple
 api_test.py::JitTest::test_jit_decorator_factory
 api_test.py::JitTest::test_jit_deep_copy
 api_test.py::JitTest::test_jit_donate_warning_raised_argnames
@@ -69,7 +67,6 @@ api_test.py::JitTest::test_jit_lower_compile_trivial
 api_test.py::JitTest::test_jit_lower_compile_trivial_in_tree_mismatch
 api_test.py::JitTest::test_jit_lower_compile_trivial_multi_arg
 api_test.py::JitTest::test_jit_lower_compile_vmap
-api_test.py::JitTest::test_jit_lower_compile_with_compiler_options
 api_test.py::JitTest::test_jit_lower_compiler_ir
 api_test.py::JitTest::test_jit_lower_duck_typing
 api_test.py::JitTest::test_jit_lower_no_pruning
@@ -99,7 +96,6 @@ api_test.py::JitTest::test_jit_with_static_argnames
 api_test.py::JitTest::test_jit_wrapped_attributes
 api_test.py::JitTest::test_jnp_array_copy_argnames
 api_test.py::JitTest::test_jnp_array_copy_argnums
-api_test.py::JitTest::test_lower_compile_with_compiler_options_multiple
 api_test.py::JitTest::test_memory_fitting_level_compiler_option
 api_test.py::JitTest::test_new_static_argnum_on_keyword_arguments
 api_test.py::JitTest::test_new_static_argnum_with_default_arguments

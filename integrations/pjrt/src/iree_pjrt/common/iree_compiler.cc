@@ -99,12 +99,6 @@ class IREECompilerJob : public CompilerJob {
   bool SetFlags(xla::CompileOptionsProto options) override {
     // Set extra options, overriding env variables if appropriate.
     for (auto [option, option_override] : options.env_option_overrides()) {
-      // Skip XLA-specific debug options (no IREE equivalent).
-      // These options control XLA's internal debugging/dumping behavior.
-      if (option.rfind("xla_", 0) == 0) {
-        continue;
-      }
-
       // Skip JAX build options that are meant for ExecutableBuildOptions.
       // These are handled separately by JAX's compiler.py and don't map
       // directly to IREE compiler flags.
