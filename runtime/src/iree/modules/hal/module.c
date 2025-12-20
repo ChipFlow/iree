@@ -18,7 +18,9 @@
 
 // Limit the number of bindings we pass down through the HAL. This can be tuned
 // in the future but right now guards the stack from blowing up during calls.
-#define IREE_HAL_MODULE_MAX_DESCRIPTOR_BINDING_COUNT ((iree_host_size_t)32)
+// Increased from 32 to 1024 to support programs with many arguments (e.g., JAX
+// tests with 500+ elements in lists). This should match the Metal driver limit.
+#define IREE_HAL_MODULE_MAX_DESCRIPTOR_BINDING_COUNT ((iree_host_size_t)1024)
 
 // Limit the number of bindings in a binding table that we allocate on the stack
 // while marshaling from the VM. Counts over this amount will result in heap

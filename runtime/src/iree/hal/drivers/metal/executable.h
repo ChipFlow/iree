@@ -31,9 +31,11 @@ extern "C" {
 // - Argument buffer tier 2 binding limits:
 //   - 500,000 buffers or textures
 //
-// Using 64 here to match macOS limit. For iOS, this would need to be reduced
-// to 31 (or conditionally detected at runtime).
-#define IREE_HAL_METAL_MAX_DESCRIPTOR_SET_BINDING_COUNT 64
+// Using 1024 here to support programs with many arguments (e.g., JAX tests with
+// 500+ elements in lists). Modern macOS with Apple Silicon supports tier 2
+// argument buffers which allow up to 500K bindings. For iOS tier 1 devices,
+// this would need to be reduced (or conditionally detected at runtime).
+#define IREE_HAL_METAL_MAX_DESCRIPTOR_SET_BINDING_COUNT 1024
 
 // The max number of descriptor sets allowed in the Metal HAL implementation.
 //
