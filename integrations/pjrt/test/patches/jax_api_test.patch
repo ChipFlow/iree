@@ -1,0 +1,45 @@
+--- a/tests/api_test.py
++++ b/tests/api_test.py
+@@ -1365,6 +1365,7 @@
+     self.assertIsNotNone(f.runtime_executable())
+     self.assertIsNotNone(g.runtime_executable())
+
++  @jtu.skip_on_devices("iree_metal")  # XLA-specific compiler options
+   def test_jit_lower_compile_with_compiler_options(self):
+     def f(x):
+       return jnp.sqrt(x ** 2) + 1.
+@@ -1379,6 +1380,7 @@
+         }
+     )
+
++  @jtu.skip_on_devices("iree_metal")  # XLA-specific compiler options
+   def test_compile_options_jit(self):
+     def f(x):
+       return jnp.sqrt(x ** 2) + 1.
+@@ -1446,11 +1448,14 @@
+         lambda: lowered.compile(
+             compiler_options={"invalid_key": "invalid_value"}))
+
+-    self.assertRaisesRegex(
+-        jax.errors.JaxRuntimeError, "is not a valid bool value.",
+-        lambda: lowered.compile(
+-            compiler_options={"xla_embed_ir_in_executable": "invalid_value"}))
++    # XLA-specific validation: skip on non-XLA backends
++    if jtu.device_under_test() not in ("iree_metal",):
++      self.assertRaisesRegex(
++          jax.errors.JaxRuntimeError, "is not a valid bool value.",
++          lambda: lowered.compile(
++              compiler_options={"xla_embed_ir_in_executable": "invalid_value"}))
+
++  @jtu.skip_on_devices("iree_metal")  # XLA-specific compiler options
+   def test_jit_compile_with_compiler_options_multiple(self):
+     def f(x):
+       return jnp.sqrt(x ** 2) + 1.
+@@ -1465,6 +1470,7 @@
+         jax.errors.JaxRuntimeError, "No such compile option: 'invalid_key'"):
+       jit(f, compiler_options={"invalid_key": "invalid_value"})(1.)
+
++  @jtu.skip_on_devices("iree_metal")  # XLA-specific compiler options
+   def test_lower_compile_with_compiler_options_multiple(self):
+     def f(x):
+       return jnp.sqrt(x ** 2) + 1.

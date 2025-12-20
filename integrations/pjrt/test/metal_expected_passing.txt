@@ -17,10 +17,11 @@
 # Lines starting with # are comments
 
 # =============================================================================
-# JitTest - 81 passing tests (75% pass rate)
+# JitTest - 82 passing tests (with patches: 82 pass, 18 skip, 22 fail)
 # =============================================================================
-# Known failures (27 tests):
-# - XLA compiler options (5): tests passing xla_* options (not supported by IREE)
+# Patches in test/patches/ skip XLA-specific tests on iree_metal.
+#
+# Known failures (22 tests after patches):
 # - Memory donation (6): test_dict_donation_*, test_donate_args_*, etc.
 # - Multi-backend/device (7): test_explicit_backend, test_jit_device, etc.
 # - Token/side-effects (3): test_trivial_computations*, test_print_token_*
@@ -67,6 +68,7 @@ api_test.py::JitTest::test_jit_lower_compile_trivial
 api_test.py::JitTest::test_jit_lower_compile_trivial_in_tree_mismatch
 api_test.py::JitTest::test_jit_lower_compile_trivial_multi_arg
 api_test.py::JitTest::test_jit_lower_compile_vmap
+api_test.py::JitTest::test_jit_lower_compile_with_compiler_options_invalid
 api_test.py::JitTest::test_jit_lower_compiler_ir
 api_test.py::JitTest::test_jit_lower_duck_typing
 api_test.py::JitTest::test_jit_lower_no_pruning

@@ -173,6 +173,17 @@ jobs:
           git clone --depth=1 https://github.com/jax-ml/jax.git /tmp/jax
           echo "JAX version: $(cat /tmp/jax/jax/version.py | grep __version__)"
 
+      - name: Apply IREE Metal patches to JAX tests
+        run: |
+          cd /tmp/jax
+          # Apply patches to skip XLA-specific tests on IREE Metal
+          for patch in ${{ github.workspace }}/integrations/pjrt/test/patches/*.patch; do
+            if [ -f "$patch" ]; then
+              echo "Applying patch: $patch"
+              patch -p1 < "$patch"
+            fi
+          done
+
       - name: Install JAX test dependencies
         run: |
           source ${VENV_DIR}/bin/activate
@@ -185,7 +196,7 @@ jobs:
           cd /tmp/jax
 
           # Run JitTest subset against IREE Metal
-          # 80/108 tests pass (74% pass rate)
+          # With patches applied: 82 pass, 18 skipped, 22 fail
           # See integrations/pjrt/test/metal_expected_passing.txt for baseline
           echo "Running JAX JitTest suite against IREE Metal..."
           JAX_PLATFORMS=iree_metal JAX_ENABLE_X64=0 pytest tests/api_test.py::JitTest \
