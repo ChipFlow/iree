@@ -16,5 +16,95 @@
 # Format: test_file.py::TestClass::test_method
 # Lines starting with # are comments
 
-# Initial baseline - to be populated after first successful test run
-# Start with empty baseline to bootstrap, then add passing tests incrementally
+# =============================================================================
+# JitTest - 80 passing tests (74% pass rate)
+# =============================================================================
+# Known failures (28 tests):
+# - XLA compiler options (4): test_compile_options_jit, test_exec_time_*, etc.
+# - Memory donation (6): test_dict_donation_*, test_donate_args_*, etc.
+# - Multi-backend/device (7): test_explicit_backend, test_jit_device, etc.
+# - Token/side-effects (3): test_trivial_computations*, test_print_token_*
+# - Concurrency (1): test_concurrent_jit
+# - Other (7): test_omnistaging, test_jit_nan_times_zero, etc.
+# =============================================================================
+
+api_test.py::JitTest::test_cache_key_defaults
+api_test.py::JitTest::test_caches_depend_on_axis_env
+api_test.py::JitTest::test_complex_support
+api_test.py::JitTest::test_cpp_jit_raises_on_non_hashable_static_argnum
+api_test.py::JitTest::test_cpp_jit_raises_other_exceptions_when_hashing_fails
+api_test.py::JitTest::test_cpp_jitted_function_returns_PyBuffer
+api_test.py::JitTest::test_disable_jit
+api_test.py::JitTest::test_donate_argnames_signature_fail
+api_test.py::JitTest::test_fun_name
+api_test.py::JitTest::test_infer_argnums_and_argnames
+api_test.py::JitTest::test_intersecting_static_and_donate_argnames
+api_test.py::JitTest::test_jit_argnames_validation0
+api_test.py::JitTest::test_jit_argnames_validation1
+api_test.py::JitTest::test_jit_argnums_overflow_error0
+api_test.py::JitTest::test_jit_argnums_overflow_error1
+api_test.py::JitTest::test_jit_bad_input
+api_test.py::JitTest::test_jit_cache_clear
+api_test.py::JitTest::test_jit_decorator_factory
+api_test.py::JitTest::test_jit_deep_copy
+api_test.py::JitTest::test_jit_donate_warning_raised_argnames
+api_test.py::JitTest::test_jit_donate_warning_raised_argnums
+api_test.py::JitTest::test_jit_enum_as_dict_keys_fails
+api_test.py::JitTest::test_jit_global_cache
+api_test.py::JitTest::test_jit_kwargs0
+api_test.py::JitTest::test_jit_kwargs1
+api_test.py::JitTest::test_jit_lower_as_text
+api_test.py::JitTest::test_jit_lower_compile
+api_test.py::JitTest::test_jit_lower_compile_arg_type_mismatch
+api_test.py::JitTest::test_jit_lower_compile_as_text
+api_test.py::JitTest::test_jit_lower_compile_compiler_ir
+api_test.py::JitTest::test_jit_lower_compile_executable
+api_test.py::JitTest::test_jit_lower_compile_in_tree_mismatch
+api_test.py::JitTest::test_jit_lower_compile_memory_analysis
+api_test.py::JitTest::test_jit_lower_compile_multi_arg
+api_test.py::JitTest::test_jit_lower_compile_trivial
+api_test.py::JitTest::test_jit_lower_compile_trivial_in_tree_mismatch
+api_test.py::JitTest::test_jit_lower_compile_trivial_multi_arg
+api_test.py::JitTest::test_jit_lower_compile_vmap
+api_test.py::JitTest::test_jit_lower_compiler_ir
+api_test.py::JitTest::test_jit_lower_duck_typing
+api_test.py::JitTest::test_jit_lower_no_pruning
+api_test.py::JitTest::test_jit_lower_trivial_compile_compiler_ir
+api_test.py::JitTest::test_jit_lower_trivial_compiler_ir
+api_test.py::JitTest::test_jit_masked_array
+api_test.py::JitTest::test_jit_nested_donate_ignored
+api_test.py::JitTest::test_jit_of_generator
+api_test.py::JitTest::test_jit_of_noncallable
+api_test.py::JitTest::test_jit_of_nonweakreferenceable_function
+api_test.py::JitTest::test_jit_python_builtin
+api_test.py::JitTest::test_jit_raises_on_first_invocation_on_non_hashable_static_argnum
+api_test.py::JitTest::test_jit_reference_dropping
+api_test.py::JitTest::test_jit_replica_attributes
+api_test.py::JitTest::test_jit_repr
+api_test.py::JitTest::test_jit_repr_errors
+api_test.py::JitTest::test_jit_shallow_copy
+api_test.py::JitTest::test_jit_static_argnums_requires_type_equality
+api_test.py::JitTest::test_jit_static_args0
+api_test.py::JitTest::test_jit_static_args1
+api_test.py::JitTest::test_jit_with_many_args_works
+api_test.py::JitTest::test_jit_with_mismatched_static_argnames
+api_test.py::JitTest::test_jit_with_pruned_args0
+api_test.py::JitTest::test_jit_with_pruned_args1
+api_test.py::JitTest::test_jit_with_pruned_args2
+api_test.py::JitTest::test_jit_with_static_argnames
+api_test.py::JitTest::test_jit_wrapped_attributes
+api_test.py::JitTest::test_jnp_array_copy_argnames
+api_test.py::JitTest::test_jnp_array_copy_argnums
+api_test.py::JitTest::test_memory_fitting_level_compiler_option
+api_test.py::JitTest::test_new_static_argnum_on_keyword_arguments
+api_test.py::JitTest::test_new_static_argnum_with_default_arguments
+api_test.py::JitTest::test_no_execution
+api_test.py::JitTest::test_no_tracing
+api_test.py::JitTest::test_optimization_level_compiler_option
+api_test.py::JitTest::test_pe_close_jaxpr_cache_leak
+api_test.py::JitTest::test_resolve_argnums_signature_fail
+api_test.py::JitTest::test_static_argnum_on_method
+api_test.py::JitTest::test_static_argnum_on_static_method_is_not_supported
+api_test.py::JitTest::test_static_args_equality
+api_test.py::JitTest::test_staticmethod_is_not_supported
+api_test.py::JitTest::testBuffersAreFreedPromptly

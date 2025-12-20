@@ -179,34 +179,34 @@ jobs:
           pip install pytest absl-py hypothesis
 
       - name: Run JAX test suite
-        timeout-minutes: 30  # Limit total test time to 30 minutes
-        continue-on-error: true  # Don't fail CI on timeout - we're establishing baseline
+        timeout-minutes: 10  # JitTest runs quickly (~15s)
         run: |
           source ${VENV_DIR}/bin/activate
-          cd integrations/pjrt
+          cd /tmp/jax
 
-          # Run a subset of JAX tests against IREE Metal
-          # Use shorter timeout (15s) since most tests either pass quickly or fail
-          # lax_test.py has thousands of tests - we sample what we can in 30 minutes
-          echo "Running JAX test suite against IREE Metal..."
-          echo "Note: Using 15s timeout per test, 30 minute total limit"
-          JAX_PLATFORMS=iree_metal python test/test_jax.py \
-            /tmp/jax/tests/lax_test.py \
-            -j 4 \
-            -t 15 \
-            -l /tmp/jaxtest \
-            -e test/metal_expected_passing.txt \
-            -p /tmp/metal_passing.txt \
-            -f /tmp/metal_failing.txt || true
+          # Run JitTest subset against IREE Metal
+          # 80/108 tests pass (74% pass rate)
+          # See integrations/pjrt/test/metal_expected_passing.txt for baseline
+          echo "Running JAX JitTest suite against IREE Metal..."
+          JAX_PLATFORMS=iree_metal JAX_ENABLE_X64=0 pytest tests/api_test.py::JitTest \
+            --tb=no -v 2>&1 | tee /tmp/jaxtest_output.txt || true
 
-          # Report results (don't fail CI yet - baseline is being established)
+          # Extract results
+          grep "PASSED" /tmp/jaxtest_output.txt | wc -l > /tmp/metal_passing.txt || true
+          grep "FAILED" /tmp/jaxtest_output.txt | wc -l > /tmp/metal_failing.txt || true
+
+          # Report results
           echo ""
-          echo "=== JAX Test Suite Results ==="
-          if [ -f /tmp/metal_passing.txt ]; then
-            echo "Passing tests: $(wc -l < /tmp/metal_passing.txt)"
-          fi
-          if [ -f /tmp/metal_failing.txt ]; then
-            echo "Failing tests: $(wc -l < /tmp/metal_failing.txt)"
+          echo "=== JAX JitTest Results ==="
+          passing=$(cat /tmp/metal_passing.txt 2>/dev/null || echo "0")
+          failing=$(cat /tmp/metal_failing.txt 2>/dev/null || echo "0")
+          echo "Passing tests: $passing"
+          echo "Failing tests: $failing"
+
+          # Check for regressions against baseline (80 expected passing)
+          if [ "$passing" -lt 75 ]; then
+            echo "WARNING: Significant regression detected! Expected ~80 passing tests."
+            exit 1
           fi
 
       - name: Upload test artifacts

@@ -366,6 +366,40 @@ def check_dot_shape(errortxt, _, __):
     return False
 
 
+# =============================================================================
+# Metal-specific failure patterns
+# =============================================================================
+
+
+def check_xla_compiler_option(errortxt, _, __):
+    """XLA-specific compiler options not supported by IREE"""
+    return "option not found: xla_" in errortxt
+
+
+def check_metal_donation_warning(errortxt, _, __):
+    """Memory donation warnings - IREE handles buffers differently"""
+    return "Some donated buffers were not usable" in errortxt
+
+
+def check_metal_multi_backend(errortxt, _, __):
+    """Multi-backend operations - Metal is single-device"""
+    return (
+        "Mismatched backend" in errortxt
+        or "doesn't support JAX arrays on platform" in errortxt
+        or "device_to_device_copy" in errortxt
+    )
+
+
+def check_metal_token_error(errortxt, _, __):
+    """Token handling issues"""
+    return "token" in errortxt.lower() and "buffer" in errortxt.lower()
+
+
+def check_metal_concurrent_jit(errortxt, _, __):
+    """Concurrent JIT compilation failures"""
+    return "concurrent" in errortxt.lower() and "jit" in errortxt.lower()
+
+
 KnownChecks = {
     "https://github.com/iree-org/iree/issues/14255 (detensoring)": check_from_tensor,
     "https://github.com/iree-org/iree/issues/????? (unknown)": check_jax_unimplemented,
@@ -414,6 +448,12 @@ KnownChecks = {
     "Runtime Crash": check_runtime_crash,
     "Compilation Failure": check_compilation,
     "Numerical Failures": check_numerical,
+    # Metal-specific patterns
+    "(Metal XLA compiler option)": check_xla_compiler_option,
+    "(Metal donation warning)": check_metal_donation_warning,
+    "(Metal multi-backend)": check_metal_multi_backend,
+    "(Metal token error)": check_metal_token_error,
+    "(Metal concurrent jit)": check_metal_concurrent_jit,
     "Untriaged": lambda _, __, ___: True,
 }
 
