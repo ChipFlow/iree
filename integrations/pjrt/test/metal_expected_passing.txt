@@ -17,16 +17,17 @@
 # Lines starting with # are comments
 
 # =============================================================================
-# JitTest - 82 passing tests (with patches: 82 pass, 18 skip, 22 fail)
+# JitTest - 81 passing, 24 skipped, 15 failed (with patches applied)
 # =============================================================================
-# Patches in test/patches/ skip XLA-specific tests on iree_metal.
+# Patches in test/patches/jax_api_test.patch skip:
+# - 5 donation tests (@jtu.device_supports_buffer_donation)
+# - 5 XLA-specific compiler option tests (@jtu.skip_on_devices("iree_metal"))
 #
-# Known failures (22 tests after patches):
-# - Memory donation (6): test_dict_donation_*, test_donate_args_*, etc.
+# Known failures (15 tests):
 # - Multi-backend/device (7): test_explicit_backend, test_jit_device, etc.
 # - Token/side-effects (3): test_trivial_computations*, test_print_token_*
 # - Concurrency (1): test_concurrent_jit
-# - Other (5): test_omnistaging, test_jit_nan_times_zero, etc.
+# - Other (4): test_omnistaging, test_jit_nan_times_zero, etc.
 # =============================================================================
 
 api_test.py::JitTest::test_cache_key_defaults
@@ -68,7 +69,7 @@ api_test.py::JitTest::test_jit_lower_compile_trivial
 api_test.py::JitTest::test_jit_lower_compile_trivial_in_tree_mismatch
 api_test.py::JitTest::test_jit_lower_compile_trivial_multi_arg
 api_test.py::JitTest::test_jit_lower_compile_vmap
-api_test.py::JitTest::test_jit_lower_compile_with_compiler_options_invalid
+# Skipped by patch: api_test.py::JitTest::test_jit_lower_compile_with_compiler_options_invalid
 api_test.py::JitTest::test_jit_lower_compiler_ir
 api_test.py::JitTest::test_jit_lower_duck_typing
 api_test.py::JitTest::test_jit_lower_no_pruning
