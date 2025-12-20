@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <iostream>  // TODO: Remove
+#include <unordered_set>
 #include <vector>
 
 #include "iree/compiler/embedding_api.h"
@@ -98,6 +99,24 @@ class IREECompilerJob : public CompilerJob {
   bool SetFlags(xla::CompileOptionsProto options) override {
     // Set extra options, overriding env variables if appropriate.
     for (auto [option, option_override] : options.env_option_overrides()) {
+      // Skip XLA-specific debug options (no IREE equivalent).
+      // These options control XLA's internal debugging/dumping behavior.
+      if (option.rfind("xla_", 0) == 0) {
+        continue;
+      }
+
+      // Skip JAX build options that are meant for ExecutableBuildOptions.
+      // These are handled separately by JAX's compiler.py and don't map
+      // directly to IREE compiler flags.
+      static const std::unordered_set<std::string> build_options_to_skip = {
+          "exec_time_optimization_effort",
+          "memory_fitting_effort",
+          "optimization_level",
+          "memory_fitting_level"};
+      if (build_options_to_skip.count(option)) {
+        continue;
+      }
+
       std::string override_string;
       if (option_override.has_string_field()) {
         override_string = option_override.string_field();

@@ -17,10 +17,10 @@
 # Lines starting with # are comments
 
 # =============================================================================
-# JitTest - 80 passing tests (74% pass rate)
+# JitTest - 82 passing tests (76% pass rate)
 # =============================================================================
-# Known failures (28 tests):
-# - XLA compiler options (4): test_compile_options_jit, test_exec_time_*, etc.
+# Known failures (26 tests):
+# - XLA compiler options (2): test_exec_time_*, test_*_compiler_options_invalid
 # - Memory donation (6): test_dict_donation_*, test_donate_args_*, etc.
 # - Multi-backend/device (7): test_explicit_backend, test_jit_device, etc.
 # - Token/side-effects (3): test_trivial_computations*, test_print_token_*
@@ -30,6 +30,7 @@
 
 api_test.py::JitTest::test_cache_key_defaults
 api_test.py::JitTest::test_caches_depend_on_axis_env
+api_test.py::JitTest::test_compile_options_jit
 api_test.py::JitTest::test_complex_support
 api_test.py::JitTest::test_cpp_jit_raises_on_non_hashable_static_argnum
 api_test.py::JitTest::test_cpp_jit_raises_other_exceptions_when_hashing_fails
@@ -66,6 +67,7 @@ api_test.py::JitTest::test_jit_lower_compile_trivial
 api_test.py::JitTest::test_jit_lower_compile_trivial_in_tree_mismatch
 api_test.py::JitTest::test_jit_lower_compile_trivial_multi_arg
 api_test.py::JitTest::test_jit_lower_compile_vmap
+api_test.py::JitTest::test_jit_lower_compile_with_compiler_options
 api_test.py::JitTest::test_jit_lower_compiler_ir
 api_test.py::JitTest::test_jit_lower_duck_typing
 api_test.py::JitTest::test_jit_lower_no_pruning
