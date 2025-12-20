@@ -1542,6 +1542,21 @@ PJRT_Error* ClientInstance::Compile(const PJRT_Program* program,
 
   auto MakeCompilerError = [&](CompilerJob& job) {
     std::string message = job.GetErrorMessage();
+
+    // Transform IREE error format to match XLA/JAX expected format.
+    // "option not found: foo" -> "No such compile option: 'foo'"
+    const std::string prefix = "option not found: ";
+    size_t pos = message.find(prefix);
+    if (pos != std::string::npos) {
+      std::string option_name = message.substr(pos + prefix.length());
+      // Trim any trailing whitespace/newlines.
+      while (!option_name.empty() &&
+             (option_name.back() == '\n' || option_name.back() == ' ')) {
+        option_name.pop_back();
+      }
+      message = "No such compile option: '" + option_name + "'";
+    }
+
     return MakeError(iree_make_status(IREE_STATUS_INVALID_ARGUMENT, ": %s",
                                       message.c_str()));
   };
