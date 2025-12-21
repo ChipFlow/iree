@@ -1,11 +1,10 @@
 diff --git a/tests/api_test.py b/tests/api_test.py
-index 020b32ec1..db4987e0e 100644
 --- a/tests/api_test.py
 +++ b/tests/api_test.py
 @@ -606,6 +606,7 @@ class JitTest(jtu.BufferDonationTestCase):
      f(inp1=x)
      self.assertDeleted(x)
- 
+
 +  @jtu.device_supports_buffer_donation()
    def test_donate_args_info_aot(self):
      def fn(x, y):
@@ -13,7 +12,7 @@ index 020b32ec1..db4987e0e 100644
 @@ -632,6 +633,7 @@ class JitTest(jtu.BufferDonationTestCase):
      # y is not donated.
      self.assertFalse(args_info[1].donated)
- 
+
 +  @jtu.device_supports_buffer_donation()
    def test_double_donation(self):
      def add(x, y):
@@ -21,7 +20,7 @@ index 020b32ec1..db4987e0e 100644
 @@ -643,6 +645,7 @@ class JitTest(jtu.BufferDonationTestCase):
        result = f(x, x)
        result.block_until_ready()
- 
+
 +  @jtu.device_supports_buffer_donation()
    @parameterized.named_parameters(
        ('argnames', {'donate_argnames': ('z', 'y')}),
@@ -29,56 +28,96 @@ index 020b32ec1..db4987e0e 100644
 @@ -661,6 +664,7 @@ class JitTest(jtu.BufferDonationTestCase):
      self.assertTrue(kwargs_info['y']['b'].donated)
      self.assertFalse(kwargs_info['x']['a'].donated)
- 
+
 +  @jtu.device_supports_buffer_donation()
    @parameterized.named_parameters(
        ('argnames', {'donate_argnames': ('z', 'y')}),
        ('argnums', {'donate_argnums': (0, 1)})
-@@ -1264,6 +1268,7 @@ class JitTest(jtu.BufferDonationTestCase):
+@@ -795,6 +799,7 @@ class JitTest(jtu.BufferDonationTestCase):
+         def my_staticmethod_jit(x):
+           return x + 2
+
++  @jtu.skip_on_devices("iree_metal")  # Metal concurrent buffer allocation issue
+   def test_concurrent_jit(self):
+     @jit
+     def f(x):
+@@ -807,6 +812,7 @@ class JitTest(jtu.BufferDonationTestCase):
+     with futures.ThreadPoolExecutor(max_workers=4) as executor:
+       self.assertAllClose(x * 2 - 3., y)
+
++  @jtu.skip_on_devices("iree_metal")  # IREE buffer reuse differs from XLA
+   def test_trivial_computations(self):
+     x = jnp.array([1, 2, 3])
+     y = jit(lambda x: x)(x)
+@@ -822,6 +827,7 @@ class JitTest(jtu.BufferDonationTestCase):
+     self.assertNotEqual(z1.unsafe_buffer_pointer(), x2.unsafe_buffer_pointer())
+     self.assertEqual(z2, 1)
+
++  @jtu.skip_on_devices("iree_metal")  # stablehlo.create_token not supported
+   def test_print_token_buffer_error(self):
+     token = jax.lax.create_token()
+     with self.assertRaisesRegex(
+@@ -829,6 +835,7 @@ class JitTest(jtu.BufferDonationTestCase):
+     ):
+       token._buf._value
+
++  @jtu.skip_on_devices("iree_metal")  # stablehlo.create_token not supported
+   def test_trivial_computations_with_tokens(self):
+     @jit
+     def noop(arr, token):
+@@ -1264,6 +1269,7 @@ class JitTest(jtu.BufferDonationTestCase):
      f_exe = jit(f).lower(1., 1.).compile()
      self.assertAllClose(f_exe(1., 1.), 1.)
- 
+
 +  @jtu.device_supports_buffer_donation()
    def test_jit_lower_donate_argnums_available(self):
      def f(*args):
        x, *_ = args
-@@ -1365,6 +1370,7 @@ class JitTest(jtu.BufferDonationTestCase):
+@@ -1365,6 +1371,7 @@ class JitTest(jtu.BufferDonationTestCase):
      self.assertIsNotNone(f.runtime_executable())
      self.assertIsNotNone(g.runtime_executable())
- 
+
 +  @jtu.skip_on_devices("iree_metal")  # XLA-specific compiler options
    def test_jit_lower_compile_with_compiler_options(self):
      def f(x):
        return jnp.sqrt(x ** 2) + 1.
-@@ -1379,6 +1385,7 @@ class JitTest(jtu.BufferDonationTestCase):
+@@ -1379,6 +1386,7 @@ class JitTest(jtu.BufferDonationTestCase):
          }
      )
- 
+
 +  @jtu.skip_on_devices("iree_metal")  # XLA-specific compiler options
    def test_compile_options_jit(self):
      def f(x):
        return jnp.sqrt(x ** 2) + 1.
-@@ -1434,6 +1441,7 @@ class JitTest(jtu.BufferDonationTestCase):
+@@ -1434,6 +1442,7 @@ class JitTest(jtu.BufferDonationTestCase):
          1.0
      )  # doesn't crash.
- 
+
 +  @jtu.skip_on_devices("iree_metal")  # XLA-specific compiler options
    def test_jit_lower_compile_with_compiler_options_invalid(self):
      def f(x):
        return jnp.sqrt(x ** 2) + 1.
-@@ -1451,6 +1459,7 @@ class JitTest(jtu.BufferDonationTestCase):
+@@ -1451,6 +1460,7 @@ class JitTest(jtu.BufferDonationTestCase):
          lambda: lowered.compile(
              compiler_options={"xla_embed_ir_in_executable": "invalid_value"}))
- 
+
 +  @jtu.skip_on_devices("iree_metal")  # XLA-specific compiler options
    def test_jit_compile_with_compiler_options_multiple(self):
      def f(x):
        return jnp.sqrt(x ** 2) + 1.
-@@ -1465,6 +1474,7 @@ class JitTest(jtu.BufferDonationTestCase):
+@@ -1465,6 +1475,7 @@ class JitTest(jtu.BufferDonationTestCase):
          jax.errors.JaxRuntimeError, "No such compile option: 'invalid_key'"):
        jit(f, compiler_options={"invalid_key": "invalid_value"})(1.)
- 
+
 +  @jtu.skip_on_devices("iree_metal")  # XLA-specific compiler options
    def test_lower_compile_with_compiler_options_multiple(self):
      def f(x):
        return jnp.sqrt(x ** 2) + 1.
+@@ -1563,6 +1574,7 @@ class JitTest(jtu.BufferDonationTestCase):
+     self.assertEqual(f._cache_size(), 0)
+     self.assertEqual(f._cache_size(), 1)
+
++  @jtu.skip_on_devices("iree_metal")  # Metal NaN*0 semantics differ
+   def test_jit_nan_times_zero(self):
+     # https://github.com/jax-ml/jax/issues/4780
+     def f(x):

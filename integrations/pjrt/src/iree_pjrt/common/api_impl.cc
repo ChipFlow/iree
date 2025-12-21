@@ -1939,8 +1939,10 @@ void ExecutableImage::BindApi(PJRT_Api* api) {
   };
   api->PJRT_Executable_GetCostAnalysis =
       +[](PJRT_Executable_GetCostAnalysis_Args* args) -> PJRT_Error* {
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_Executable_GetCostAnalysis"));
+    // Return empty cost analysis - IREE doesn't currently expose this data
+    args->num_properties = 0;
+    args->properties = nullptr;
+    return nullptr;
   };
   api->PJRT_Executable_OutputElementTypes =
       +[](PJRT_Executable_OutputElementTypes_Args* args) -> PJRT_Error* {

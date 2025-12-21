@@ -17,17 +17,20 @@
 # Lines starting with # are comments
 
 # =============================================================================
-# JitTest - 81 passing, 24 skipped, 15 failed (with patches applied)
+# JitTest - 82 passing, 29 skipped, 9 failed (with patches applied)
 # =============================================================================
 # Patches in test/patches/jax_api_test.patch skip:
 # - 5 donation tests (@jtu.device_supports_buffer_donation)
 # - 5 XLA-specific compiler option tests (@jtu.skip_on_devices("iree_metal"))
+# - 2 token tests (stablehlo.create_token not supported)
+# - 2 buffer/NaN semantic tests
+# - 1 concurrent execution test (Metal buffer allocation issue)
 #
-# Known failures (15 tests):
-# - Multi-backend/device (7): test_explicit_backend, test_jit_device, etc.
-# - Token/side-effects (3): test_trivial_computations*, test_print_token_*
-# - Concurrency (1): test_concurrent_jit
-# - Other (4): test_omnistaging, test_jit_nan_times_zero, etc.
+# Known failures (9 tests) - all Shardy dialect (sdy) related:
+# - test_device_put_aliasing, test_device_to_device_copy_between_backends
+# - test_explicit_backend, test_jit_default_platform, test_jit_device
+# - test_jit_lower_compile_sharding_computation, test_jit_on_all_devices
+# - test_mismatched_nested_backends, test_omnistaging
 # =============================================================================
 
 api_test.py::JitTest::test_cache_key_defaults
@@ -61,6 +64,7 @@ api_test.py::JitTest::test_jit_lower_compile
 api_test.py::JitTest::test_jit_lower_compile_arg_type_mismatch
 api_test.py::JitTest::test_jit_lower_compile_as_text
 api_test.py::JitTest::test_jit_lower_compile_compiler_ir
+api_test.py::JitTest::test_jit_lower_compile_cost_analysis
 api_test.py::JitTest::test_jit_lower_compile_executable
 api_test.py::JitTest::test_jit_lower_compile_in_tree_mismatch
 api_test.py::JitTest::test_jit_lower_compile_memory_analysis
@@ -69,7 +73,6 @@ api_test.py::JitTest::test_jit_lower_compile_trivial
 api_test.py::JitTest::test_jit_lower_compile_trivial_in_tree_mismatch
 api_test.py::JitTest::test_jit_lower_compile_trivial_multi_arg
 api_test.py::JitTest::test_jit_lower_compile_vmap
-# Skipped by patch: api_test.py::JitTest::test_jit_lower_compile_with_compiler_options_invalid
 api_test.py::JitTest::test_jit_lower_compiler_ir
 api_test.py::JitTest::test_jit_lower_duck_typing
 api_test.py::JitTest::test_jit_lower_no_pruning
