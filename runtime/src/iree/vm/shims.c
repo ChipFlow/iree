@@ -70,6 +70,7 @@ IREE_VM_ABI_DEFINE_SHIM(rrIrIIiI, v);
 IREE_VM_ABI_DEFINE_SHIM(riirIrIII, v);
 IREE_VM_ABI_DEFINE_SHIM(rrIii, v);
 IREE_VM_ABI_DEFINE_SHIM(rrrIii, v);
+IREE_VM_ABI_DEFINE_SHIM(rrr, v);  // dense_blas, sparse_solver: solve operations
 IREE_VM_ABI_DEFINE_SHIM(rIrrIiiII, r);
 IREE_VM_ABI_DEFINE_SHIM(rrIIIi, v);
 IREE_VM_ABI_DEFINE_SHIM(rrIIiIiI, v);

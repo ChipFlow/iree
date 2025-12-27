@@ -292,6 +292,15 @@ IREE_VM_ABI_FIXED_STRUCT(rII, {
   int64_t i2;
 });
 
+// sparse_solver: analyze(device, n, nnz, row_ptr, col_idx) -> handle
+IREE_VM_ABI_FIXED_STRUCT(rIIrr, {
+  iree_vm_ref_t r0;
+  int64_t i1;
+  int64_t i2;
+  iree_vm_ref_t r3;
+  iree_vm_ref_t r4;
+});
+
 IREE_VM_ABI_FIXED_STRUCT(rif, {
   iree_vm_ref_t r0;
   int32_t i1;
@@ -447,6 +456,14 @@ IREE_VM_ABI_FIXED_STRUCT(rrrIii, {
   int64_t i3;
   int32_t i4;
   int32_t i5;
+});
+
+// sparse_solver: solve.batched(handle, rhs, solution, num_rhs)
+IREE_VM_ABI_FIXED_STRUCT(rrrI, {
+  iree_vm_ref_t r0;
+  iree_vm_ref_t r1;
+  iree_vm_ref_t r2;
+  int64_t i3;
 });
 
 IREE_VM_ABI_FIXED_STRUCT(rIrrIiiII, {
@@ -797,6 +814,7 @@ IREE_VM_ABI_DECLARE_SHIM(rr, ii);
 IREE_VM_ABI_DECLARE_SHIM(rr, iI);
 IREE_VM_ABI_DECLARE_SHIM(rrr, iI);
 IREE_VM_ABI_DECLARE_SHIM(rrr, r);
+IREE_VM_ABI_DECLARE_SHIM(rrr, v);    // dense_blas, sparse_solver: solve operations
 IREE_VM_ABI_DECLARE_SHIM(rrCrIID, v);
 IREE_VM_ABI_DECLARE_SHIM(rriCiD, v);
 IREE_VM_ABI_DECLARE_SHIM(rriiCID, v);
@@ -810,6 +828,8 @@ IREE_VM_ABI_DECLARE_SHIM(rrIrIIiI, v);
 IREE_VM_ABI_DECLARE_SHIM(riirIrIII, v);
 IREE_VM_ABI_DECLARE_SHIM(rrIii, v);
 IREE_VM_ABI_DECLARE_SHIM(rrrIii, v);
+IREE_VM_ABI_DECLARE_SHIM(rrrI, v);    // sparse_solver: solve.batched
+IREE_VM_ABI_DECLARE_SHIM(rIIrr, r);   // sparse_solver: analyze
 IREE_VM_ABI_DECLARE_SHIM(rIrrIiiII, r);
 IREE_VM_ABI_DECLARE_SHIM(rrIIIi, v);
 IREE_VM_ABI_DECLARE_SHIM(rrIIiIiI, v);
