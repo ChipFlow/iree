@@ -42,6 +42,19 @@ def LegalizeStableHLOCustomCalls :
   let summary = "Legalizes specialized custom calls to decomposed implementations";
 }
 
+def LegalizeStableHLOCholeskyToLinalg :
+    InterfacePass<"iree-stablehlo-legalize-cholesky-to-linalg", "mlir::FunctionOpInterface"> {
+  let summary = "Lowers stablehlo.cholesky to linalg and scf operations";
+  let description = [{
+    Converts stablehlo.cholesky operations to a sequence of linalg and scf
+    operations that compute Cholesky decomposition. This enables the operation
+    to be executed on any target without requiring external library support.
+
+    For high-performance execution, consider using platform-specific libraries
+    (Accelerate, cuSOLVER) or the sparse_solver module for sparse matrices.
+  }];
+}
+
 def LegalizeShapeComputations :
     InterfacePass<"iree-stablehlo-legalize-shape-computations", "mlir::FunctionOpInterface"> {
   let summary = "Legalizes StableHLO shape operations to core-mlir operations";

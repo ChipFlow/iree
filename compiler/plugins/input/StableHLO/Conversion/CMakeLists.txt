@@ -45,6 +45,7 @@ iree_cc_library(
     "LegalizeToLinalgUtils.cpp"
     "LegalizeToLinalgUtils.h"
     "MapStableHLOToScalarOp.h"
+    "StableHLOCholeskyToLinalg.cpp"
     "StableHLOCustomCalls.cpp"
     "StableHLOToIREEInputDialects.cpp"
     "StableHLOToLinalgExt.cpp"

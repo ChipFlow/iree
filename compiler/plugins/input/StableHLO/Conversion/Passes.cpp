@@ -91,6 +91,9 @@ void buildStableHLOInputConversionPassPipelineImpl(
       stablehlo::createConvertStableHloToLinalgExt());
   passManager.addNestedPass<func::FuncOp>(
       mlir::stablehlo::createChloLegalizeToStablehloPass());
+  // Lower stablehlo.cholesky to linalg/scf before general StableHLO lowering.
+  passManager.addNestedPass<func::FuncOp>(
+      createLegalizeStableHLOCholeskyToLinalg());
   passManager.addPass(createConvertStableHloToIreeInputDialects());
   passManager.addPass(createReconcileUnrealizedCastsPass());
 
