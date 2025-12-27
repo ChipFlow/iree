@@ -10,3 +10,36 @@ requires = [
     "sympy",
 ]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "iree-base-compiler"
+dynamic = ["version", "readme"]
+description = "IREE Compiler Python API"
+license = "Apache-2.0"
+authors = [
+    {name = "The IREE Team"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "sympy",
+]
+
+[project.optional-dependencies]
+onnx = [
+    "onnx>=1.16.0",
+]
+
+
+[project.urls]
+Homepage = "https://iree.dev"
+Repository = "https://github.com/iree-org/iree"
+
+[project.scripts]
+iree-compile = "iree.compiler.tools:_iree_compile_main"
+iree-opt = "iree.compiler.tools:_iree_opt_main"
+iree-link = "iree.compiler.tools:_iree_link_main"

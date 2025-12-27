@@ -4,6 +4,18 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+# Collect optional module dependencies and defines
+set(_OPTIONAL_DEPS "")
+set(_OPTIONAL_DEFINES "")
+if(IREE_EXTERNAL_DENSE_BLAS)
+  list(APPEND _OPTIONAL_DEPS iree::modules::dense_blas::dense_blas)
+  list(APPEND _OPTIONAL_DEFINES IREE_DENSE_BLAS_HAVE_METAL=1)
+endif()
+if(IREE_EXTERNAL_SPARSE_SOLVER)
+  list(APPEND _OPTIONAL_DEPS iree::modules::sparse_solver::sparse_solver)
+  list(APPEND _OPTIONAL_DEFINES IREE_SPARSE_SOLVER_HAVE_METAL=1)
+endif()
+
 iree_cc_library(
   NAME
     client
@@ -15,6 +27,9 @@ iree_cc_library(
     iree_pjrt::common
     iree::hal::drivers::metal
     iree::hal::drivers::metal::registration
+    ${_OPTIONAL_DEPS}
+  DEFINES
+    ${_OPTIONAL_DEFINES}
 )
 
 iree_cc_library(

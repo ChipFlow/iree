@@ -460,22 +460,6 @@ setup(
     description="IREE Python Compiler API",
     long_description=README,
     long_description_content_type="text/markdown",
-    license="Apache-2.0",
-    classifiers=[
-        "Development Status :: 3 - Alpha",
-        "License :: OSI Approved :: Apache Software License",
-        "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
-        "Programming Language :: Python :: 3.12",
-        "Programming Language :: Python :: 3.13",
-    ],
-    project_urls={
-        "homepage": "https://iree.dev/",
-        "repository": "https://github.com/iree-org/iree",
-        "documentation": "https://iree.dev/reference/bindings/python/",
-    },
     ext_modules=[
         CMakeExtension("iree.compiler._mlir_libs._mlir"),
         CMakeExtension("iree.compiler._mlir_libs._ireeDialects"),
@@ -509,13 +493,4 @@ setup(
             "iree-opt = iree.compiler.tools.scripts.iree_opt.__main__:main",
         ],
     },
-    install_requires=[
-        "numpy",
-        "sympy",
-    ],
-    extras_require={
-        "onnx": [
-            "onnx>=1.16.0",
-        ],
-    },
-)
+ )

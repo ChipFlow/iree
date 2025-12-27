@@ -6,8 +6,11 @@
 
 #include "iree_pjrt/common/api_impl.h"
 
+#include <cstdlib>
 #include <iterator>
+#include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <utility>
 
@@ -2016,6 +2019,36 @@ void LoadedExecutableInstance::BindApi(PJRT_Api* api) {
   };
 }
 
+std::vector<size_t> LoadedExecutableInstance::ParseDonationIndices(
+    iree_string_view_t indices) {
+  std::vector<size_t> result;
+  if (indices.size == 0) return result;
+
+  const char* start = indices.data;
+  const char* end = indices.data + indices.size;
+  const char* p = start;
+
+  while (p < end) {
+    // Skip whitespace
+    while (p < end && (*p == ' ' || *p == '\t')) ++p;
+    if (p >= end) break;
+
+    // Parse number
+    char* num_end;
+    long val = strtol(p, &num_end, 10);
+    if (num_end > p && val >= 0) {
+      result.push_back(static_cast<size_t>(val));
+    }
+    p = num_end;
+
+    // Skip to next comma or end
+    while (p < end && *p != ',') ++p;
+    if (p < end) ++p;  // Skip the comma
+  }
+
+  return result;
+}
+
 iree_status_t LoadedExecutableInstance::LoadAll() {
   IREE_TRACE_SCOPE();
   if (!resident_executables_.empty()) return iree_ok_status();
@@ -2049,6 +2082,15 @@ iree_status_t LoadedExecutableInstance::LoadAll() {
         iree_vm_function_signature(&loaded.main_function);
     IREE_RETURN_IF_ERROR(iree_vm_function_call_count_arguments_and_results(
         &sig, &loaded.arg_count, &loaded.result_count));
+
+    // Extract JAX buffer donation metadata from reflection attributes.
+    // Only do this once (for the first device).
+    if (donated_arg_indices_.empty()) {
+      iree_string_view_t donated_args = iree_vm_function_lookup_attr_by_name(
+          &loaded.main_function,
+          iree_make_cstring_view("jax.donated_args"));
+      donated_arg_indices_ = ParseDonationIndices(donated_args);
+    }
 
     // Defer to the client to populate the stack of modules.
     std::vector<iree::vm::ref<iree_vm_module_t>> modules;
@@ -2105,6 +2147,42 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
 
   // Make sure loaded.
   IREE_RETURN_IF_ERROR(LoadAll());
+
+  // Build the effective set of donated argument indices.
+  // Start with compile-time donation info, then remove any runtime overrides.
+  std::set<size_t> effective_donated_indices(donated_arg_indices_.begin(),
+                                              donated_arg_indices_.end());
+  if (args->options && args->options->num_non_donatable_input_indices > 0) {
+    for (size_t i = 0; i < args->options->num_non_donatable_input_indices; ++i) {
+      effective_donated_indices.erase(
+          args->options->non_donatable_input_indices[i]);
+    }
+  }
+
+  // Check for duplicate donated buffers.
+  // If the same buffer appears twice and at least one occurrence is donated,
+  // that's an error (the buffer would be invalidated while still in use).
+  for (size_t dev_index = 0; dev_index < args->num_devices; ++dev_index) {
+    std::map<BufferInstance*, size_t> buffer_first_occurrence;
+    for (size_t i = 0; i < args->num_args; ++i) {
+      auto* buffer = BufferInstance::Unwrap(args->argument_lists[dev_index][i]);
+      auto it = buffer_first_occurrence.find(buffer);
+      if (it != buffer_first_occurrence.end()) {
+        size_t first_idx = it->second;
+        // If either occurrence is donated, that's an error.
+        if (effective_donated_indices.count(first_idx) ||
+            effective_donated_indices.count(i)) {
+          return iree_make_status(
+              IREE_STATUS_INVALID_ARGUMENT,
+              "Buffer is donated but appears multiple times in argument list "
+              "(first at index %zu, again at index %zu). A buffer can only be "
+              "donated once per execution.",
+              first_idx, i);
+        }
+      }
+      buffer_first_occurrence[buffer] = i;
+    }
+  }
 
   // Timeline setup. There are two timelines that we synchronize to:
   // the main execution timeline, which preserves as-called ordering to
@@ -2235,6 +2313,20 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
     if (args->device_complete_events) {
       args->device_complete_events[dev_index] =
           *(new EventInstance(retain_ref(inv.wait_fence)));
+    }
+  }
+
+  // Mark donated buffers as deleted after successful execution.
+  // This prevents the caller from using the buffer again, which would be
+  // undefined behavior since the runtime may have reused the memory.
+  for (size_t dev_index = 0; dev_index < args->num_devices; ++dev_index) {
+    for (size_t i = 0; i < args->num_args; ++i) {
+      if (effective_donated_indices.count(i)) {
+        auto* buffer = BufferInstance::Unwrap(args->argument_lists[dev_index][i]);
+        // AsyncDeallocate marks the buffer as deleted and schedules deallocation
+        // to occur after any pending operations complete.
+        IREE_RETURN_IF_ERROR(buffer->AsyncDeallocate());
+      }
     }
   }
 

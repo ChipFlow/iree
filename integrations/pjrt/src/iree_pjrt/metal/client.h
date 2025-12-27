@@ -19,7 +19,12 @@ class MetalClientInstance final : public ClientInstance {
   iree_status_t CreateDriver(iree_hal_driver_t** out_driver) override;
   bool SetDefaultCompilerFlags(CompilerJob* compiler_job) override;
 
- private:
+ protected:
+  // Override to add dense_blas module for GPU-accelerated BLAS operations.
+  iree_status_t PopulateVMModules(
+      std::vector<iree::vm::ref<iree_vm_module_t>>& modules,
+      iree_hal_device_t* hal_device,
+      iree::vm::ref<iree_vm_module_t>& main_module) override;
 };
 
 }  // namespace iree::pjrt::metal

@@ -6,3 +6,47 @@ requires = [
     "cmake",
 ]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "iree-pjrt-plugin-metal"
+version = "0.1.dev1"
+description = "IREE PJRT Plugin for Metal (macOS)"
+license = "Apache-2.0"
+authors = [
+    {name = "The IREE Team", email = "iree-technical-discussion@lists.lfaidata.foundation"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS :: MacOS X",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "iree-base-compiler",
+    "jax",
+    "jaxlib>=0.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/iree-org/iree"
+
+[project.entry-points."jax_plugins"]
+iree-metal = "jax_plugins.iree_metal"
+
+# Note: packages and package-data are configured in setup.py
+# because they depend on the cmake build output directory
+
+[tool.uv.sources]
+# Use patched JAX (path relative to this package)
+jax = { path = "../../../../../jax", editable = true }
+
+[tool.uv]
+# Rebuild when setup.py changes (contains cmake args) or cmake env vars change
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "setup.py" },
+    { file = "../_setup_support/iree_pjrt_setup.py" },
+    { env = "CMAKE_C_COMPILER_LAUNCHER" },
+    { env = "CMAKE_CXX_COMPILER_LAUNCHER" },
+    { env = "IREE_CMAKE_BUILD_TYPE" },
+]

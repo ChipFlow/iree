@@ -6,63 +6,42 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-# Early splice the _setup_support directory onto the python path.
-import os
-from pathlib import Path
-import sys
+"""
+Build configuration for iree-pjrt-plugin-cuda.
 
-THIS_DIR = os.path.realpath(os.path.dirname(__file__))
-sys.path.insert(0, os.path.join(THIS_DIR, "..", "_setup_support"))
-
-import iree_pjrt_setup
-from setuptools import setup, find_namespace_packages
-
-README = r"""
-OpenXLA PJRT Plugin for CUDA
+Metadata is in pyproject.toml; this file handles cmake build orchestration
+using the setuptools SubCommand protocol for proper uv/pip compatibility.
 """
 
-# Setup and get version information.
-CMAKE_BUILD_DIR_ABS = os.path.join(THIS_DIR, "build", "cmake")
+import os
+import sys
+from pathlib import Path
 
+THIS_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(THIS_DIR.parent / "_setup_support"))
 
-class CMakeBuildPy(iree_pjrt_setup.BaseCMakeBuildPy):
-    def build_default_configuration(self):
-        print("*****************************", file=sys.stderr)
-        print("* Building base runtime     *", file=sys.stderr)
-        print("*****************************", file=sys.stderr)
-        self.build_configuration(
-            os.path.join(THIS_DIR, "build", "cmake"),
-            extra_cmake_args=("-DIREE_HAL_DRIVER_CUDA=ON",),
-        )
-        print("Target populated.", file=sys.stderr)
+import iree_pjrt_setup
+from setuptools import setup
 
+CMAKE_BUILD_DIR = THIS_DIR / "build" / "cmake"
+OUTPUT_DIR = CMAKE_BUILD_DIR / "python" / "iree" / "_pjrt_libs" / "cuda"
 
-iree_pjrt_setup.populate_built_package(
-    os.path.join(
-        CMAKE_BUILD_DIR_ABS,
-        "python",
-        "iree",
-        "_pjrt_libs",
-        "cuda",
-    )
+# Create the build_cmake subclass configured for cuda plugin
+CudaBuildCMake = iree_pjrt_setup.create_cmake_build_class(
+    cmake_source_dir=str(THIS_DIR.parent.parent.parent),  # integrations/pjrt
+    cmake_build_dir=str(CMAKE_BUILD_DIR),
+    extra_cmake_args=(
+        "-DIREE_HAL_DRIVER_CUDA=ON",
+    ),
+    output_dir="iree/_pjrt_libs/cuda",
+    output_files=["pjrt_plugin_iree_cuda.*", "*.so"],
 )
 
+# Ensure the build output directory exists for setuptools package discovery
+iree_pjrt_setup.populate_built_package(str(OUTPUT_DIR))
 
 setup(
-    name=f"iree-pjrt-plugin-cuda{iree_pjrt_setup.PACKAGE_SUFFIX}",
-    version=f"{iree_pjrt_setup.PACKAGE_VERSION}",
-    author="The IREE Team",
-    author_email="iree-technical-discussion@lists.lfaidata.foundation",
-    license="Apache-2.0",
-    description="IREE PJRT Plugin for CUDA (generic)",
-    long_description=README,
-    long_description_content_type="text/markdown",
-    url="https://github.com/iree-org/iree",
-    classifiers=[
-        "Development Status :: 3 - Alpha",
-        "License :: OSI Approved :: Apache Software License",
-        "Programming Language :: Python :: 3",
-    ],
+    # Metadata comes from pyproject.toml
     packages=[
         "jax_plugins.iree_cuda",
         "iree._pjrt_libs.cuda",
@@ -72,22 +51,12 @@ setup(
         "iree._pjrt_libs.cuda": "build/cmake/python/iree/_pjrt_libs/cuda",
     },
     package_data={
-        "iree._pjrt_libs.cuda": ["pjrt_plugin_iree_cuda.*"],
+        "iree._pjrt_libs.cuda": ["pjrt_plugin_iree_cuda.*", "*.so"],
     },
     cmdclass={
         "build": iree_pjrt_setup.PjrtPluginBuild,
-        "build_py": CMakeBuildPy,
+        "build_cmake": CudaBuildCMake,
         "bdist_wheel": iree_pjrt_setup.bdist_wheel,
-        "install": iree_pjrt_setup.platlib_install,
     },
-    zip_safe=False,  # Needs to reference embedded shared libraries.
-    entry_points={
-        # We must advertise which Python modules should be treated as loadable
-        # plugins. This augments the path based scanning that Jax does, which
-        # is not always robust to all packaging circumstances.
-        "jax_plugins": [
-            "iree-cuda = jax_plugins.iree_cuda",
-        ],
-    },
-    install_requires=iree_pjrt_setup.install_requires,
+    zip_safe=False,
 )

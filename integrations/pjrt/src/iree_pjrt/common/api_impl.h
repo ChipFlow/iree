@@ -442,11 +442,20 @@ class LoadedExecutableInstance {
   // we just give it the raw C argument struct vs breaking it down.
   iree_status_t BatchExecute(PJRT_LoadedExecutable_Execute_Args* args);
 
+  // Returns the indices of arguments marked for buffer donation.
+  const std::vector<size_t>& donated_arg_indices() const {
+    return donated_arg_indices_;
+  }
+
  private:
+  // Parses a comma-separated string of indices (e.g. "0,2,5") into a vector.
+  static std::vector<size_t> ParseDonationIndices(iree_string_view_t indices);
+
   ClientInstance& client_;
   ExecutableImage* image_;  // Ref-counted semantics.
   std::vector<DeviceInstance*> addressable_devices_;
   std::vector<ResidentExecutable> resident_executables_;
+  std::vector<size_t> donated_arg_indices_;
 };
 
 //===----------------------------------------------------------------------===//
