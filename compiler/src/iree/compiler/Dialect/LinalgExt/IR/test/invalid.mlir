@@ -104,25 +104,8 @@ func.func @scatter_invalid_dim_map_entries(
     %update : tensor<?x?xf32>, %indices : tensor<?x1xi32>,
     %original : tensor<?x?xf32>) -> tensor<?x?xf32> {
   // expected-error @below {{'iree_linalg_ext.scatter' op dimension map is invalid.}}
-  // expected-note @below {{element (2) at index#0 is out of bounds}}
+  // expected-note @below {{element (2) at index#0 is out of bounds for rank 2 tensor}}
   %0 = iree_linalg_ext.scatter dimension_map = [2] unique_indices(true)
-      ins(%update, %indices : tensor<?x?xf32>, tensor<?x1xi32>)
-      outs(%original : tensor<?x?xf32>) {
-      ^bb0(%arg1: f32, %arg2: f32):
-        %1 = arith.addf %arg1, %arg2 : f32
-        iree_linalg_ext.yield %1 : f32
-      } -> tensor<?x?xf32>
-  return %0 : tensor<?x?xf32>
-}
-
-// -----
-
-func.func @scatter_invalid_dim_map_entries(
-    %update : tensor<?x?xf32>, %indices : tensor<?x1xi32>,
-    %original : tensor<?x?xf32>) -> tensor<?x?xf32> {
-  // expected-error @below {{'iree_linalg_ext.scatter' op dimension map is invalid.}}
-  // expected-note @below {{element (1) at index#0 is out of bounds}}
-  %0 = iree_linalg_ext.scatter dimension_map = [1] unique_indices(true)
       ins(%update, %indices : tensor<?x?xf32>, tensor<?x1xi32>)
       outs(%original : tensor<?x?xf32>) {
       ^bb0(%arg1: f32, %arg2: f32):
@@ -400,7 +383,8 @@ func.func @scatter_yield_mismatch(
 func.func @scatter_index_depth_too_large(
     %original: tensor<?x?xf32>, %indices: tensor<?x3xi32>,
     %update: tensor<?x?xf32>) -> tensor<?x?xf32> {
-  // expected-error @below {{'iree_linalg_ext.scatter' op expected update to be at least the rank of non indexed original dims}}
+  // expected-error @below {{'iree_linalg_ext.scatter' op dimension map is invalid.}}
+  // expected-note @below {{element (2) at index#2 is out of bounds for rank 2 tensor}}
   %0 = iree_linalg_ext.scatter
     dimension_map = [0, 1, 2]
     unique_indices(true)
@@ -473,7 +457,8 @@ func.func @gather_indices_batch_rank_too_large(
 func.func @gather_dim_map_mismatch(
     %source : tensor<2xf32>, %idx : tensor<1xi32>,
     %output : tensor<1xf32>) -> tensor<1xf32> {
-  // expected-error @below {{'iree_linalg_ext.gather' op expected output to be at least the rank of non indexed source dims}}
+  // expected-error @below {{'iree_linalg_ext.gather' op dimension map is invalid.}}
+  // expected-note @below {{element (1) at index#1 is out of bounds for rank 1 tensor}}
   %0 = iree_linalg_ext.gather
     dimension_map = [0, 1]
     ins(%source, %idx : tensor<2xf32>, tensor<1xi32>)

@@ -461,6 +461,34 @@ func.func @scatter_update_slice_2D(
 
 // -----
 
+// Test that dimension_map = [1] works with a rank-2 tensor (indexes second dim)
+func.func @scatter_dim1_of_rank2_tensor(
+    %original: tensor<?x?xi32>, %indices: tensor<?x1xi32>,
+    %updates: tensor<?x?xi32>) -> tensor<?x?xi32> {
+  %0 = iree_linalg_ext.scatter
+    dimension_map = [1]
+    unique_indices(true)
+    ins(%updates, %indices : tensor<?x?xi32>, tensor<?x1xi32>)
+    outs(%original : tensor<?x?xi32>)  {
+    ^bb0(%arg0: i32, %arg1: i32):
+      iree_linalg_ext.yield %arg0 : i32
+    } -> tensor<?x?xi32>
+  return %0 : tensor<?x?xi32>
+}
+// CHECK-LABEL: func.func @scatter_dim1_of_rank2_tensor(
+//  CHECK-SAME:   %[[ORIGINAL:[a-zA-Z0-9_]+]]
+//  CHECK-SAME:   %[[INDICES:[a-zA-Z0-9_]+]]
+//  CHECK-SAME:   %[[UPDATE:[a-zA-Z0-9_]+]]
+//       CHECK:   %[[RESULT:.+]] = iree_linalg_ext.scatter
+//  CHECK-SAME:     dimension_map = [1]
+//  CHECK-SAME:     unique_indices(true)
+//  CHECK-SAME:     ins(%[[UPDATE]], %[[INDICES]]
+//  CHECK-SAME:     outs(%[[ORIGINAL]]
+//       CHECK:     iree_linalg_ext.yield %{{.+}} : i32
+//       CHECK:   return %[[RESULT]]
+
+// -----
+
 func.func @scatter_batch_2D_dynamic(
     %update : tensor<48x?x?xf32>, %indices : tensor<48x?x1xi32>,
     %original : tensor<?x?xf32>) -> tensor<?x?xf32> {

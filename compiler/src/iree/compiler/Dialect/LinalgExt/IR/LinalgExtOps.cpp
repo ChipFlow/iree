@@ -104,16 +104,17 @@ static bool allIndexingsAreProjectedPermutation(IndexingMapOpInterface op) {
   });
 }
 
-/// Emit an error and return failure when `seq` is invalid. It is only valid
-/// when it is a permutation of the sequence 0...length(seq) - 1.
+/// Validate dimension map entries are valid indices into a tensor of given
+/// rank. Elements must be non-negative, less than tensorRank, and unique.
 static LogicalResult
-isPermSequence(function_ref<InFlightDiagnostic()> emitError,
-               ArrayRef<int64_t> seq) {
-  BitVector seen(seq.size(), false);
-  for (auto [idx, dim] : llvm::enumerate(seq)) {
-    if (dim < 0 || dim >= seq.size()) {
-      return emitError().attachNote() << "element (" << dim << ") at index#"
-                                      << idx << " is out of bounds";
+isDimensionMapValid(function_ref<InFlightDiagnostic()> emitError,
+                    ArrayRef<int64_t> dimMap, int64_t tensorRank) {
+  BitVector seen(tensorRank, false);
+  for (auto [idx, dim] : llvm::enumerate(dimMap)) {
+    if (dim < 0 || dim >= tensorRank) {
+      return emitError().attachNote()
+             << "element (" << dim << ") at index#" << idx
+             << " is out of bounds for rank " << tensorRank << " tensor";
     }
     if (seen.test(dim)) {
       return emitError().attachNote()
@@ -169,9 +170,9 @@ verifyGatherScatter(OpTy op, int64_t sliceRank, ShapedType originalType,
   }
 
   ArrayRef<int64_t> dimMap = op.getDimensionMap();
-  if (failed(isPermSequence(
+  if (failed(isDimensionMapValid(
           [&]() { return op->emitOpError("dimension map is invalid."); },
-          dimMap))) {
+          dimMap, originalType.getRank()))) {
     return failure();
   }
 
