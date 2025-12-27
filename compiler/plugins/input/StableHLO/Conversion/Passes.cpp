@@ -41,6 +41,10 @@ void registerStableHLOConversionPassPipeline() {
 // Prepare HLO for use as an input to the Flow dialect.
 void buildStableHLOInputConversionPassPipelineImpl(
     OpPassManager &passManager, const StableHloOptions &options, bool detuple) {
+  // Extract JAX buffer donation metadata BEFORE any transformations.
+  // This preserves tf.aliasing_output attributes as iree.reflection metadata.
+  passManager.addPass(InputConversion::createExtractJaxDonationMetadataPass());
+
   // Having both StableHLO and VHLO in the same module is not supported.
   // If the input is VHLO, then it is automatically converted to StableHLO.
   // If the input is StableHLO, this pass is considered a NOP.
