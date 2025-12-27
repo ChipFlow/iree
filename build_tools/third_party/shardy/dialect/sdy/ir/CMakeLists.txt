@@ -8,48 +8,51 @@
 # TableGen and library definitions
 
 set(SDY_IR_SOURCE_DIR "${SHARDY_SOURCE_DIR}/shardy/dialect/sdy/ir")
+# Shardy uses includes like "shardy/dialect/..." - the shardy repo contains a shardy/ subdirectory
+# so SHARDY_SOURCE_DIR (the git repo root) is the correct include path
+set(SDY_TABLEGEN_INCLUDE_DIR "${SHARDY_SOURCE_DIR}")
 
 # TableGen include path
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
-include_directories(${SDY_IR_SOURCE_DIR})
+include_directories(${SDY_TABLEGEN_INCLUDE_DIR})
 
 set(LLVM_TARGET_DEFINITIONS ${SDY_IR_SOURCE_DIR}/dialect.td)
-mlir_tablegen(dialect.h.inc -gen-dialect-decls)
-mlir_tablegen(dialect.cc.inc -gen-dialect-defs)
+mlir_tablegen(dialect.h.inc -gen-dialect-decls EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
+mlir_tablegen(dialect.cc.inc -gen-dialect-defs EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
 add_public_tablegen_target(SdyDialectIncGen)
 add_dependencies(mlir-headers SdyDialectIncGen)
 
 set(LLVM_TARGET_DEFINITIONS ${SDY_IR_SOURCE_DIR}/ops.td)
-mlir_tablegen(ops.h.inc -gen-op-decls)
-mlir_tablegen(ops.cc.inc -gen-op-defs)
+mlir_tablegen(ops.h.inc -gen-op-decls EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
+mlir_tablegen(ops.cc.inc -gen-op-defs EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
 add_public_tablegen_target(SdyOpsIncGen)
 add_dependencies(mlir-headers SdyOpsIncGen)
 
 set(LLVM_TARGET_DEFINITIONS ${SDY_IR_SOURCE_DIR}/attrs.td)
-mlir_tablegen(attrs.h.inc -gen-attrdef-decls)
-mlir_tablegen(attrs.cc.inc -gen-attrdef-defs)
+mlir_tablegen(attrs.h.inc -gen-attrdef-decls EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
+mlir_tablegen(attrs.cc.inc -gen-attrdef-defs EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
 add_public_tablegen_target(SdyAttrsIncGen)
 add_dependencies(mlir-headers SdyAttrsIncGen)
 
 set(LLVM_TARGET_DEFINITIONS ${SDY_IR_SOURCE_DIR}/enums.td)
-mlir_tablegen(enums.h.inc -gen-enum-decls)
-mlir_tablegen(enums.cc.inc -gen-enum-defs)
+mlir_tablegen(enums.h.inc -gen-enum-decls EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
+mlir_tablegen(enums.cc.inc -gen-enum-defs EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
 add_public_tablegen_target(SdyEnumsIncGen)
 add_dependencies(mlir-headers SdyEnumsIncGen)
 
 set(LLVM_TARGET_DEFINITIONS ${SDY_IR_SOURCE_DIR}/op_interface.td)
-mlir_tablegen(op_interface.h.inc -gen-op-interface-decls)
-mlir_tablegen(op_interface.cc.inc -gen-op-interface-defs)
+mlir_tablegen(op_interface.h.inc -gen-op-interface-decls EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
+mlir_tablegen(op_interface.cc.inc -gen-op-interface-defs EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
 add_public_tablegen_target(SdyOpInterfaceIncGen)
 add_dependencies(mlir-headers SdyOpInterfaceIncGen)
 
 set(LLVM_TARGET_DEFINITIONS ${SDY_IR_SOURCE_DIR}/canonicalization.td)
-mlir_tablegen(canonicalization.cc.inc -gen-rewriters)
+mlir_tablegen(canonicalization.cc.inc -gen-rewriters EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
 add_public_tablegen_target(SdyCanonicalizationIncGen)
 add_dependencies(mlir-headers SdyCanonicalizationIncGen)
 
 set(LLVM_TARGET_DEFINITIONS ${SDY_IR_SOURCE_DIR}/bytecode.td)
-mlir_tablegen(bytecode.cc.inc -gen-bytecode -bytecode-dialect=sdy)
+mlir_tablegen(bytecode.cc.inc -gen-bytecode -bytecode-dialect=sdy EXTRA_INCLUDES ${SDY_TABLEGEN_INCLUDE_DIR})
 add_public_tablegen_target(SdyBytecodeIncGen)
 add_dependencies(mlir-headers SdyBytecodeIncGen)
 
@@ -94,7 +97,7 @@ add_mlir_dialect_library(SdyDialect
 
 target_include_directories(SdyDialect PUBLIC
   $<BUILD_INTERFACE:${SHARDY_SOURCE_DIR}>
-  $<BUILD_INTERFACE:${SHARDY_BINARY_DIR}>
+  $<BUILD_INTERFACE:${SHARDY_BINARY_DIR}/..>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
 )
@@ -106,7 +109,7 @@ add_library(SdyDialectRegister
 
 target_include_directories(SdyDialectRegister PUBLIC
   $<BUILD_INTERFACE:${SHARDY_SOURCE_DIR}>
-  $<BUILD_INTERFACE:${SHARDY_BINARY_DIR}>
+  $<BUILD_INTERFACE:${SHARDY_BINARY_DIR}/..>
 )
 
 target_link_libraries(SdyDialectRegister PUBLIC

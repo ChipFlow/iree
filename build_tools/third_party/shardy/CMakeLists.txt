@@ -20,8 +20,10 @@ set(SHARDY_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 # Include directories for TableGen and compilation
 include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
-include_directories(${SHARDY_SOURCE_DIR})
-include_directories(${SHARDY_BINARY_DIR})
+# Shardy uses includes like "shardy/dialect/..." - source has shardy/shardy/dialect,
+# but cmake builds to shardy/dialect (one less level)
+include_directories(${SHARDY_SOURCE_DIR})    # for source: shardy/dialect/... -> third_party/shardy/shardy/dialect/...
+include_directories(${SHARDY_BINARY_DIR}/..) # for generated: shardy/dialect/... -> build_tools/third_party/shardy/dialect/...
 
 # Build common utilities
 add_subdirectory(common)
