@@ -40,6 +40,7 @@ iree_cc_library(
     "Passes.h"
   SRCS
     "ConvertPrimitiveType.cpp"
+    "ExtractJaxDonationMetadata.cpp"
     "IREEImportPublic.cpp"
     "ImportMLProgram.cpp"
     "Passes.cpp"

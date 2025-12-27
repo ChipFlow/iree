@@ -22,6 +22,10 @@ namespace {
 
 void buildCommonInputConversionPassPipeline(
     OpPassManager &passManager, const TransformOptions &transformOptions) {
+  // Extract JAX donation metadata early, before it's lowered away.
+  // This preserves jax.buffer_donor attributes as iree.reflection metadata.
+  passManager.addPass(createExtractJaxDonationMetadataPass());
+
   passManager.addPass(createIREEImportPublicPass());
   passManager.addPass(createImportMLProgramPass());
   passManager.addPass(createSanitizeModuleNamesPass());

@@ -57,4 +57,19 @@ def PromoteBF16ToF32Pass : Pass<"iree-input-conversion-promote-bf16-to-f32", "ml
   let summary = "Promotes bf16 types to f32 types.";
 }
 
+//===----------------------------------------------------------------------===//
+// JAX Integration
+//===----------------------------------------------------------------------===//
+
+def ExtractJaxDonationMetadataPass :
+    Pass<"iree-extract-jax-donation-metadata", "ModuleOp"> {
+  let summary = "Extracts JAX buffer donation metadata and stores in iree.reflection.";
+  let description = [{
+    Scans function arguments for jax.buffer_donor attributes and records
+    donated argument indices in the function's iree.reflection dictionary.
+    This metadata survives compilation and can be queried at runtime by
+    the PJRT plugin to implement proper buffer donation semantics.
+  }];
+}
+
 #endif // IREE_COMPILER_INPUTCONVERSION_COMMON_PASSES
