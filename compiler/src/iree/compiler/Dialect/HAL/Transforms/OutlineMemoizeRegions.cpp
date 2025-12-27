@@ -39,6 +39,21 @@ namespace {
 //===----------------------------------------------------------------------===//
 
 static std::string getMemoizeNamePrefix(IREE::HAL::DeviceMemoizeOp memoizeOp) {
+  // Check if we're inside an initializer (which has no symbol name).
+  if (auto initOp =
+          memoizeOp->getParentOfType<IREE::Util::InitializerOp>()) {
+    // Use a name based on the initializer's position in the module.
+    // Count how many initializers come before this one.
+    auto moduleOp = initOp->getParentOfType<ModuleOp>();
+    unsigned initializerIndex = 0;
+    for (auto &op : moduleOp.getBody()->getOperations()) {
+      if (&op == initOp.getOperation())
+        break;
+      if (isa<IREE::Util::InitializerOp>(op))
+        ++initializerIndex;
+    }
+    return "__initializer_" + std::to_string(initializerIndex) + "_memoize";
+  }
   auto parentOp = memoizeOp->getParentOfType<FunctionOpInterface>();
   return ("__" + parentOp.getName() + "_memoize").str();
 }
