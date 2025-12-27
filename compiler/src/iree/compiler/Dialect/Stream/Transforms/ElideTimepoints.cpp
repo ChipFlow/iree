@@ -1212,7 +1212,19 @@ static bool tryFoldAwaitWithTimelineOps(IREE::Stream::TimepointAwaitOp awaitOp,
             if (!isCovered) {
               // PROACTIVE: Timeline op DOESN'T cover the await timepoint.
               // We'll absorb the await into the timeline op after the walk
-              // completes.
+              // completes. But first, we need to check that the awaitTimepoint
+              // dominates the timeline op - otherwise we'd create a use before
+              // definition (SSA dominance violation).
+              if (!domInfo.properlyDominates(awaitTimepoint, timelineOp)) {
+                LLVM_DEBUG({
+                  llvm::dbgs()
+                      << "[ElideTimepoints] skipping absorption: awaitTimepoint ";
+                  awaitTimepoint.printAsOperand(llvm::dbgs(),
+                                                analysis.getAsmState());
+                  llvm::dbgs() << " does not dominate timeline op\n";
+                });
+                return WalkResult::advance();
+              }
               LLVM_DEBUG({
                 llvm::dbgs()
                     << "[ElideTimepoints] will absorb await into timeline op "
@@ -1223,7 +1235,9 @@ static bool tryFoldAwaitWithTimelineOps(IREE::Stream::TimepointAwaitOp awaitOp,
               });
               modifications.push_back(
                   {timelineOp, operand.get(), asyncValue, true});
-              didChange = true;
+              // NOTE: didChange is set later when we actually apply the
+              // modification, to avoid false positives when dominance
+              // constraints prevent the change.
             } else {
               // REACTIVE: Timeline op DOES cover the await timepoint.
               // The timeline op already awaits this timepoint (or something
@@ -1237,7 +1251,9 @@ static bool tryFoldAwaitWithTimelineOps(IREE::Stream::TimepointAwaitOp awaitOp,
               });
               modifications.push_back(
                   {timelineOp, operand.get(), asyncValue, false});
-              didChange = true;
+              // NOTE: didChange is set later when we actually apply the
+              // modification, to avoid false positives when dominance
+              // constraints prevent the change.
             }
           }
           return WalkResult::advance();
@@ -1259,26 +1275,66 @@ static bool tryFoldAwaitWithTimelineOps(IREE::Stream::TimepointAwaitOp awaitOp,
     auto timelineOp = cast<IREE::Stream::TimelineOpInterface>(timelineOpPtr);
     OpBuilder builder(timelineOp);
     SmallVector<Value> newAwaitTimepoints(timelineOp.getAwaitTimepoints());
+    size_t originalSize = newAwaitTimepoints.size();
 
-    // Add unique timepoints (avoid duplicates).
+    // Add unique timepoints (avoid duplicates and covered timepoints).
+    // We need to check both Value identity AND coverage, because after
+    // setAwaitTimepoints is called, the timeline op's await list might
+    // contain a join that covers the timepoint we're trying to add.
     for (Value timepoint : timepoints) {
-      if (!llvm::is_contained(newAwaitTimepoints, timepoint)) {
-        newAwaitTimepoints.push_back(timepoint);
+      // Skip if already in the list (Value identity).
+      if (llvm::is_contained(newAwaitTimepoints, timepoint)) {
+        continue;
       }
+      // Skip if directly covered by existing await timepoints.
+      // This prevents infinite loops where we keep adding the same timepoint
+      // to joins that already cover it.
+      // Note: We can't use analysis.covers() here because the analysis was
+      // computed at the start of the pass and doesn't know about joins we
+      // created during this invocation. Instead, we directly check if the
+      // timepoint is an operand of any join in the await list.
+      bool isCovered = false;
+      for (Value existingTp : newAwaitTimepoints) {
+        if (existingTp == timepoint) {
+          isCovered = true;
+          break;
+        }
+        // Check if existingTp is a join that contains timepoint.
+        if (auto joinOp = existingTp.getDefiningOp<IREE::Stream::TimepointJoinOp>()) {
+          for (Value joinOperand : joinOp.getAwaitTimepoints()) {
+            if (joinOperand == timepoint) {
+              isCovered = true;
+              break;
+            }
+          }
+        }
+        if (isCovered) break;
+      }
+      if (isCovered) {
+        continue;
+      }
+      newAwaitTimepoints.push_back(timepoint);
     }
 
-    timelineOp.setAwaitTimepoints(newAwaitTimepoints, builder);
-    LLVM_DEBUG({
-      llvm::dbgs() << "[ElideTimepoints] absorbed await into timeline op ";
-      timelineOp.print(llvm::dbgs(), analysis.getAsmState());
-      llvm::dbgs() << "\n";
-    });
+    // Only update if we actually added new timepoints.
+    if (newAwaitTimepoints.size() > originalSize) {
+      timelineOp.setAwaitTimepoints(newAwaitTimepoints, builder);
+      didChange = true;
+      LLVM_DEBUG({
+        llvm::dbgs() << "[ElideTimepoints] absorbed await into timeline op ";
+        timelineOp.print(llvm::dbgs(), analysis.getAsmState());
+        llvm::dbgs() << "\n";
+      });
+    }
   }
 
   // Phase 2: Replace all operand values with async values.
   // Use replaceUsesWithIf to safely update only the uses within the timeline
   // ops we're modifying.
   for (auto &mod : modifications) {
+    // Count uses before so we can detect if anything changed.
+    unsigned useCountBefore = std::distance(mod.oldValue.use_begin(),
+                                            mod.oldValue.use_end());
     mod.oldValue.replaceUsesWithIf(mod.newValue, [&](OpOperand &use) {
       if (use.getOwner() != mod.timelineOp.getOperation()) {
         return false;
@@ -1338,6 +1394,11 @@ static bool tryFoldAwaitWithTimelineOps(IREE::Stream::TimepointAwaitOp awaitOp,
                                          mod.oldValue.getDefiningOp());
       }
     });
+    unsigned useCountAfter = std::distance(mod.oldValue.use_begin(),
+                                           mod.oldValue.use_end());
+    if (useCountBefore != useCountAfter) {
+      didChange = true;
+    }
   }
 
   // Phase 3: Erase the await op if all its results are now unused.
@@ -1534,6 +1595,16 @@ static bool tryElideTimepointsInRegion(Region &region,
   auto elideTimepointOperand = [&](Operation *op, Value elidedTimepoint) {
     if (isDefinedImmediate(elidedTimepoint))
       return; // already immediate
+    // Count uses in this op before replacement.
+    unsigned useCountBefore = 0;
+    for (auto &use : elidedTimepoint.getUses()) {
+      if (use.getOwner() == op) {
+        ++useCountBefore;
+      }
+    }
+    if (useCountBefore == 0) {
+      return; // no uses to replace
+    }
     auto immediateTimepoint = makeImmediate(elidedTimepoint, OpBuilder(op));
     elidedTimepoint.replaceUsesWithIf(
         immediateTimepoint,
@@ -1561,11 +1632,19 @@ static bool tryElideTimepointsInRegion(Region &region,
 
   // Elides |elidedTimepoint| by replacing all its uses with an immediate
   // timepoint value. The original value will end up with zero uses.
+  // NOTE: We don't set didChange here - we defer that to the replacement loop
+  // which will only signal change if we actually replace at least one use.
+  // This is important because dominance constraints may prevent some
+  // replacements in loops, and we don't want to signal change if nothing
+  // actually changed.
   auto elideTimepointResult = [&](Operation *op, Value elidedTimepoint) {
     if (elidedTimepoint.use_empty())
       return; // no-op
     if (isDefinedImmediate(elidedTimepoint))
       return; // already immediate
+    // Check if we've already scheduled a replacement for this timepoint.
+    if (pendingReplacements.count(elidedTimepoint))
+      return; // already scheduled
     OpBuilder afterBuilder(op);
     afterBuilder.setInsertionPointAfterValue(elidedTimepoint);
     Value immediateTimepoint = IREE::Stream::TimepointImmediateOp::create(
@@ -1573,7 +1652,8 @@ static bool tryElideTimepointsInRegion(Region &region,
     // Defer actually swapping until later.
     pendingReplacements.insert(
         std::make_pair(elidedTimepoint, immediateTimepoint));
-    didChange = true;
+    // didChange is set in the replacement loop below if we actually replace
+    // any uses.
   };
 
   // Elides all timepoint results of |op| that are immediately resolved.
@@ -1746,8 +1826,32 @@ static bool tryElideTimepointsInRegion(Region &region,
 
   // Process elided results; we do this afterward to keep the debug output
   // cleaner by not adding <<UNKNOWN VALUES>>.
+  // We use replaceUsesWithIf to only replace uses that the new value
+  // dominates. This is important for loops where a timepoint from one
+  // iteration might be used in a join with timepoints from previous
+  // iterations, and the immediate inserted after the defining op won't
+  // dominate uses in predecessor blocks.
   for (auto replacement : pendingReplacements) {
-    replacement.first.replaceAllUsesWith(replacement.second);
+    Value oldValue = replacement.first;
+    Value newValue = replacement.second;
+    // Count uses before replacement so we can detect if anything changed.
+    unsigned useCountBefore = std::distance(oldValue.use_begin(),
+                                            oldValue.use_end());
+    oldValue.replaceUsesWithIf(newValue, [&](OpOperand &use) {
+      return domInfo.properlyDominates(newValue, use.getOwner());
+    });
+    unsigned useCountAfter = std::distance(oldValue.use_begin(),
+                                           oldValue.use_end());
+    if (useCountBefore != useCountAfter) {
+      // We actually replaced some uses.
+      didChange = true;
+    }
+    // If the immediate has no uses (couldn't replace any uses due to
+    // dominance constraints), clean it up to avoid creating dead ops
+    // every iteration.
+    if (newValue.use_empty()) {
+      newValue.getDefiningOp()->erase();
+    }
   }
 
   return didChange;
@@ -1793,8 +1897,10 @@ struct ElideTimepointsPass
           tryElideTimepointsInRegion(*region, analysis, domInfo) || didChange;
     }
 
-    if (didChange)
+    // Temporary debug output removed
+    if (didChange) {
       signalFixedPointModified(moduleOp);
+    }
   }
 };
 
