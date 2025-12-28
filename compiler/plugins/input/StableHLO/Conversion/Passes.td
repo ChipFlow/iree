@@ -55,6 +55,20 @@ def LegalizeStableHLOCholeskyToLinalg :
   }];
 }
 
+def LegalizeStableHLOTriangularSolveToLinalg :
+    InterfacePass<"iree-stablehlo-legalize-triangular-solve-to-linalg", "mlir::FunctionOpInterface"> {
+  let summary = "Lowers stablehlo.triangular_solve to linalg and scf operations";
+  let description = [{
+    Converts stablehlo.triangular_solve operations to a sequence of linalg and
+    scf operations that compute forward or back substitution. This enables the
+    operation to be executed on any target without requiring external library
+    support.
+
+    For high-performance execution, consider using platform-specific BLAS
+    libraries (cuBLAS, rocBLAS, Accelerate).
+  }];
+}
+
 def LegalizeShapeComputations :
     InterfacePass<"iree-stablehlo-legalize-shape-computations", "mlir::FunctionOpInterface"> {
   let summary = "Legalizes StableHLO shape operations to core-mlir operations";

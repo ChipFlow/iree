@@ -94,6 +94,9 @@ void buildStableHLOInputConversionPassPipelineImpl(
   // Lower stablehlo.cholesky to linalg/scf before general StableHLO lowering.
   passManager.addNestedPass<func::FuncOp>(
       createLegalizeStableHLOCholeskyToLinalg());
+  // Lower stablehlo.triangular_solve to linalg/scf before general StableHLO lowering.
+  passManager.addNestedPass<func::FuncOp>(
+      createLegalizeStableHLOTriangularSolveToLinalg());
   passManager.addPass(createConvertStableHloToIreeInputDialects());
   passManager.addPass(createReconcileUnrealizedCastsPass());
 
