@@ -12,6 +12,8 @@
 #include <complex>
 #include <memory>
 
+#include "llvm/ADT/SmallBitVector.h"
+
 #include "compiler/plugins/input/StableHLO/Conversion/LegalizeToLinalgUtils.h"
 #include "compiler/plugins/input/StableHLO/Conversion/MapStableHLOToScalarOp.h"
 #include "compiler/plugins/input/StableHLO/Conversion/PassDetail.h"
@@ -217,6 +219,7 @@ struct ScatterOpConversion final
   static bool hasCanonicalDimensionNumbers(mlir::stablehlo::ScatterOp op) {
     auto dimNumbers = op.getScatterDimensionNumbers();
     auto indicesType = cast<ShapedType>(op.getScatterIndices().getType());
+    auto originalType = cast<ShapedType>(op.getInputs().front().getType());
     auto indicesRank = indicesType.getRank();
     auto indexVectorDim = dimNumbers.getIndexVectorDim();
     auto indexDepth = indicesType.getShape().back();
@@ -241,6 +244,15 @@ struct ScatterOpConversion final
         return false;
     }
 
+    // Verify that the number of update window dimensions matches the expected
+    // slice rank. LinalgExt scatter expects updates to have shape
+    // [batch..., slice...] where slice rank = original rank - index depth.
+    // If they don't match, this pattern can't be directly converted.
+    auto updateWindowDims = dimNumbers.getUpdateWindowDims();
+    int64_t expectedSliceRank = originalType.getRank() - indexDepth;
+    if (static_cast<int64_t>(updateWindowDims.size()) != expectedSliceRank)
+      return false;
+
     return true;
   }
 
@@ -261,11 +273,134 @@ struct ScatterOpConversion final
     Value updates = adaptor.getUpdates().front();
 
     auto originalType = dyn_cast<ShapedType>(original.getType());
+    auto updatesType = dyn_cast<ShapedType>(updates.getType());
+    auto indicesType = dyn_cast<ShapedType>(indices.getType());
+    auto dimNumbers = op.getScatterDimensionNumbers();
+
+    // Check for degenerate scatter: if the last dimension of indices is 0,
+    // there are no index vectors to scatter, so this is a no-op.
+    // Just return the original tensor unchanged.
+    if (indicesType.hasRank() && indicesType.getRank() > 0) {
+      int64_t indexDepth = indicesType.getShape().back();
+      if (indexDepth == 0) {
+        rewriter.replaceOp(op, original);
+        return success();
+      }
+    }
 
     llvm::SmallVector<int64_t> scatterDimMap;
-    for (auto dim :
-         op.getScatterDimensionNumbers().getScatterDimsToOperandDims()) {
+    for (auto dim : dimNumbers.getScatterDimsToOperandDims()) {
       scatterDimMap.push_back(dim);
+    }
+
+    // IREE LinalgExt scatter assumes indexed dimensions are the first N
+    // dimensions of original. If dimension_map is not [0, 1, ..., N-1],
+    // we need to transpose original to put indexed dimensions first,
+    // perform the scatter with canonical dimension_map, then transpose back.
+    bool needsTranspose = false;
+    SmallVector<int64_t> perm;
+    SmallVector<int64_t> inversePerm;
+
+    if (originalType.hasRank()) {
+      int64_t rank = originalType.getRank();
+      // Check if dimension_map is canonical [0, 1, ..., N-1]
+      for (size_t i = 0; i < scatterDimMap.size(); ++i) {
+        if (scatterDimMap[i] != static_cast<int64_t>(i)) {
+          needsTranspose = true;
+          break;
+        }
+      }
+
+      if (needsTranspose) {
+        // Build permutation: indexed dims first, then non-indexed dims
+        llvm::SmallBitVector indexed(rank);
+        for (int64_t d : scatterDimMap) {
+          indexed.set(d);
+        }
+
+        // Indexed dimensions come first (in order of dimension_map)
+        for (int64_t d : scatterDimMap) {
+          perm.push_back(d);
+        }
+        // Non-indexed dimensions follow
+        for (int64_t i = 0; i < rank; ++i) {
+          if (!indexed.test(i)) {
+            perm.push_back(i);
+          }
+        }
+
+        // Compute inverse permutation for transposing back
+        inversePerm.resize(rank);
+        for (int64_t i = 0; i < rank; ++i) {
+          inversePerm[perm[i]] = i;
+        }
+
+        // Transpose original using linalg.transpose
+        SmallVector<int64_t> transposedShape;
+        for (int64_t i = 0; i < rank; ++i) {
+          transposedShape.push_back(originalType.getDimSize(perm[i]));
+        }
+
+        // Create empty output for transpose
+        Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+            op.getLoc(), transposedShape, originalType.getElementType());
+        auto transposeOp = rewriter.create<linalg::TransposeOp>(
+            op.getLoc(), original, emptyTensor, perm);
+        original = transposeOp->getResult(0);
+        originalType = dyn_cast<ShapedType>(original.getType());
+
+        // Update dimension_map to canonical [0, 1, ..., N-1]
+        scatterDimMap.clear();
+        for (size_t i = 0; i < dimNumbers.getScatterDimsToOperandDims().size();
+             ++i) {
+          scatterDimMap.push_back(i);
+        }
+      }
+    }
+
+    // Squeeze trailing size-1 dimensions from updates if needed
+    if (updatesType.hasRank() && indicesType.hasRank() &&
+        originalType.hasRank()) {
+      int64_t indexDepth = scatterDimMap.size();
+      int64_t sliceRank = originalType.getRank() - indexDepth;
+      int64_t expectedBatchRank = indicesType.getRank() - 1;
+      int64_t expectedUpdatesRank = expectedBatchRank + sliceRank;
+
+      int64_t numToSqueeze = updatesType.getRank() - expectedUpdatesRank;
+
+      // Verify we're only squeezing trailing size-1 dimensions
+      bool canSqueeze = numToSqueeze > 0;
+      for (int64_t i = 0; i < numToSqueeze && canSqueeze; ++i) {
+        int64_t dim = updatesType.getRank() - 1 - i;
+        if (updatesType.getDimSize(dim) != 1) {
+          canSqueeze = false;
+        }
+      }
+
+      if (canSqueeze && numToSqueeze > 0) {
+        SmallVector<int64_t> newShape;
+        for (int64_t i = 0; i < expectedUpdatesRank; ++i) {
+          newShape.push_back(updatesType.getDimSize(i));
+        }
+
+        // Build reassociation map for collapse
+        SmallVector<ReassociationExprs> reassociation;
+        for (int64_t i = 0; i < static_cast<int64_t>(newShape.size()); ++i) {
+          reassociation.push_back({rewriter.getAffineDimExpr(i)});
+        }
+        // Merge the squeezed dims into the last dimension
+        if (!reassociation.empty()) {
+          for (int64_t i = newShape.size(); i < updatesType.getRank(); ++i) {
+            reassociation.back().push_back(rewriter.getAffineDimExpr(i));
+          }
+        }
+
+        auto newUpdatesType =
+            RankedTensorType::get(newShape, updatesType.getElementType());
+        updates = tensor::CollapseShapeOp::create(rewriter, op.getLoc(),
+                                                  newUpdatesType, updates,
+                                                  reassociation);
+      }
     }
 
     auto scatterOp = IREE::LinalgExt::ScatterOp::create(
@@ -285,7 +420,25 @@ struct ScatterOpConversion final
     signatureConverter.addInputs(0, argType);
     rewriter.applySignatureConversion(&region.front(), signatureConverter);
 
-    rewriter.replaceOp(op, scatterOp->getResults());
+    Value result = scatterOp->getResult(0);
+
+    // Transpose result back if we transposed the input
+    if (needsTranspose) {
+      auto resultType = dyn_cast<ShapedType>(result.getType());
+      SmallVector<int64_t> finalShape;
+      for (int64_t i = 0; i < resultType.getRank(); ++i) {
+        finalShape.push_back(resultType.getDimSize(inversePerm[i]));
+      }
+
+      // Create empty output for inverse transpose
+      Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+          op.getLoc(), finalShape, resultType.getElementType());
+      auto inverseTransposeOp = rewriter.create<linalg::TransposeOp>(
+          op.getLoc(), result, emptyTensor, inversePerm);
+      result = inverseTransposeOp->getResult(0);
+    }
+
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
