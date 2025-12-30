@@ -11,6 +11,7 @@
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
@@ -225,9 +226,21 @@ verifyGatherScatter(OpTy op, int64_t sliceRank, ShapedType originalType,
   }
 
   {
-    for (auto idx : llvm::seq<int64_t>(0, sliceRank)) {
+    // Compute the slice dimensions of original (dimensions NOT in dimension_map)
+    llvm::SmallBitVector indexedDims(originalType.getRank());
+    for (int64_t d : dimMap) {
+      indexedDims.set(d);
+    }
+    SmallVector<int64_t> sliceDims;
+    for (int64_t i = 0; i < originalType.getRank(); ++i) {
+      if (!indexedDims.test(i)) {
+        sliceDims.push_back(i);
+      }
+    }
+
+    // Validate that update slice dimensions match original slice dimensions
+    for (auto [idx, origDim] : llvm::enumerate(sliceDims)) {
       int64_t updateDim = idx + batchRank;
-      int64_t origDim = idx + indexDepth;
       if (originalType.isDynamicDim(origDim) ||
           updateType.isDynamicDim(updateDim)) {
         continue;
