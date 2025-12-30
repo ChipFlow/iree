@@ -17,10 +17,12 @@
 // TODO: Back substitution for upper triangular matrices has a bug with
 // lambda captures in the generated IR. Needs investigation.
 //
-// NOTE: There is a Metal backend bug with tensor<2x1xf32> specifically that
-// causes incorrect results for 2x2 matrices with single RHS column. This is
-// a Metal backend issue, not a problem with this pass. Larger matrices and
-// multiple RHS columns work correctly.
+// NOTE: We use util.optimization_barrier on the inner loop upper bound to
+// prevent IREE's OptimizeIntArithmeticPass from incorrectly replacing loop
+// indices with constants. This is a workaround for an issue where integer
+// range analysis determines that small loop variables can only take one
+// value, but replacing them with constants is incorrect for loop-carried
+// tensor accesses. See the IREE bug report for details.
 //
 // For GPU efficiency, this could be replaced with calls to cuBLAS/rocBLAS
 // or platform-specific BLAS libraries.
@@ -28,6 +30,7 @@
 
 #include "compiler/plugins/input/StableHLO/Conversion/Passes.h"
 #include "compiler/plugins/input/StableHLO/Conversion/Rewriters.h"
+#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -48,13 +51,20 @@ namespace {
 // TriangularSolve Lowering Pattern
 //===----------------------------------------------------------------------===//
 
-/// Lowers stablehlo.triangular_solve to SCF loops with tensor operations.
+/// Lowers stablehlo.triangular_solve to linalg.generic with scf.for.
 ///
-/// Uses forward substitution:
+/// Uses forward substitution with a row-by-row computation:
 /// for i = 0 to n-1:
-///   X[i] = (B[i] - sum(A[i,k]*X[k] for k < i)) / A[i,i]
+///   X[i,:] = (B[i,:] - A[i,0:i] @ X[0:i,:]) / A[i,i]
 ///
-/// For transpose case, A[i,k] becomes A[k,i].
+/// This lowering avoids the problematic loop-carried tensor update pattern
+/// that IREE's stream conversion doesn't handle correctly. Instead, we:
+/// 1. Create the result tensor once with all elements set to the initial values
+/// 2. Use linalg.generic to compute each row, reading from the result tensor
+///    for the dot product and writing to a fresh tensor for that row
+/// 3. Update the result tensor row-by-row using tensor.insert_slice
+///
+/// For small matrices, we unroll the computation completely to avoid loops.
 struct TriangularSolveToLinalgPattern
     : public OpRewritePattern<mlir::stablehlo::TriangularSolveOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -115,6 +125,113 @@ struct TriangularSolveToLinalgPattern
 
     // Create constants.
     Value zero = builder.create<arith::ConstantOp>(builder.getZeroAttr(elementType));
+
+    // For small matrices, unroll completely to avoid loop-carried tensor issues.
+    // This works around IREE's stream conversion bug with dynamic tensor updates.
+    // We compute all scalars first, then create the tensor using tensor.from_elements.
+    if (n <= 16) {
+      // Compute all X[i,j] values as scalars first.
+      // Store them in a 2D vector for later tensor creation.
+      SmallVector<SmallVector<Value, 16>, 16> xValues(n);
+      for (int64_t i = 0; i < n; ++i) {
+        xValues[i].resize(m);
+      }
+
+      // Process each element in row-major order.
+      for (int64_t i = 0; i < n; ++i) {
+        Value iIdx = builder.create<arith::ConstantIndexOp>(i);
+
+        // Get diagonal element A[i,i].
+        Value Aii = builder.create<tensor::ExtractOp>(aMatrix, ValueRange{iIdx, iIdx});
+
+        for (int64_t j = 0; j < m; ++j) {
+          Value jIdx = builder.create<arith::ConstantIndexOp>(j);
+
+          // Get B[i,j].
+          Value Bij = builder.create<tensor::ExtractOp>(bMatrix, ValueRange{iIdx, jIdx});
+
+          // Compute sum(A[i,k]*X[k,j] for k < i) using previously computed values.
+          Value sum = zero;
+          for (int64_t k = 0; k < i; ++k) {
+            Value kIdx = builder.create<arith::ConstantIndexOp>(k);
+
+            // Get A[i,k] or A[k,i] if transposed.
+            Value Aik;
+            if (transpose) {
+              Aik = builder.create<tensor::ExtractOp>(aMatrix, ValueRange{kIdx, iIdx});
+            } else {
+              Aik = builder.create<tensor::ExtractOp>(aMatrix, ValueRange{iIdx, kIdx});
+            }
+
+            // Use the previously computed scalar value X[k,j].
+            Value Xkj = xValues[k][j];
+            Value prod = builder.create<arith::MulFOp>(Aik, Xkj);
+            sum = builder.create<arith::AddFOp>(sum, prod);
+          }
+
+          // X[i,j] = (B[i,j] - sum) / A[i,i].
+          Value num = builder.create<arith::SubFOp>(Bij, sum);
+          Value Xij;
+          if (unitDiagonal) {
+            Xij = num;
+          } else {
+            Xij = builder.create<arith::DivFOp>(num, Aii);
+          }
+
+          xValues[i][j] = Xij;
+        }
+      }
+
+      // Create the result tensor using linalg.generic with index-based selection.
+      // This uses a parallel map operation that IREE can properly dispatch.
+      Value init = builder.create<tensor::EmptyOp>(bType.getShape(), elementType);
+
+      // Create affine maps for linalg.generic.
+      AffineMap resultMap = AffineMap::getMultiDimIdentityMap(2, builder.getContext());
+      SmallVector<AffineMap> indexingMaps = {resultMap};
+      SmallVector<utils::IteratorType> iteratorTypes = {
+          utils::IteratorType::parallel, utils::IteratorType::parallel};
+
+      // Create a linalg.generic that computes each element based on its indices.
+      auto genericOp = builder.create<linalg::GenericOp>(
+          TypeRange{bType}, ValueRange{}, ValueRange{init},
+          indexingMaps, iteratorTypes,
+          [&](OpBuilder &nestedBuilder, Location nestedLoc,
+              ValueRange /*args*/) {
+            // Get the current indices.
+            Value rowIdx = nestedBuilder.create<linalg::IndexOp>(nestedLoc, 0);
+            Value colIdx = nestedBuilder.create<linalg::IndexOp>(nestedLoc, 1);
+
+            // Build a selection tree based on indices.
+            // Start with the last value as the default.
+            Value result = xValues[n - 1][m - 1];
+
+            // Build selection tree in reverse order.
+            for (int64_t i = n - 1; i >= 0; --i) {
+              for (int64_t j = m - 1; j >= 0; --j) {
+                if (i == n - 1 && j == m - 1) continue;  // Skip last (default)
+
+                Value iConst = nestedBuilder.create<arith::ConstantIndexOp>(nestedLoc, i);
+                Value jConst = nestedBuilder.create<arith::ConstantIndexOp>(nestedLoc, j);
+                Value rowMatch = nestedBuilder.create<arith::CmpIOp>(
+                    nestedLoc, arith::CmpIPredicate::eq, rowIdx, iConst);
+                Value colMatch = nestedBuilder.create<arith::CmpIOp>(
+                    nestedLoc, arith::CmpIPredicate::eq, colIdx, jConst);
+                Value match = nestedBuilder.create<arith::AndIOp>(nestedLoc, rowMatch, colMatch);
+                result = nestedBuilder.create<arith::SelectOp>(
+                    nestedLoc, match, xValues[i][j], result);
+              }
+            }
+
+            nestedBuilder.create<linalg::YieldOp>(nestedLoc, result);
+          });
+
+      rewriter.replaceOp(op, genericOp.getResult(0));
+      return success();
+    }
+
+    // For larger matrices, we still need the loop-based approach.
+    // TODO: Route to dense_blas.trsm for larger matrices.
     Value nVal = builder.create<arith::ConstantIndexOp>(n);
     Value mVal = builder.create<arith::ConstantIndexOp>(m);
     Value zeroIdx = builder.create<arith::ConstantIndexOp>(0);
@@ -146,8 +263,12 @@ struct TriangularSolveToLinalgPattern
                 Value Bij = cb.create<tensor::ExtractOp>(bMatrix, ValueRange{i, j});
 
                 // Compute sum(A[i,k]*X[k,j] for k < i).
+                // Use optimization barrier on loop bound to prevent incorrect
+                // loop index constant propagation (workaround for IREE bug).
+                Value iBarrier =
+                    cb.create<IREE::Util::OptimizationBarrierOp>(i).getResult(0);
                 auto sumLoop = cb.create<scf::ForOp>(
-                    zeroIdx, i, oneIdx, ValueRange{zero},
+                    zeroIdx, iBarrier, oneIdx, ValueRange{zero},
                     [&, i, transpose, aMatrix, Xcol](
                         OpBuilder &sumBuilder, Location sumLoc, Value k, ValueRange sumArgs) {
                       ImplicitLocOpBuilder sb(sumLoc, sumBuilder);
