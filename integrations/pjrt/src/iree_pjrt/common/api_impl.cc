@@ -815,6 +815,82 @@ iree_status_t DeviceInstance::CreateFence(iree_hal_fence_t** out_fence) {
                                    out_fence);
 }
 
+iree_status_t DeviceInstance::CopyDeviceBuffer(BufferInstance* source,
+                                               BufferInstance** out_buffer) {
+  // Get source buffer info
+  iree_hal_buffer_view_t* source_view = source->buffer_view();
+  iree_hal_buffer_t* source_buffer = iree_hal_buffer_view_buffer(source_view);
+  iree_device_size_t buffer_size = iree_hal_buffer_byte_length(source_buffer);
+
+  // Get element type and shape from source
+  iree_hal_element_type_t element_type =
+      iree_hal_buffer_view_element_type(source_view);
+  size_t num_dims = iree_hal_buffer_view_shape_rank(source_view);
+  const iree_hal_dim_t* dims = iree_hal_buffer_view_shape_dims(source_view);
+
+  // Timeline setup
+  uint64_t wait_transfer_start = last_transfer_timepoint_;
+  uint64_t signal_alloc_complete = ++last_transfer_timepoint_;
+  uint64_t signal_copy_complete = ++last_transfer_timepoint_;
+
+  // Allocate destination buffer
+  iree_hal_buffer_params_t params;
+  memset(&params, 0, sizeof(params));
+  params.type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL;
+  params.usage = IREE_HAL_BUFFER_USAGE_DEFAULT |
+                 IREE_HAL_BUFFER_USAGE_TRANSFER_SOURCE |
+                 IREE_HAL_BUFFER_USAGE_TRANSFER_TARGET;
+
+  iree::vm::ref<iree_hal_buffer_t> dst_buffer;
+  IREE_RETURN_IF_ERROR(IreeApi::hal_device_queue_alloca(
+      device(), IREE_HAL_QUEUE_AFFINITY_ANY,
+      /*wait_semaphore_list=*/
+      {1, &transfer_timeline_, &wait_transfer_start},
+      /*signal_semaphore_list=*/
+      {1, &transfer_timeline_, &signal_alloc_complete},
+      IREE_HAL_ALLOCATOR_POOL_DEFAULT, params, buffer_size,
+      IREE_HAL_ALLOCA_FLAG_NONE, &dst_buffer));
+
+  // Create transfer command to copy from source to destination
+  iree_hal_transfer_command_t transfer_command;
+  memset(&transfer_command, 0, sizeof(transfer_command));
+  transfer_command.type = IREE_HAL_TRANSFER_COMMAND_TYPE_COPY;
+  transfer_command.copy.source_buffer = source_buffer;
+  transfer_command.copy.source_offset = 0;
+  transfer_command.copy.target_buffer = dst_buffer.get();
+  transfer_command.copy.target_offset = 0;
+  transfer_command.copy.length = buffer_size;
+
+  iree::vm::ref<iree_hal_command_buffer_t> transfer_cb;
+  IREE_RETURN_IF_ERROR(iree_hal_create_transfer_command_buffer(
+      device(), IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_QUEUE_AFFINITY_ANY,
+      /*transfer_count=*/1, &transfer_command, &transfer_cb));
+
+  // Execute the copy, waiting for allocation to complete
+  IREE_RETURN_IF_ERROR(IreeApi::hal_device_queue_execute(
+      device(), IREE_HAL_QUEUE_AFFINITY_ANY,
+      /*wait_semaphore_list=*/
+      {1, &transfer_timeline_, &signal_alloc_complete},
+      /*signal_semaphore_list=*/
+      {1, &transfer_timeline_, &signal_copy_complete}, transfer_cb.get()));
+
+  // Create buffer view for the copy
+  iree::vm::ref<iree_hal_buffer_view_t> result_buffer_view;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_create(
+      dst_buffer.get(), num_dims, dims, element_type,
+      IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR, client_.host_allocator(),
+      &result_buffer_view));
+
+  // Create BufferInstance for the copy
+  auto instance = new BufferInstance(*this, std::move(result_buffer_view));
+  instance->AdvanceReadyFence(transfer_timeline_.get(), signal_copy_complete);
+  instance->AdvanceDoneFence(transfer_timeline_.get(), signal_copy_complete);
+  *out_buffer = instance;
+
+  return iree_ok_status();
+}
+
 iree_status_t DeviceInstance::OpenDevice() {
   if (device_) return iree_ok_status();
   IREE_RETURN_IF_ERROR(iree_hal_driver_create_device_by_id(
@@ -2232,19 +2308,36 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
                                              allocator, &inv.outputs));
 
     // Populate inputs.
+    // For non-donated inputs, we create copies to preserve the original
+    // buffers, since IREE may optimize operations to be in-place (e.g.,
+    // scatter) which would corrupt the original data.
     for (size_t i = 0; i < args->num_args; ++i) {
       auto* buffer = BufferInstance::Unwrap(args->argument_lists[dev_index][i]);
+      BufferInstance* input_buffer = buffer;
+
+      // If this input is NOT donated, create a copy to preserve the original.
+      // This prevents IREE's copy elision optimizations from corrupting
+      // non-donated input buffers.
+      if (!effective_donated_indices.count(i)) {
+        BufferInstance* copied_buffer = nullptr;
+        IREE_RETURN_IF_ERROR(
+            inv.res_exe->device_instance->CopyDeviceBuffer(buffer, &copied_buffer));
+        input_buffer = copied_buffer;
+        // Note: The copied buffer will be cleaned up when it's no longer
+        // referenced by the VM after execution.
+      }
+
       iree_vm_ref_t bv_ref =
-          iree_hal_buffer_view_retain_ref(buffer->buffer_view());
+          iree_hal_buffer_view_retain_ref(input_buffer->buffer_view());
       IREE_RETURN_IF_ERROR(
           iree_vm_list_push_ref_move(inv.inputs.get(), &bv_ref));
 
       // Extend the execute wait to include the input's ready signal.
       IREE_RETURN_IF_ERROR(IreeApi::hal_fence_extend(inv.wait_fence.get(),
-                                                     buffer->ready_fence()));
+                                                     input_buffer->ready_fence()));
 
       // And extend the buffer's done fence to close over this execution.
-      buffer->AdvanceDoneFence(inv.res_exe->device_instance->main_timeline(),
+      input_buffer->AdvanceDoneFence(inv.res_exe->device_instance->main_timeline(),
                                signal_timepoint);
     }
 

@@ -290,6 +290,12 @@ class DeviceInstance {
   // device.
   iree_status_t CreateFence(iree_hal_fence_t** out_fence);
 
+  // Creates a device-side copy of a buffer.
+  // Used to preserve non-donated input buffers that may be mutated in-place
+  // by IREE's compiled code (due to copy elision optimizations).
+  iree_status_t CopyDeviceBuffer(BufferInstance* source,
+                                 BufferInstance** out_buffer);
+
  private:
   iree_status_t OpenDevice();
   iree_status_t AcquireHostStagingBuffer(
