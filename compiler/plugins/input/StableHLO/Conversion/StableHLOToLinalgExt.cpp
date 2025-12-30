@@ -217,6 +217,7 @@ struct ScatterOpConversion final
   /// * Inserted window dims order: (0, ... , d)
   /// * Update window dims order: (d + 1, ... , m)
   static bool hasCanonicalDimensionNumbers(mlir::stablehlo::ScatterOp op) {
+    LLVM_DEBUG(llvm::dbgs() << "ScatterOpConversion: checking canonical dims\n");
     auto dimNumbers = op.getScatterDimensionNumbers();
     auto indicesType = cast<ShapedType>(op.getScatterIndices().getType());
     auto originalType = cast<ShapedType>(op.getInputs().front().getType());
@@ -225,23 +226,38 @@ struct ScatterOpConversion final
     auto indexDepth = indicesType.getShape().back();
     auto scatterDimsToOperandDims = dimNumbers.getScatterDimsToOperandDims();
 
-    if (indicesRank != 2)
+    if (indicesRank != 2) {
+      LLVM_DEBUG(llvm::dbgs() << "  FAIL: indicesRank=" << indicesRank << " != 2\n");
       return false;
-    if (indexVectorDim != indicesRank - 1)
+    }
+    if (indexVectorDim != indicesRank - 1) {
+      LLVM_DEBUG(llvm::dbgs() << "  FAIL: indexVectorDim=" << indexVectorDim
+                              << " != " << (indicesRank - 1) << "\n");
       return false;
-    if (scatterDimsToOperandDims.size() != indexDepth)
+    }
+    if (scatterDimsToOperandDims.size() != indexDepth) {
+      LLVM_DEBUG(llvm::dbgs() << "  FAIL: scatterDimsToOperandDims.size()="
+                              << scatterDimsToOperandDims.size() << " != indexDepth="
+                              << indexDepth << "\n");
       return false;
+    }
 
     auto insertedWindowDims = dimNumbers.getInsertedWindowDims();
     for (auto [idx, dim] : llvm::enumerate(insertedWindowDims)) {
-      if (idx != dim)
+      if (idx != dim) {
+        LLVM_DEBUG(llvm::dbgs() << "  FAIL: insertedWindowDims[" << idx
+                                << "]=" << dim << " != " << idx << "\n");
         return false;
+      }
     }
 
     // Check that there is only one batch dimension in the updates.
     for (auto [idx, dim] : llvm::enumerate(dimNumbers.getUpdateWindowDims())) {
-      if (idx + 1 != dim)
+      if (idx + 1 != dim) {
+        LLVM_DEBUG(llvm::dbgs() << "  FAIL: updateWindowDims[" << idx
+                                << "]=" << dim << " != " << (idx + 1) << "\n");
         return false;
+      }
     }
 
     // Verify that the number of update window dimensions matches the expected
@@ -252,9 +268,14 @@ struct ScatterOpConversion final
     auto updateWindowDims = dimNumbers.getUpdateWindowDims();
     int64_t expectedSliceRank =
         originalType.getRank() - insertedWindowDims.size();
-    if (static_cast<int64_t>(updateWindowDims.size()) != expectedSliceRank)
+    if (static_cast<int64_t>(updateWindowDims.size()) != expectedSliceRank) {
+      LLVM_DEBUG(llvm::dbgs() << "  FAIL: updateWindowDims.size()="
+                              << updateWindowDims.size() << " != expectedSliceRank="
+                              << expectedSliceRank << "\n");
       return false;
+    }
 
+    LLVM_DEBUG(llvm::dbgs() << "  PASS: canonical dimension numbers\n");
     return true;
   }
 
@@ -410,7 +431,11 @@ struct ScatterOpConversion final
         }
       }
 
+      LLVM_DEBUG(llvm::dbgs() << "ScatterOpConversion: needsWindowExpansion="
+                              << needsWindowExpansion << ", totalWindowElements="
+                              << totalWindowElements << "\n");
       if (needsWindowExpansion && totalWindowElements > 1) {
+        LLVM_DEBUG(llvm::dbgs() << "  Entering window expansion code path\n");
         int64_t batchSize = indicesType.getDimSize(0);
         Type indexElementType = indicesType.getElementType();
         int64_t operandRank = originalType.getRank();
@@ -433,7 +458,11 @@ struct ScatterOpConversion final
 
         int64_t indexDepth = indicesType.getDimSize(1);
 
+        LLVM_DEBUG(llvm::dbgs() << "  indexDepth=" << indexDepth
+                                << ", scatterDimMap.size()=" << scatterDimMap.size()
+                                << "\n");
         if (indexDepth == 1 && scatterDimMap.size() == 1) {
+          LLVM_DEBUG(llvm::dbgs() << "  Entering simple 1D window expansion\n");
           // Reshape original indices for broadcasting: [batch, 1, indexDepth]
           auto indices3DType = RankedTensorType::get(
               {batchSize, 1, indexDepth}, indexElementType);
@@ -569,8 +598,15 @@ struct ScatterOpConversion final
           for (int64_t d = 0; d < operandRank; ++d) {
             scatterDimMap.push_back(d);
           }
+          LLVM_DEBUG(llvm::dbgs() << "  After expansion: indices="
+                                  << indicesType << ", updates=" << updatesType
+                                  << "\n");
         }
       }
+
+      LLVM_DEBUG(llvm::dbgs() << "ScatterOpConversion: final types - indices="
+                              << indicesType << ", updates=" << updatesType
+                              << ", original=" << originalType << "\n");
 
       // Squeeze trailing size-1 dimensions from updates if needed
       int64_t sliceRank = originalType.getRank() - insertedWindowDims.size();
