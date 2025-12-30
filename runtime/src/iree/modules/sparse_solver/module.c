@@ -97,33 +97,131 @@ static void IREE_API_PTR iree_sparse_solver_module_free_state(
 }
 
 //===----------------------------------------------------------------------===//
-// Sparse Solver Exports (Stub Implementations)
+// BaSpaCho Handle Reference Type
 //===----------------------------------------------------------------------===//
 
-// NOTE: These are stub implementations that return UNIMPLEMENTED.
-// Full implementations require integrating with the BaSpaCho wrapper.
+// Ref type for wrapping baspacho_handle_t in VM references.
+typedef struct iree_sparse_solver_handle_t {
+  iree_vm_ref_object_t ref_object;
+  baspacho_handle_t baspacho_handle;
+  iree_allocator_t host_allocator;
+} iree_sparse_solver_handle_t;
+
+// Forward declaration of registration variable for type() function.
+static iree_vm_ref_type_t iree_sparse_solver_handle_registration_;
+
+// Returns the registered type for sparse solver handles.
+static inline iree_vm_ref_type_t iree_sparse_solver_handle_type(void) {
+  return iree_sparse_solver_handle_registration_;
+}
+
+// Type descriptor storage for registration.
+static iree_vm_ref_type_descriptor_t iree_sparse_solver_handle_descriptor_;
+
+static void IREE_API_PTR iree_sparse_solver_handle_destroy(void* ptr) {
+  iree_sparse_solver_handle_t* handle = (iree_sparse_solver_handle_t*)ptr;
+  if (handle->baspacho_handle) {
+    baspacho_destroy(handle->baspacho_handle);
+  }
+  iree_allocator_free(handle->host_allocator, handle);
+}
+
+static iree_status_t iree_sparse_solver_handle_create(
+    baspacho_handle_t baspacho_handle,
+    iree_allocator_t host_allocator,
+    iree_sparse_solver_handle_t** out_handle) {
+  iree_sparse_solver_handle_t* handle = NULL;
+  IREE_RETURN_IF_ERROR(iree_allocator_malloc(
+      host_allocator, sizeof(*handle), (void**)&handle));
+  // Initialize ref count to 1.
+  iree_atomic_ref_count_init(&handle->ref_object.counter);
+  handle->baspacho_handle = baspacho_handle;
+  handle->host_allocator = host_allocator;
+  *out_handle = handle;
+  return iree_ok_status();
+}
+
+//===----------------------------------------------------------------------===//
+// Sparse Solver Exports
+//===----------------------------------------------------------------------===//
 
 // analyze: rIIrr -> r
+// Note: First argument is device ref, which we ignore since module already
+// has the device. This allows the MLIR interface to be device-parametric
+// while we use the device from module creation.
 static iree_status_t iree_sparse_solver_analyze_impl(
     iree_vm_stack_t* IREE_RESTRICT stack,
     iree_sparse_solver_module_t* module,
     iree_sparse_solver_module_state_t* state,
-    iree_hal_buffer_view_t* device_buffer_view,
     int64_t n, int64_t nnz,
     iree_hal_buffer_view_t* row_ptr_view,
     iree_hal_buffer_view_t* col_idx_view,
     iree_vm_ref_t* out_handle) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                          "sparse_solver.analyze not yet implemented");
+  // Create BaSpaCho context with detected backend.
+  baspacho_handle_t baspacho = baspacho_create(module->backend);
+  if (!baspacho) {
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                            "failed to create BaSpaCho context");
+  }
+
+  // Map row_ptr buffer to get data.
+  iree_hal_buffer_t* row_ptr_buffer = iree_hal_buffer_view_buffer(row_ptr_view);
+  iree_hal_buffer_mapping_t row_ptr_mapping;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      row_ptr_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &row_ptr_mapping));
+
+  // Map col_idx buffer to get data.
+  iree_hal_buffer_t* col_idx_buffer = iree_hal_buffer_view_buffer(col_idx_view);
+  iree_hal_buffer_mapping_t col_idx_mapping;
+  iree_status_t status = iree_hal_buffer_map_range(
+      col_idx_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &col_idx_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&row_ptr_mapping);
+    baspacho_destroy(baspacho);
+    return status;
+  }
+
+  // Perform symbolic analysis.
+  int result = baspacho_analyze(baspacho, n, nnz,
+                                 (const int64_t*)row_ptr_mapping.contents.data,
+                                 (const int64_t*)col_idx_mapping.contents.data);
+
+  // Unmap buffers.
+  iree_hal_buffer_unmap_range(&col_idx_mapping);
+  iree_hal_buffer_unmap_range(&row_ptr_mapping);
+
+  if (result != 0) {
+    baspacho_destroy(baspacho);
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                            "BaSpaCho symbolic analysis failed with code %d",
+                            result);
+  }
+
+  // Wrap in VM ref.
+  iree_sparse_solver_handle_t* handle = NULL;
+  status = iree_sparse_solver_handle_create(
+      baspacho, module->host_allocator, &handle);
+  if (!iree_status_is_ok(status)) {
+    baspacho_destroy(baspacho);
+    return status;
+  }
+
+  iree_vm_ref_wrap_assign(handle, iree_sparse_solver_handle_type(),
+                           out_handle);
+  return iree_ok_status();
 }
 
 IREE_VM_ABI_EXPORT(iree_sparse_solver_analyze,
                    iree_sparse_solver_module_state_t, rIIrr, r) {
   iree_sparse_solver_module_t* sparse_module = state->module;
 
-  iree_hal_buffer_view_t* device_view = NULL;
-  IREE_RETURN_IF_ERROR(
-      iree_hal_buffer_view_check_deref(args->r0, &device_view));
+  // args->r0 is the device ref - we ignore it and use module->device instead.
+  // This is intentional: the MLIR interface takes device for consistency,
+  // but we use the device that was provided at module creation.
+  (void)args->r0;
+
   int64_t n = args->i1;
   int64_t nnz = args->i2;
   iree_hal_buffer_view_t* row_ptr_view = NULL;
@@ -136,7 +234,7 @@ IREE_VM_ABI_EXPORT(iree_sparse_solver_analyze,
   // Copy ret ref to local variable to avoid packed member address warning.
   iree_vm_ref_t out_handle = {0};
   iree_status_t status = iree_sparse_solver_analyze_impl(
-      stack, sparse_module, state, device_view, n, nnz, row_ptr_view,
+      stack, sparse_module, state, n, nnz, row_ptr_view,
       col_idx_view, &out_handle);
   rets->r0 = out_handle;
   return status;
@@ -151,64 +249,260 @@ IREE_VM_ABI_EXPORT(iree_sparse_solver_release,
   return iree_ok_status();
 }
 
+// Helper to extract BaSpaCho handle from VM ref.
+static iree_sparse_solver_handle_t* iree_sparse_solver_get_handle(
+    iree_vm_ref_t* ref) {
+  if (!ref || iree_vm_ref_is_null(ref)) return NULL;
+  // Check type matches and return pointer.
+  if (ref->type == iree_sparse_solver_handle_type()) {
+    return (iree_sparse_solver_handle_t*)ref->ptr;
+  }
+  return NULL;
+}
+
 // factor: rr -> i
 IREE_VM_ABI_EXPORT(iree_sparse_solver_factor,
                    iree_sparse_solver_module_state_t, rr, i) {
-  rets->i0 = -1;
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                          "sparse_solver.factor not yet implemented");
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    rets->i0 = -1;
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+
+  iree_hal_buffer_view_t* values_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r1, &values_view));
+
+  // Map values buffer.
+  iree_hal_buffer_t* values_buffer = iree_hal_buffer_view_buffer(values_view);
+  iree_hal_buffer_mapping_t values_mapping;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      values_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &values_mapping));
+
+  // Perform numeric factorization.
+  int result = baspacho_factor_f32(handle->baspacho_handle,
+                                   (const float*)values_mapping.contents.data);
+
+  iree_hal_buffer_unmap_range(&values_mapping);
+  rets->i0 = result;
+  return iree_ok_status();
 }
 
 // factor.f64: rr -> i
 IREE_VM_ABI_EXPORT(iree_sparse_solver_factor_f64,
                    iree_sparse_solver_module_state_t, rr, i) {
-  rets->i0 = -1;
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                          "sparse_solver.factor.f64 not yet implemented");
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    rets->i0 = -1;
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+
+  iree_hal_buffer_view_t* values_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r1, &values_view));
+
+  iree_hal_buffer_t* values_buffer = iree_hal_buffer_view_buffer(values_view);
+  iree_hal_buffer_mapping_t values_mapping;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      values_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &values_mapping));
+
+  int result = baspacho_factor_f64(handle->baspacho_handle,
+                                   (const double*)values_mapping.contents.data);
+
+  iree_hal_buffer_unmap_range(&values_mapping);
+  rets->i0 = result;
+  return iree_ok_status();
 }
 
 // solve: rrr -> v
 IREE_VM_ABI_EXPORT(iree_sparse_solver_solve,
                    iree_sparse_solver_module_state_t, rrr, v) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                          "sparse_solver.solve not yet implemented");
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+
+  iree_hal_buffer_view_t* rhs_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r1, &rhs_view));
+  iree_hal_buffer_view_t* solution_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r2, &solution_view));
+
+  // Map RHS buffer (read-only).
+  iree_hal_buffer_t* rhs_buffer = iree_hal_buffer_view_buffer(rhs_view);
+  iree_hal_buffer_mapping_t rhs_mapping;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      rhs_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &rhs_mapping));
+
+  // Map solution buffer (read-write).
+  iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_view);
+  iree_hal_buffer_mapping_t solution_mapping;
+  iree_status_t status = iree_hal_buffer_map_range(
+      solution_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_WRITE, 0, IREE_HAL_WHOLE_BUFFER, &solution_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&rhs_mapping);
+    return status;
+  }
+
+  // Solve in-place.
+  baspacho_solve_f32(handle->baspacho_handle,
+                     (const float*)rhs_mapping.contents.data,
+                     (float*)solution_mapping.contents.data);
+
+  iree_hal_buffer_unmap_range(&solution_mapping);
+  iree_hal_buffer_unmap_range(&rhs_mapping);
+  return iree_ok_status();
 }
 
 // solve.f64: rrr -> v
 IREE_VM_ABI_EXPORT(iree_sparse_solver_solve_f64,
                    iree_sparse_solver_module_state_t, rrr, v) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                          "sparse_solver.solve.f64 not yet implemented");
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+
+  iree_hal_buffer_view_t* rhs_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r1, &rhs_view));
+  iree_hal_buffer_view_t* solution_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r2, &solution_view));
+
+  iree_hal_buffer_t* rhs_buffer = iree_hal_buffer_view_buffer(rhs_view);
+  iree_hal_buffer_mapping_t rhs_mapping;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      rhs_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &rhs_mapping));
+
+  iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_view);
+  iree_hal_buffer_mapping_t solution_mapping;
+  iree_status_t status = iree_hal_buffer_map_range(
+      solution_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_WRITE, 0, IREE_HAL_WHOLE_BUFFER, &solution_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&rhs_mapping);
+    return status;
+  }
+
+  baspacho_solve_f64(handle->baspacho_handle,
+                     (const double*)rhs_mapping.contents.data,
+                     (double*)solution_mapping.contents.data);
+
+  iree_hal_buffer_unmap_range(&solution_mapping);
+  iree_hal_buffer_unmap_range(&rhs_mapping);
+  return iree_ok_status();
 }
 
 // solve.batched: rrrI -> v
 IREE_VM_ABI_EXPORT(iree_sparse_solver_solve_batched,
                    iree_sparse_solver_module_state_t, rrrI, v) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                          "sparse_solver.solve.batched not yet implemented");
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+
+  iree_hal_buffer_view_t* rhs_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r1, &rhs_view));
+  iree_hal_buffer_view_t* solution_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r2, &solution_view));
+  int64_t num_rhs = args->i3;
+
+  iree_hal_buffer_t* rhs_buffer = iree_hal_buffer_view_buffer(rhs_view);
+  iree_hal_buffer_mapping_t rhs_mapping;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      rhs_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &rhs_mapping));
+
+  iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_view);
+  iree_hal_buffer_mapping_t solution_mapping;
+  iree_status_t status = iree_hal_buffer_map_range(
+      solution_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_WRITE, 0, IREE_HAL_WHOLE_BUFFER, &solution_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&rhs_mapping);
+    return status;
+  }
+
+  baspacho_solve_batched_f32(handle->baspacho_handle,
+                              (const float*)rhs_mapping.contents.data,
+                              (float*)solution_mapping.contents.data,
+                              num_rhs);
+
+  iree_hal_buffer_unmap_range(&solution_mapping);
+  iree_hal_buffer_unmap_range(&rhs_mapping);
+  return iree_ok_status();
 }
 
 // solve.batched.f64: rrrI -> v
 IREE_VM_ABI_EXPORT(iree_sparse_solver_solve_batched_f64,
                    iree_sparse_solver_module_state_t, rrrI, v) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                          "sparse_solver.solve.batched.f64 not yet implemented");
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+
+  iree_hal_buffer_view_t* rhs_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r1, &rhs_view));
+  iree_hal_buffer_view_t* solution_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r2, &solution_view));
+  int64_t num_rhs = args->i3;
+
+  iree_hal_buffer_t* rhs_buffer = iree_hal_buffer_view_buffer(rhs_view);
+  iree_hal_buffer_mapping_t rhs_mapping;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      rhs_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &rhs_mapping));
+
+  iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_view);
+  iree_hal_buffer_mapping_t solution_mapping;
+  iree_status_t status = iree_hal_buffer_map_range(
+      solution_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_WRITE, 0, IREE_HAL_WHOLE_BUFFER, &solution_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&rhs_mapping);
+    return status;
+  }
+
+  baspacho_solve_batched_f64(handle->baspacho_handle,
+                              (const double*)rhs_mapping.contents.data,
+                              (double*)solution_mapping.contents.data,
+                              num_rhs);
+
+  iree_hal_buffer_unmap_range(&solution_mapping);
+  iree_hal_buffer_unmap_range(&rhs_mapping);
+  return iree_ok_status();
 }
 
 // get_factor_nnz: r -> I
 IREE_VM_ABI_EXPORT(iree_sparse_solver_get_factor_nnz,
                    iree_sparse_solver_module_state_t, r, I) {
-  rets->i0 = 0;
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                          "sparse_solver.get_factor_nnz not yet implemented");
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    rets->i0 = 0;
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+  rets->i0 = baspacho_get_factor_nnz(handle->baspacho_handle);
+  return iree_ok_status();
 }
 
 // get_num_supernodes: r -> I
 IREE_VM_ABI_EXPORT(iree_sparse_solver_get_num_supernodes,
                    iree_sparse_solver_module_state_t, r, I) {
-  rets->i0 = 0;
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                          "sparse_solver.get_num_supernodes not yet implemented");
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    rets->i0 = 0;
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+  rets->i0 = baspacho_get_num_supernodes(handle->baspacho_handle);
+  return iree_ok_status();
 }
 
 //===----------------------------------------------------------------------===//
@@ -374,6 +668,28 @@ static const iree_vm_native_module_descriptor_t
         .functions = iree_sparse_solver_module_funcs_,
 };
 
+// Register the sparse solver handle ref type with the VM.
+// This must be called once before creating any modules.
+static iree_status_t iree_sparse_solver_register_types(
+    iree_vm_instance_t* instance) {
+  // Only register once.
+  if (iree_sparse_solver_handle_registration_ != 0) {
+    return iree_ok_status();
+  }
+
+  iree_sparse_solver_handle_descriptor_.type_name =
+      iree_make_cstring_view("sparse_solver.handle");
+  iree_sparse_solver_handle_descriptor_.offsetof_counter =
+      offsetof(iree_sparse_solver_handle_t, ref_object.counter) /
+      IREE_VM_REF_COUNTER_ALIGNMENT;
+  iree_sparse_solver_handle_descriptor_.destroy =
+      iree_sparse_solver_handle_destroy;
+
+  return iree_vm_instance_register_type(
+      instance, &iree_sparse_solver_handle_descriptor_,
+      &iree_sparse_solver_handle_registration_);
+}
+
 IREE_API_EXPORT iree_status_t iree_sparse_solver_module_create(
     iree_vm_instance_t* instance, iree_hal_device_t* device,
     iree_sparse_solver_module_flags_t flags, iree_allocator_t host_allocator,
@@ -382,6 +698,9 @@ IREE_API_EXPORT iree_status_t iree_sparse_solver_module_create(
   IREE_ASSERT_ARGUMENT(device);
   IREE_ASSERT_ARGUMENT(out_module);
   *out_module = NULL;
+
+  // Register our custom ref type with the VM.
+  IREE_RETURN_IF_ERROR(iree_sparse_solver_register_types(instance));
 
   // Setup the interface with the functions we implement ourselves.
   static const iree_vm_module_t interface = {
