@@ -10,12 +10,14 @@
 // Triangular solve computes X such that A*X=B (left_side=true) or X*A=B
 // (left_side=false) where A is a triangular matrix.
 //
-// Currently supports forward substitution for:
-// - lower triangular matrices (lower=true, transpose=NO_TRANSPOSE)
-// - upper triangular with transpose (lower=false, transpose=TRANSPOSE)
+// Supports both forward and back substitution:
+// - Forward substitution (lower=true, trans=NO_TRANSPOSE) or
+//                        (lower=false, trans=TRANSPOSE):
+//   for i = 0 to n-1: X[i] = (B[i] - sum(A[i,k]*X[k] for k < i)) / A[i,i]
 //
-// TODO: Back substitution for upper triangular matrices has a bug with
-// lambda captures in the generated IR. Needs investigation.
+// - Back substitution (lower=false, trans=NO_TRANSPOSE) or
+//                     (lower=true, trans=TRANSPOSE):
+//   for i = n-1 to 0: X[i] = (B[i] - sum(A[i,k]*X[k] for k > i)) / A[i,i]
 //
 // NOTE: We use util.optimization_barrier on the inner loop upper bound to
 // prevent IREE's OptimizeIntArithmeticPass from incorrectly replacing loop
@@ -53,9 +55,11 @@ namespace {
 
 /// Lowers stablehlo.triangular_solve to linalg.generic with scf.for.
 ///
-/// Uses forward substitution with a row-by-row computation:
-/// for i = 0 to n-1:
-///   X[i,:] = (B[i,:] - A[i,0:i] @ X[0:i,:]) / A[i,i]
+/// Uses forward or back substitution depending on the matrix type:
+/// - Forward (lower + no_trans, or upper + trans):
+///   for i = 0 to n-1: X[i] = (B[i] - sum(A[i,k]*X[k] for k < i)) / A[i,i]
+/// - Back (upper + no_trans, or lower + trans):
+///   for i = n-1 to 0: X[i] = (B[i] - sum(A[i,k]*X[k] for k > i)) / A[i,i]
 ///
 /// This lowering avoids the problematic loop-carried tensor update pattern
 /// that IREE's stream conversion doesn't handle correctly. Instead, we:
@@ -110,16 +114,12 @@ struct TriangularSolveToLinalgPattern
     bool transpose = (transposeA == mlir::stablehlo::Transpose::TRANSPOSE);
     bool unitDiagonal = op.getUnitDiagonal();
 
-    // Determine if we can use forward substitution.
+    // Determine if we use forward or back substitution.
     // lower + no_transpose -> forward (rows 0 to n-1, sum k < i)
     // upper + transpose -> forward (A^T is lower, rows 0 to n-1, sum k < i)
-    // Other cases need back substitution which is not yet supported.
-    bool canUseForward = (lower != transpose);
-
-    if (!canUseForward) {
-      return rewriter.notifyMatchFailure(op,
-          "back substitution (upper+no_transpose or lower+transpose) not yet supported");
-    }
+    // upper + no_transpose -> back (rows n-1 to 0, sum k > i)
+    // lower + transpose -> back (A^T is upper, rows n-1 to 0, sum k > i)
+    bool useForward = (lower != transpose);
 
     ImplicitLocOpBuilder builder(loc, rewriter);
 
@@ -137,8 +137,11 @@ struct TriangularSolveToLinalgPattern
         xValues[i].resize(m);
       }
 
-      // Process each element in row-major order.
-      for (int64_t i = 0; i < n; ++i) {
+      // Process each element - row order depends on forward vs back substitution.
+      // Forward: rows 0 to n-1, sum over k < i
+      // Back: rows n-1 to 0, sum over k > i
+      for (int64_t step = 0; step < n; ++step) {
+        int64_t i = useForward ? step : (n - 1 - step);
         Value iIdx = builder.create<arith::ConstantIndexOp>(i);
 
         // Get diagonal element A[i,i].
@@ -150,23 +153,45 @@ struct TriangularSolveToLinalgPattern
           // Get B[i,j].
           Value Bij = builder.create<tensor::ExtractOp>(bMatrix, ValueRange{iIdx, jIdx});
 
-          // Compute sum(A[i,k]*X[k,j] for k < i) using previously computed values.
+          // Compute sum using previously computed values.
+          // Forward: sum(A[i,k]*X[k,j] for k < i)
+          // Back: sum(A[i,k]*X[k,j] for k > i)
           Value sum = zero;
-          for (int64_t k = 0; k < i; ++k) {
-            Value kIdx = builder.create<arith::ConstantIndexOp>(k);
+          if (useForward) {
+            for (int64_t k = 0; k < i; ++k) {
+              Value kIdx = builder.create<arith::ConstantIndexOp>(k);
 
-            // Get A[i,k] or A[k,i] if transposed.
-            Value Aik;
-            if (transpose) {
-              Aik = builder.create<tensor::ExtractOp>(aMatrix, ValueRange{kIdx, iIdx});
-            } else {
-              Aik = builder.create<tensor::ExtractOp>(aMatrix, ValueRange{iIdx, kIdx});
+              // Get A[i,k] or A[k,i] if transposed.
+              Value Aik;
+              if (transpose) {
+                Aik = builder.create<tensor::ExtractOp>(aMatrix, ValueRange{kIdx, iIdx});
+              } else {
+                Aik = builder.create<tensor::ExtractOp>(aMatrix, ValueRange{iIdx, kIdx});
+              }
+
+              // Use the previously computed scalar value X[k,j].
+              Value Xkj = xValues[k][j];
+              Value prod = builder.create<arith::MulFOp>(Aik, Xkj);
+              sum = builder.create<arith::AddFOp>(sum, prod);
             }
+          } else {
+            // Back substitution: sum over k > i (i.e., k from i+1 to n-1).
+            for (int64_t k = i + 1; k < n; ++k) {
+              Value kIdx = builder.create<arith::ConstantIndexOp>(k);
 
-            // Use the previously computed scalar value X[k,j].
-            Value Xkj = xValues[k][j];
-            Value prod = builder.create<arith::MulFOp>(Aik, Xkj);
-            sum = builder.create<arith::AddFOp>(sum, prod);
+              // Get A[i,k] or A[k,i] if transposed.
+              Value Aik;
+              if (transpose) {
+                Aik = builder.create<tensor::ExtractOp>(aMatrix, ValueRange{kIdx, iIdx});
+              } else {
+                Aik = builder.create<tensor::ExtractOp>(aMatrix, ValueRange{iIdx, kIdx});
+              }
+
+              // Use the previously computed scalar value X[k,j].
+              Value Xkj = xValues[k][j];
+              Value prod = builder.create<arith::MulFOp>(Aik, Xkj);
+              sum = builder.create<arith::AddFOp>(sum, prod);
+            }
           }
 
           // X[i,j] = (B[i,j] - sum) / A[i,i].
@@ -236,17 +261,28 @@ struct TriangularSolveToLinalgPattern
     Value mVal = builder.create<arith::ConstantIndexOp>(m);
     Value zeroIdx = builder.create<arith::ConstantIndexOp>(0);
     Value oneIdx = builder.create<arith::ConstantIndexOp>(1);
+    Value nMinusOne = builder.create<arith::ConstantIndexOp>(n - 1);
 
     // Initialize output (X) with zeros.
     Value init = builder.create<tensor::EmptyOp>(bType.getShape(), elementType);
     Value result = builder.create<linalg::FillOp>(zero, init).getResult(0);
 
-    // Forward substitution: iterate rows from 0 to n-1.
+    // Row loop: iterate step from 0 to n-1.
+    // For forward: i = step (0, 1, ..., n-1)
+    // For back: i = n-1-step (n-1, n-2, ..., 0)
     auto rowLoop = builder.create<scf::ForOp>(
         zeroIdx, nVal, oneIdx, ValueRange{result},
-        [&](OpBuilder &rowBuilder, Location rowLoc, Value i, ValueRange rowArgs) {
+        [&, useForward, nMinusOne](OpBuilder &rowBuilder, Location rowLoc, Value step, ValueRange rowArgs) {
           ImplicitLocOpBuilder rb(rowLoc, rowBuilder);
           Value X = rowArgs[0];
+
+          // Compute actual row index based on substitution direction.
+          Value i;
+          if (useForward) {
+            i = step;
+          } else {
+            i = rb.create<arith::SubIOp>(nMinusOne, step);
+          }
 
           // Get diagonal element A[i,i].
           Value Aii = rb.create<tensor::ExtractOp>(aMatrix, ValueRange{i, i});
@@ -254,7 +290,7 @@ struct TriangularSolveToLinalgPattern
           // Loop over columns of B/X.
           auto colLoop = rb.create<scf::ForOp>(
               zeroIdx, mVal, oneIdx, ValueRange{X},
-              [&, i, Aii, transpose, unitDiagonal, zero, zeroIdx, oneIdx, aMatrix, bMatrix](
+              [&, i, Aii, transpose, unitDiagonal, useForward, zero, zeroIdx, oneIdx, nVal, aMatrix, bMatrix](
                   OpBuilder &colBuilder, Location colLoc, Value j, ValueRange colArgs) {
                 ImplicitLocOpBuilder cb(colLoc, colBuilder);
                 Value Xcol = colArgs[0];
@@ -262,13 +298,23 @@ struct TriangularSolveToLinalgPattern
                 // Get B[i,j].
                 Value Bij = cb.create<tensor::ExtractOp>(bMatrix, ValueRange{i, j});
 
-                // Compute sum(A[i,k]*X[k,j] for k < i).
+                // Compute sum using previously computed values.
+                // Forward: sum(A[i,k]*X[k,j] for k < i), loop from 0 to i
+                // Back: sum(A[i,k]*X[k,j] for k > i), loop from i+1 to n
                 // Use optimization barrier on loop bound to prevent incorrect
                 // loop index constant propagation (workaround for IREE bug).
-                Value iBarrier =
-                    cb.create<IREE::Util::OptimizationBarrierOp>(i).getResult(0);
+                Value sumStart, sumEnd;
+                if (useForward) {
+                  sumStart = zeroIdx;
+                  sumEnd = cb.create<IREE::Util::OptimizationBarrierOp>(i).getResult(0);
+                } else {
+                  Value iPlusOne = cb.create<arith::AddIOp>(i, oneIdx);
+                  sumStart = cb.create<IREE::Util::OptimizationBarrierOp>(iPlusOne).getResult(0);
+                  sumEnd = nVal;
+                }
+
                 auto sumLoop = cb.create<scf::ForOp>(
-                    zeroIdx, iBarrier, oneIdx, ValueRange{zero},
+                    sumStart, sumEnd, oneIdx, ValueRange{zero},
                     [&, i, transpose, aMatrix, Xcol](
                         OpBuilder &sumBuilder, Location sumLoc, Value k, ValueRange sumArgs) {
                       ImplicitLocOpBuilder sb(sumLoc, sumBuilder);
