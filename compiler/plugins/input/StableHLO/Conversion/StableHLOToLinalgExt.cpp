@@ -246,10 +246,12 @@ struct ScatterOpConversion final
 
     // Verify that the number of update window dimensions matches the expected
     // slice rank. LinalgExt scatter expects updates to have shape
-    // [batch..., slice...] where slice rank = original rank - index depth.
-    // If they don't match, this pattern can't be directly converted.
+    // [batch..., slice...] where slice rank = original rank - inserted dims.
+    // The inserted_window_dims are the operand dimensions that become size-1
+    // in the update window. The remaining dimensions form the window.
     auto updateWindowDims = dimNumbers.getUpdateWindowDims();
-    int64_t expectedSliceRank = originalType.getRank() - indexDepth;
+    int64_t expectedSliceRank =
+        originalType.getRank() - insertedWindowDims.size();
     if (static_cast<int64_t>(updateWindowDims.size()) != expectedSliceRank)
       return false;
 
@@ -358,11 +360,220 @@ struct ScatterOpConversion final
       }
     }
 
-    // Squeeze trailing size-1 dimensions from updates if needed
+    // Handle sliding window scatter: when update has window dimensions that
+    // span indexed (not inserted) operand dimensions.
+    //
+    // LinalgExt scatter expects updates to have shape [batch, slice] where
+    // slice fully covers all non-indexed dimensions. StableHLO scatter allows
+    // arbitrary window shapes that may not match.
+    //
+    // We convert to a "point scatter" by expanding the window into the batch:
+    //   - For each window element, create an index tuple
+    //   - Flatten updates to one element per batch
+    //
+    // Example 1 (1D window):
+    //   operand: tensor<3xf32>, indices: tensor<1x1xi32> [[0]]
+    //   updates: tensor<1x2xf32> (1 batch, 2-element window)
+    //   scatter_dims_to_operand_dims: [0]
+    //   -> indices: tensor<2x1xi32> [[0], [1]]
+    //   -> updates: tensor<2xf32> [v0, v1]
+    //
+    // Example 2 (2D window with partial coverage):
+    //   operand: tensor<2x2xf64>, indices: tensor<1x1xi32> [[0]]
+    //   updates: tensor<1x2x1xf64> (1 batch, 2x1 window)
+    //   scatter_dims_to_operand_dims: [0]
+    //   -> indices: tensor<2x2xi32> [[0, 0], [1, 0]] (point scatter)
+    //   -> updates: tensor<2xf64> (flattened)
+    //   -> dimension_map: [0, 1]
+    auto insertedWindowDims = dimNumbers.getInsertedWindowDims();
+    auto updateWindowDims = dimNumbers.getUpdateWindowDims();
+
     if (updatesType.hasRank() && indicesType.hasRank() &&
-        originalType.hasRank()) {
-      int64_t indexDepth = scatterDimMap.size();
-      int64_t sliceRank = originalType.getRank() - indexDepth;
+        originalType.hasRank() && insertedWindowDims.empty()) {
+      // Get window dimensions and sizes
+      SmallVector<int64_t> windowSizes;
+      int64_t totalWindowElements = 1;
+      for (int64_t dim : updateWindowDims) {
+        int64_t size = updatesType.getDimSize(dim);
+        windowSizes.push_back(size);
+        totalWindowElements *= size;
+      }
+
+      // Check if we need to expand the window
+      // This is needed when window size doesn't match operand size for any dim
+      bool needsWindowExpansion = false;
+      for (size_t i = 0; i < windowSizes.size(); ++i) {
+        if (windowSizes[i] != 1) {
+          // Window has extent > 1 in this dimension
+          // Check if this causes a mismatch with LinalgExt expectations
+          needsWindowExpansion = true;
+        }
+      }
+
+      if (needsWindowExpansion && totalWindowElements > 1) {
+        int64_t batchSize = indicesType.getDimSize(0);
+        Type indexElementType = indicesType.getElementType();
+        int64_t operandRank = originalType.getRank();
+        int64_t newBatchSize = batchSize * totalWindowElements;
+
+        // Build the expanded indices tensor with shape [newBatch, operandRank]
+        // For each original batch and each window position, create an index.
+        //
+        // For scatter_dims_to_operand_dims = [d0, d1, ...]:
+        //   original_indices[b, k] gives the base index for operand dim dk
+        // For window dimensions (not in scatter_dims):
+        //   the offset comes from the window position
+        //
+        // Since we're converting to a point scatter with dimension_map =
+        // [0, 1, ..., operandRank-1], we need indices for all operand dims.
+
+        // Create expanded indices: [newBatch, operandRank]
+        auto newIndicesType = RankedTensorType::get(
+            {newBatchSize, operandRank}, indexElementType);
+
+        int64_t indexDepth = indicesType.getDimSize(1);
+
+        if (indexDepth == 1 && scatterDimMap.size() == 1) {
+          // Reshape original indices for broadcasting: [batch, 1, indexDepth]
+          auto indices3DType = RankedTensorType::get(
+              {batchSize, 1, indexDepth}, indexElementType);
+          SmallVector<ReassociationExprs> insertReassoc = {
+              {rewriter.getAffineDimExpr(0)},
+              {rewriter.getAffineDimExpr(1), rewriter.getAffineDimExpr(2)}};
+          Value indices3D = tensor::ExpandShapeOp::create(
+              rewriter, op.getLoc(), indices3DType, indices, insertReassoc);
+          // Simple case: one indexed dimension
+          // Compute window offsets entirely inline using index arithmetic,
+          // avoiding constant tensors that IREE may hoist to globals.
+          //
+          // For window position w and dimension d:
+          //   offset[d] = (w / stride[d]) % windowSizes[d]
+          // where stride[d] = product of windowSizes[d+1..n-1]
+
+          int64_t indexedDim = scatterDimMap[0];
+
+          // Precompute strides for each dimension (compile-time constants)
+          SmallVector<int64_t> strides(operandRank);
+          int64_t stride = 1;
+          for (int64_t d = operandRank - 1; d >= 0; --d) {
+            strides[d] = stride;
+            stride *= windowSizes[d];
+          }
+
+          // Result shape: [batch, totalWindow, operandRank]
+          auto result3DType = RankedTensorType::get(
+              {batchSize, totalWindowElements, operandRank}, indexElementType);
+          Value initResult = tensor::EmptyOp::create(
+              rewriter, op.getLoc(), result3DType.getShape(), indexElementType);
+
+          // Indexing maps for 1 input (base indices) + 1 output:
+          // indices3D [batch, 1, indexDepth] -> (b, w, d) -> [b, 0, 0]
+          // result [batch, totalWindow, operandRank] -> (b, w, d)
+          AffineMap indicesMap = AffineMap::get(
+              3, 0,
+              {rewriter.getAffineDimExpr(0), rewriter.getAffineConstantExpr(0),
+               rewriter.getAffineConstantExpr(0)},
+              rewriter.getContext());
+          AffineMap resultMap =
+              AffineMap::getMultiDimIdentityMap(3, rewriter.getContext());
+
+          SmallVector<AffineMap> indexingMaps = {indicesMap, resultMap};
+          SmallVector<utils::IteratorType> iteratorTypes = {
+              utils::IteratorType::parallel, utils::IteratorType::parallel,
+              utils::IteratorType::parallel};
+
+          auto genericOp = linalg::GenericOp::create(
+              rewriter, op.getLoc(), result3DType,
+              ValueRange{indices3D},
+              ValueRange{initResult}, indexingMaps, iteratorTypes);
+
+          // Body: compute window offsets inline using index arithmetic
+          Block *body = rewriter.createBlock(&genericOp.getRegion(), {},
+                                             {indexElementType, indexElementType},
+                                             {op.getLoc(), op.getLoc()});
+          rewriter.setInsertionPointToStart(body);
+
+          // Get current indices
+          Value windowIdx = linalg::IndexOp::create(rewriter, op.getLoc(), 1);
+          Value dimIdx = linalg::IndexOp::create(rewriter, op.getLoc(), 2);
+          Value baseIndex = body->getArgument(0);
+
+          // Cast window index to element type for arithmetic
+          Value windowIdxCast = arith::IndexCastOp::create(
+              rewriter, op.getLoc(), indexElementType, windowIdx);
+
+          // Compute window offset for current dimension using select chain:
+          // offset = (windowIdx / stride[d]) % windowSize[d]
+          // We use a select chain because d is a runtime index value
+          Value offset = arith::ConstantOp::create(
+              rewriter, op.getLoc(), IntegerAttr::get(indexElementType, 0));
+
+          for (int64_t d = 0; d < operandRank; ++d) {
+            Value dConst = arith::ConstantIndexOp::create(rewriter, op.getLoc(), d);
+            Value isDim = arith::CmpIOp::create(
+                rewriter, op.getLoc(), arith::CmpIPredicate::eq, dimIdx, dConst);
+
+            // Compute offset for dimension d: (windowIdx / stride) % windowSize
+            Value strideVal = arith::ConstantOp::create(
+                rewriter, op.getLoc(), IntegerAttr::get(indexElementType, strides[d]));
+            Value divided = arith::DivSIOp::create(rewriter, op.getLoc(),
+                                                   windowIdxCast, strideVal);
+            Value windowSizeVal = arith::ConstantOp::create(
+                rewriter, op.getLoc(), IntegerAttr::get(indexElementType, windowSizes[d]));
+            Value offsetForDim = arith::RemSIOp::create(rewriter, op.getLoc(),
+                                                        divided, windowSizeVal);
+
+            offset = arith::SelectOp::create(rewriter, op.getLoc(),
+                                             isDim, offsetForDim, offset);
+          }
+
+          // Add base index only for the indexed dimension
+          Value indexedDimConst = arith::ConstantIndexOp::create(
+              rewriter, op.getLoc(), indexedDim);
+          Value isIndexedDim = arith::CmpIOp::create(
+              rewriter, op.getLoc(), arith::CmpIPredicate::eq, dimIdx, indexedDimConst);
+          Value zero = arith::ConstantOp::create(
+              rewriter, op.getLoc(), IntegerAttr::get(indexElementType, 0));
+          Value selectedBase = arith::SelectOp::create(
+              rewriter, op.getLoc(), isIndexedDim, baseIndex, zero);
+          Value sum = arith::AddIOp::create(rewriter, op.getLoc(),
+                                            offset, selectedBase);
+          linalg::YieldOp::create(rewriter, op.getLoc(), sum);
+
+          rewriter.setInsertionPointAfter(genericOp);
+
+          // Collapse [batch, totalWindow, operandRank] to [newBatch, operandRank]
+          SmallVector<ReassociationExprs> collapseReassoc = {
+              {rewriter.getAffineDimExpr(0), rewriter.getAffineDimExpr(1)},
+              {rewriter.getAffineDimExpr(2)}};
+          indices = tensor::CollapseShapeOp::create(
+              rewriter, op.getLoc(), newIndicesType, genericOp.getResult(0),
+              collapseReassoc);
+          indicesType = newIndicesType;
+
+          // Flatten updates from [batch, window...] to [newBatch]
+          auto flatUpdatesType = RankedTensorType::get(
+              {newBatchSize}, updatesType.getElementType());
+          SmallVector<ReassociationExprs> updatesReassoc;
+          ReassociationExprs allDims;
+          for (int64_t i = 0; i < updatesType.getRank(); ++i) {
+            allDims.push_back(rewriter.getAffineDimExpr(i));
+          }
+          updatesReassoc.push_back(allDims);
+          updates = tensor::CollapseShapeOp::create(
+              rewriter, op.getLoc(), flatUpdatesType, updates, updatesReassoc);
+          updatesType = flatUpdatesType;
+
+          // Update scatterDimMap to point scatter all dimensions
+          scatterDimMap.clear();
+          for (int64_t d = 0; d < operandRank; ++d) {
+            scatterDimMap.push_back(d);
+          }
+        }
+      }
+
+      // Squeeze trailing size-1 dimensions from updates if needed
+      int64_t sliceRank = originalType.getRank() - insertedWindowDims.size();
       int64_t expectedBatchRank = indicesType.getRank() - 1;
       int64_t expectedUpdatesRank = expectedBatchRank + sliceRank;
 
