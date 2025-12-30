@@ -36,4 +36,50 @@ vm.import private @matmul(
   %out : !vm.ref<!hal.buffer_view>
 )
 
+// Triangular solve: solve A*X=B or X*A=B for X where A is triangular.
+// Uses platform-optimized BLAS (cblas_strsm on CPU, MPSMatrixSolveTriangular on GPU).
+//
+// Arguments:
+//   side: 0=Left (A*X=B), 1=Right (X*A=B)
+//   uplo: 0=Lower, 1=Upper triangular
+//   transA: 0=NoTrans, 1=Trans, 2=ConjTrans
+//   diag: 0=NonUnit, 1=Unit diagonal
+//   m: Number of rows in B
+//   n: Number of columns in B
+//   alpha: Scalar multiplier (typically 1.0)
+//   lda: Leading dimension of A
+//   a: Triangular matrix A [lda, K] where K=M if left, K=N if right
+//   ldb: Leading dimension of B
+//   b: Input/output matrix B [ldb, N], modified in-place to contain X
+//
+// Supports: f32 element type
+vm.import private @trsm(
+  %side : i32,
+  %uplo : i32,
+  %transA : i32,
+  %diag : i32,
+  %m : index,
+  %n : index,
+  %alpha : f32,
+  %lda : index,
+  %a : !vm.ref<!hal.buffer_view>,
+  %ldb : index,
+  %b : !vm.ref<!hal.buffer_view>
+)
+
+// Triangular solve (f64 variant): solve A*X=B or X*A=B for X where A is triangular.
+vm.import private @trsm.f64(
+  %side : i32,
+  %uplo : i32,
+  %transA : i32,
+  %diag : i32,
+  %m : index,
+  %n : index,
+  %alpha : f64,
+  %lda : index,
+  %a : !vm.ref<!hal.buffer_view>,
+  %ldb : index,
+  %b : !vm.ref<!hal.buffer_view>
+)
+
 }  // module
