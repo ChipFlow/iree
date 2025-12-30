@@ -531,10 +531,34 @@ struct ScatterOpConversion final
           Value windowIdxCast = arith::IndexCastOp::create(
               rewriter, op.getLoc(), indexElementType, windowIdx);
 
-          // Compute window offset for current dimension using select chain:
-          // offset = (windowIdx / stride[d]) % windowSize[d]
-          // We use a select chain because d is a runtime index value
-          Value offset = arith::ConstantOp::create(
+          // Compute window offset for NON-INDEXED dimensions only.
+          // For indexed dimensions, we use only the base index.
+          //
+          // The window dimensions map to non-indexed operand dimensions.
+          // windowSizes[i] corresponds to the i-th non-indexed operand dim.
+          //
+          // Build a mapping from non-indexed dims to their window position.
+          SmallVector<int64_t> nonIndexedDimToWindowPos(operandRank, -1);
+          int64_t windowPos = 0;
+          for (int64_t d = 0; d < operandRank; ++d) {
+            if (d != indexedDim) {
+              nonIndexedDimToWindowPos[d] = windowPos++;
+            }
+          }
+
+          // Compute strides for non-indexed dimensions (window dimensions)
+          int64_t numWindowDims = operandRank - 1;  // All dims except indexed
+          SmallVector<int64_t> windowStrides(numWindowDims);
+          int64_t windowStride = 1;
+          for (int64_t i = numWindowDims - 1; i >= 0; --i) {
+            windowStrides[i] = windowStride;
+            windowStride *= windowSizes[i];
+          }
+
+          // For each operand dimension:
+          // - If it's the indexed dimension: result = base_index
+          // - If it's a non-indexed dimension: result = window_offset
+          Value result = arith::ConstantOp::create(
               rewriter, op.getLoc(), IntegerAttr::get(indexElementType, 0));
 
           for (int64_t d = 0; d < operandRank; ++d) {
@@ -542,32 +566,30 @@ struct ScatterOpConversion final
             Value isDim = arith::CmpIOp::create(
                 rewriter, op.getLoc(), arith::CmpIPredicate::eq, dimIdx, dConst);
 
-            // Compute offset for dimension d: (windowIdx / stride) % windowSize
-            Value strideVal = arith::ConstantOp::create(
-                rewriter, op.getLoc(), IntegerAttr::get(indexElementType, strides[d]));
-            Value divided = arith::DivSIOp::create(rewriter, op.getLoc(),
-                                                   windowIdxCast, strideVal);
-            Value windowSizeVal = arith::ConstantOp::create(
-                rewriter, op.getLoc(), IntegerAttr::get(indexElementType, windowSizes[d]));
-            Value offsetForDim = arith::RemSIOp::create(rewriter, op.getLoc(),
-                                                        divided, windowSizeVal);
+            Value valueForDim;
+            if (d == indexedDim) {
+              // Indexed dimension: use base index
+              valueForDim = baseIndex;
+            } else {
+              // Non-indexed dimension: compute window offset
+              int64_t wp = nonIndexedDimToWindowPos[d];
+              Value strideVal = arith::ConstantOp::create(
+                  rewriter, op.getLoc(),
+                  IntegerAttr::get(indexElementType, windowStrides[wp]));
+              Value divided = arith::DivSIOp::create(rewriter, op.getLoc(),
+                                                     windowIdxCast, strideVal);
+              Value windowSizeVal = arith::ConstantOp::create(
+                  rewriter, op.getLoc(),
+                  IntegerAttr::get(indexElementType, windowSizes[wp]));
+              valueForDim = arith::RemSIOp::create(rewriter, op.getLoc(),
+                                                   divided, windowSizeVal);
+            }
 
-            offset = arith::SelectOp::create(rewriter, op.getLoc(),
-                                             isDim, offsetForDim, offset);
+            result = arith::SelectOp::create(rewriter, op.getLoc(),
+                                             isDim, valueForDim, result);
           }
 
-          // Add base index only for the indexed dimension
-          Value indexedDimConst = arith::ConstantIndexOp::create(
-              rewriter, op.getLoc(), indexedDim);
-          Value isIndexedDim = arith::CmpIOp::create(
-              rewriter, op.getLoc(), arith::CmpIPredicate::eq, dimIdx, indexedDimConst);
-          Value zero = arith::ConstantOp::create(
-              rewriter, op.getLoc(), IntegerAttr::get(indexElementType, 0));
-          Value selectedBase = arith::SelectOp::create(
-              rewriter, op.getLoc(), isIndexedDim, baseIndex, zero);
-          Value sum = arith::AddIOp::create(rewriter, op.getLoc(),
-                                            offset, selectedBase);
-          linalg::YieldOp::create(rewriter, op.getLoc(), sum);
+          linalg::YieldOp::create(rewriter, op.getLoc(), result);
 
           rewriter.setInsertionPointAfter(genericOp);
 
