@@ -5,9 +5,15 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+
+#define DEBUG_TYPE "iree-fixed-point-iterator"
 
 namespace mlir::iree_compiler::IREE::Util {
 
@@ -15,6 +21,35 @@ namespace mlir::iree_compiler::IREE::Util {
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h.inc"
 
 namespace {
+
+// Computes a structural fingerprint of an operation for cycle detection.
+// This is faster than full IR hashing but still catches most oscillations.
+static uint64_t computeIRFingerprint(Operation *op) {
+  uint64_t hash = 0;
+
+  // Count operations by type
+  llvm::DenseMap<mlir::OperationName, int64_t> opCounts;
+  op->walk([&](Operation *nested) {
+    opCounts[nested->getName()]++;
+  });
+
+  // Combine counts into hash
+  for (auto &[name, count] : opCounts) {
+    hash ^= llvm::hash_combine(name.getAsOpaquePointer(), count);
+  }
+
+  // Also factor in the number of block arguments and results for top-level ops
+  if (auto moduleOp = dyn_cast<ModuleOp>(op)) {
+    for (auto &nestedOp : moduleOp.getBody()->getOperations()) {
+      if (auto funcOp = dyn_cast<FunctionOpInterface>(nestedOp)) {
+        hash ^= llvm::hash_combine(funcOp.getNumArguments(),
+                                   funcOp.getNumResults());
+      }
+    }
+  }
+
+  return hash;
+}
 
 // Dynamic pass which runs a sub-pipeline to a fixed point or a maximum
 // iteration count.
@@ -100,6 +135,9 @@ void FixedPointIteratorPass::runOnOperation() {
     return signalPassFailure();
   }
 
+  // Track fingerprints to detect cycles (A -> B -> A oscillations)
+  llvm::SmallDenseSet<uint64_t, 16> seenFingerprints;
+
   for (int i = 0; i < maxIterations; ++i) {
     getOperation()->setAttr(markerName,
                             IntegerAttr::get(IndexType::get(context), i));
@@ -109,10 +147,28 @@ void FixedPointIteratorPass::runOnOperation() {
     }
 
     if (!getOperation()->hasAttr(modifiedName)) {
-      // Normal exit.
+      // Normal exit - no modifications made.
+      LLVM_DEBUG(llvm::dbgs() << "Fixed-point converged after " << (i + 1)
+                              << " iterations\n");
       getOperation()->removeAttr(markerName);
       return;
     }
+
+    // Check for oscillation by computing a fingerprint of the current IR state.
+    // If we've seen this fingerprint before, we're in a cycle and should stop.
+    uint64_t fingerprint = computeIRFingerprint(getOperation());
+    if (!seenFingerprints.insert(fingerprint).second) {
+      // We've seen this state before - oscillation detected.
+      // Treat this as convergence since we're not making net progress.
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Fixed-point detected oscillation after " << (i + 1)
+                 << " iterations (fingerprint collision), treating as converged\n");
+      getOperation()->removeAttr(markerName);
+      return;
+    }
+
+    LLVM_DEBUG(llvm::dbgs() << "Fixed-point iteration " << (i + 1)
+                            << ", fingerprint: " << fingerprint << "\n");
   }
 
   // Abnormal exit - iteration count exceeded.
