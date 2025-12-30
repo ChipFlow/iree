@@ -608,8 +608,11 @@ struct ScatterOpConversion final
                               << indicesType << ", updates=" << updatesType
                               << ", original=" << originalType << "\n");
 
-      // Squeeze trailing size-1 dimensions from updates if needed
-      int64_t sliceRank = originalType.getRank() - insertedWindowDims.size();
+      // Squeeze trailing size-1 dimensions from updates if needed.
+      // LinalgExt scatter expects updates shape = [batch..., slice...] where
+      // slice dimensions correspond to operand dimensions NOT in dimension_map.
+      // The slice rank is therefore: operand_rank - num_indexed_dims.
+      int64_t sliceRank = originalType.getRank() - scatterDimMap.size();
       int64_t expectedBatchRank = indicesType.getRank() - 1;
       int64_t expectedUpdatesRank = expectedBatchRank + sliceRank;
 
