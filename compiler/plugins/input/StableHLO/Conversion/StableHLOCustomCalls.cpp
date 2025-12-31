@@ -239,11 +239,166 @@ struct ShapeAssertionDrop final
 };
 
 //===----------------------------------------------------------------------===//
-// LAPACK FFI Custom Calls
+// LAPACK FFI Custom Calls - LU Factorization (getrf)
 //===----------------------------------------------------------------------===//
-// These patterns handle JAX's LAPACK FFI custom calls like lapack_sgetrf_ffi.
-// Currently, IREE does not have full LAPACK support, so these patterns provide
-// clear error messages rather than silent failures.
+// Implements LU factorization with partial pivoting using pure linalg/scf ops.
+// This handles JAX's lapack_*getrf_ffi custom calls.
+
+// Helper: Find the pivot row (row with max absolute value in column k, from k onwards)
+static Value findPivotRow(Value matrix, Value k, int64_t m,
+                          ImplicitLocOpBuilder &b) {
+  auto matrixTy = cast<ShapedType>(matrix.getType());
+  Type elemTy = matrixTy.getElementType();
+  Type indexTy = b.getIndexType();
+
+  Value kIndex = k;
+  Value mIndex = arith::ConstantIndexOp::create(b, m);
+  Value one = arith::ConstantIndexOp::create(b, 1);
+
+  // Initialize: best_row = k, best_val = |A[k, k]|
+  Value initVal = tensor::ExtractOp::create(b, matrix, ValueRange{k, k});
+  Value initAbs = arith::SelectOp::create(
+      b,
+      arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, initVal,
+                            arith::ConstantOp::create(b, b.getZeroAttr(elemTy))),
+      arith::NegFOp::create(b, initVal), initVal);
+
+  // Loop from k+1 to m to find max
+  Value kPlusOne = arith::AddIOp::create(b, k, one);
+
+  auto forOp = scf::ForOp::create(
+      b, kPlusOne, mIndex, one,
+      ValueRange{k, initAbs},  // iter_args: (best_row, best_abs)
+      [&](OpBuilder &bb, Location loc, Value i, ValueRange args) {
+        ImplicitLocOpBuilder lb(loc, bb);
+        Value bestRow = args[0];
+        Value bestAbs = args[1];
+
+        // Get |A[i, k]|
+        Value val = tensor::ExtractOp::create(lb, matrix, ValueRange{i, k});
+        Value absVal = arith::SelectOp::create(
+            lb,
+            arith::CmpFOp::create(lb, arith::CmpFPredicate::OLT, val,
+                                  arith::ConstantOp::create(lb, lb.getZeroAttr(elemTy))),
+            arith::NegFOp::create(lb, val), val);
+
+        // Update if this is larger
+        Value isLarger =
+            arith::CmpFOp::create(lb, arith::CmpFPredicate::OGT, absVal, bestAbs);
+        Value newBestRow = arith::SelectOp::create(lb, isLarger, i, bestRow);
+        Value newBestAbs = arith::SelectOp::create(lb, isLarger, absVal, bestAbs);
+
+        scf::YieldOp::create(lb, ValueRange{newBestRow, newBestAbs});
+      });
+
+  return forOp.getResult(0);  // Return best row index
+}
+
+// Helper: Swap rows i and j in matrix
+static Value swapRows(Value matrix, Value i, Value j, int64_t n,
+                      ImplicitLocOpBuilder &b) {
+  auto matrixTy = cast<ShapedType>(matrix.getType());
+  Type elemTy = matrixTy.getElementType();
+
+  Value one = arith::ConstantIndexOp::create(b, 1);
+  Value nIndex = arith::ConstantIndexOp::create(b, n);
+  Value zero = arith::ConstantIndexOp::create(b, 0);
+
+  // Check if i == j (no swap needed)
+  Value needSwap = arith::CmpIOp::create(b, arith::CmpIPredicate::ne, i, j);
+
+  auto ifOp = scf::IfOp::create(
+      b, matrixTy, needSwap,
+      [&](OpBuilder &bb, Location loc) {
+        ImplicitLocOpBuilder lb(loc, bb);
+        // Loop over columns and swap elements
+        auto forOp = scf::ForOp::create(
+            lb, zero, nIndex, one, ValueRange{matrix},
+            [&](OpBuilder &bbb, Location loc2, Value col, ValueRange args) {
+              ImplicitLocOpBuilder llb(loc2, bbb);
+              Value mat = args[0];
+
+              // Extract A[i, col] and A[j, col]
+              Value valI = tensor::ExtractOp::create(llb, mat, ValueRange{i, col});
+              Value valJ = tensor::ExtractOp::create(llb, mat, ValueRange{j, col});
+
+              // Insert swapped values
+              Value mat1 = tensor::InsertOp::create(llb, valJ, mat, ValueRange{i, col});
+              Value mat2 = tensor::InsertOp::create(llb, valI, mat1, ValueRange{j, col});
+
+              scf::YieldOp::create(llb, mat2);
+            });
+        scf::YieldOp::create(lb, forOp.getResult(0));
+      },
+      [&](OpBuilder &bb, Location loc) {
+        ImplicitLocOpBuilder lb(loc, bb);
+        scf::YieldOp::create(lb, matrix);
+      });
+
+  return ifOp.getResult(0);
+}
+
+// Helper: Perform one step of LU factorization (column k)
+static std::pair<Value, Value> luStep(Value matrix, Value pivots, Value k,
+                                       int64_t m, int64_t n,
+                                       ImplicitLocOpBuilder &b) {
+  auto matrixTy = cast<ShapedType>(matrix.getType());
+  auto pivotsTy = cast<ShapedType>(pivots.getType());
+  Type elemTy = matrixTy.getElementType();
+
+  Value one = arith::ConstantIndexOp::create(b, 1);
+  Value mIndex = arith::ConstantIndexOp::create(b, m);
+  Value nIndex = arith::ConstantIndexOp::create(b, n);
+
+  // Find pivot row
+  Value pivotRow = findPivotRow(matrix, k, m, b);
+
+  // Swap rows k and pivotRow
+  Value swapped = swapRows(matrix, k, pivotRow, n, b);
+
+  // Store pivot index (convert to i32 for output, 0-indexed)
+  Value pivotI32 = arith::IndexCastOp::create(b, b.getI32Type(), pivotRow);
+  Value newPivots = tensor::InsertOp::create(b, pivotI32, pivots, ValueRange{k});
+
+  // Get pivot element A[k, k]
+  Value pivot = tensor::ExtractOp::create(b, swapped, ValueRange{k, k});
+
+  // Compute multipliers and update submatrix
+  Value kPlusOne = arith::AddIOp::create(b, k, one);
+
+  // Loop over rows below k
+  auto rowLoop = scf::ForOp::create(
+      b, kPlusOne, mIndex, one, ValueRange{swapped},
+      [&](OpBuilder &bb, Location loc, Value i, ValueRange args) {
+        ImplicitLocOpBuilder lb(loc, bb);
+        Value mat = args[0];
+
+        // Compute multiplier: A[i,k] = A[i,k] / A[k,k]
+        Value aik = tensor::ExtractOp::create(lb, mat, ValueRange{i, k});
+        Value multiplier = arith::DivFOp::create(lb, aik, pivot);
+        Value mat1 = tensor::InsertOp::create(lb, multiplier, mat, ValueRange{i, k});
+
+        // Update row i: A[i,j] -= multiplier * A[k,j] for j > k
+        auto colLoop = scf::ForOp::create(
+            lb, kPlusOne, nIndex, one, ValueRange{mat1},
+            [&](OpBuilder &bbb, Location loc2, Value j, ValueRange args2) {
+              ImplicitLocOpBuilder llb(loc2, bbb);
+              Value mat2 = args2[0];
+
+              Value aij = tensor::ExtractOp::create(llb, mat2, ValueRange{i, j});
+              Value akj = tensor::ExtractOp::create(llb, mat2, ValueRange{k, j});
+              Value product = arith::MulFOp::create(llb, multiplier, akj);
+              Value newAij = arith::SubFOp::create(llb, aij, product);
+              Value mat3 = tensor::InsertOp::create(llb, newAij, mat2, ValueRange{i, j});
+
+              scf::YieldOp::create(llb, mat3);
+            });
+
+        scf::YieldOp::create(lb, colLoop.getResult(0));
+      });
+
+  return {rowLoop.getResult(0), newPivots};
+}
 
 struct LapackGetrfFfiRewriter final
     : OpRewritePattern<mlir::stablehlo::CustomCallOp> {
@@ -259,17 +414,75 @@ struct LapackGetrfFfiRewriter final
       return rewriter.notifyMatchFailure(op, "not a LAPACK getrf FFI call");
     }
 
-    // TODO: Implement LU factorization lowering.
-    // Options:
-    // 1. Emit pure linalg/scf ops (like Cholesky)
-    // 2. Route to dense_blas.getrf runtime module (Apple Accelerate)
-    //
-    // For now, emit an error so compilation fails clearly rather than
-    // producing incorrect results from output_operand_alias passthrough.
-    return op.emitError()
-           << "LAPACK LU factorization (" << target << ") is not yet "
-           << "supported in IREE. Use jax.numpy.linalg.lu_factor with "
-           << "a CPU backend or implement custom lowering.";
+    // Complex types not yet supported
+    if (target == "lapack_cgetrf_ffi" || target == "lapack_zgetrf_ffi") {
+      return rewriter.notifyMatchFailure(op, "complex LU not yet supported");
+    }
+
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+
+    // JAX's getrf FFI has:
+    // - Input: A matrix (to be factored in-place)
+    // - Outputs: (LU matrix, pivots, info)
+    if (op.getNumOperands() != 1) {
+      return rewriter.notifyMatchFailure(op, "expected 1 operand");
+    }
+    if (op.getNumResults() != 3) {
+      return rewriter.notifyMatchFailure(op, "expected 3 results");
+    }
+
+    Value inputMatrix = op.getOperand(0);
+    auto matrixTy = cast<RankedTensorType>(inputMatrix.getType());
+    auto luTy = cast<RankedTensorType>(op.getResult(0).getType());
+    auto pivotsTy = cast<RankedTensorType>(op.getResult(1).getType());
+    auto infoTy = cast<RankedTensorType>(op.getResult(2).getType());
+
+    // Only support 2D matrices for now
+    if (matrixTy.getRank() != 2) {
+      return rewriter.notifyMatchFailure(op, "only 2D matrices supported");
+    }
+
+    // Only support static shapes for now
+    if (!matrixTy.hasStaticShape()) {
+      return rewriter.notifyMatchFailure(op, "dynamic shapes not supported");
+    }
+
+    int64_t m = matrixTy.getShape()[0];
+    int64_t n = matrixTy.getShape()[1];
+    int64_t minMN = std::min(m, n);
+
+    // Initialize LU matrix as a copy of input
+    Value lu = inputMatrix;
+
+    // Initialize pivots tensor
+    Value pivots = tensor::EmptyOp::create(b, pivotsTy.getShape(),
+                                           pivotsTy.getElementType());
+
+    // Main LU loop
+    Value zero = arith::ConstantIndexOp::create(b, 0);
+    Value one = arith::ConstantIndexOp::create(b, 1);
+    Value minMNVal = arith::ConstantIndexOp::create(b, minMN);
+
+    auto mainLoop = scf::ForOp::create(
+        b, zero, minMNVal, one, ValueRange{lu, pivots},
+        [&](OpBuilder &bb, Location loc, Value k, ValueRange args) {
+          ImplicitLocOpBuilder lb(loc, bb);
+          Value curLU = args[0];
+          Value curPivots = args[1];
+
+          auto [newLU, newPivots] = luStep(curLU, curPivots, k, m, n, lb);
+          scf::YieldOp::create(lb, ValueRange{newLU, newPivots});
+        });
+
+    Value resultLU = mainLoop.getResult(0);
+    Value resultPivots = mainLoop.getResult(1);
+
+    // Info = 0 (success) - we don't check for singularity in this simple impl
+    Value infoZero = arith::ConstantOp::create(
+        b, DenseElementsAttr::get(infoTy, rewriter.getI32IntegerAttr(0)));
+
+    rewriter.replaceOp(op, ValueRange{resultLU, resultPivots, infoZero});
+    return success();
   }
 };
 
