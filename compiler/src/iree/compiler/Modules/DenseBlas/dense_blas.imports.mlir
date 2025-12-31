@@ -82,4 +82,40 @@ vm.import private @trsm.f64(
   %b : !vm.ref<!hal.buffer_view>
 )
 
+// LU factorization with partial pivoting: A = P * L * U
+// Uses platform-optimized LAPACK (sgetrf on CPU via Accelerate).
+// The matrix A is overwritten with the factors L and U:
+//   - L is stored below the diagonal (unit diagonal not stored)
+//   - U is stored on and above the diagonal
+//
+// Arguments:
+//   m: Number of rows in A
+//   n: Number of columns in A
+//   lda: Leading dimension of A
+//   a: Input/output matrix A [lda, n], modified in-place
+//   ipiv: Output pivot indices [min(m,n)], 1-based
+//
+// Returns: info status
+//   = 0: success
+//   > 0: U(i,i) is exactly zero, factorization completed but U is singular
+//   < 0: invalid argument (shouldn't happen with valid inputs)
+//
+// Supports: f32 element type
+vm.import private @getrf(
+  %m : index,
+  %n : index,
+  %lda : index,
+  %a : !vm.ref<!hal.buffer_view>,
+  %ipiv : !vm.ref<!hal.buffer_view>
+) -> i32
+
+// LU factorization (f64 variant): A = P * L * U
+vm.import private @getrf.f64(
+  %m : index,
+  %n : index,
+  %lda : index,
+  %a : !vm.ref<!hal.buffer_view>,
+  %ipiv : !vm.ref<!hal.buffer_view>
+) -> i32
+
 }  // module

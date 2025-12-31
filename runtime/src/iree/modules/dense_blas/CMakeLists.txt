@@ -108,6 +108,8 @@ if(APPLE)
     find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
     list(APPEND DENSE_BLAS_DEPS ${ACCELERATE_FRAMEWORK})
   endif()
+  # Add Accelerate backend source file
+  list(APPEND DENSE_BLAS_SOURCES backends/accelerate.c)
   message(STATUS "dense_blas: Accelerate CPU fallback enabled")
 else()
   # Try to find OpenBLAS

@@ -8,7 +8,10 @@
 
 #if defined(__APPLE__) && defined(IREE_DENSE_BLAS_HAVE_ACCELERATE)
 
-#include <Accelerate/Accelerate.h>
+// Use new LAPACK interface to avoid deprecation warnings and vecLib vector issues.
+#define ACCELERATE_NEW_LAPACK
+// Include only cblas - we declare LAPACK functions manually below.
+#include <vecLib/cblas.h>
 
 //===----------------------------------------------------------------------===//
 // GEMM via cblas_sgemm/cblas_dgemm
@@ -147,6 +150,8 @@ iree_status_t iree_dense_blas_accelerate_trsm_f64(
 // LAPACK function declarations (Accelerate provides these).
 extern int spotrf_(char* uplo, int* n, float* a, int* lda, int* info);
 extern int dpotrf_(char* uplo, int* n, double* a, int* lda, int* info);
+extern int sgetrf_(int* m, int* n, float* a, int* lda, int* ipiv, int* info);
+extern int dgetrf_(int* m, int* n, double* a, int* lda, int* ipiv, int* info);
 
 int iree_dense_blas_accelerate_potrf_f32(
     bool upper,
@@ -169,6 +174,34 @@ int iree_dense_blas_accelerate_potrf_f64(
   int lda_int = (int)lda;
   int info = 0;
   dpotrf_(&uplo, &n, A, &lda_int, &info);
+  return info;
+}
+
+//===----------------------------------------------------------------------===//
+// GETRF via LAPACK sgetrf_/dgetrf_
+//===----------------------------------------------------------------------===//
+
+int iree_dense_blas_accelerate_getrf_f32(
+    int64_t M, int64_t N,
+    float* A, int64_t lda,
+    int32_t* ipiv) {
+  int m = (int)M;
+  int n = (int)N;
+  int lda_int = (int)lda;
+  int info = 0;
+  sgetrf_(&m, &n, A, &lda_int, ipiv, &info);
+  return info;
+}
+
+int iree_dense_blas_accelerate_getrf_f64(
+    int64_t M, int64_t N,
+    double* A, int64_t lda,
+    int32_t* ipiv) {
+  int m = (int)M;
+  int n = (int)N;
+  int lda_int = (int)lda;
+  int info = 0;
+  dgetrf_(&m, &n, A, &lda_int, ipiv, &info);
   return info;
 }
 
@@ -253,6 +286,20 @@ int iree_dense_blas_accelerate_potrf_f64(
     bool upper,
     int64_t N,
     double* A, int64_t lda) {
+  return -1;  // Unavailable
+}
+
+int iree_dense_blas_accelerate_getrf_f32(
+    int64_t M, int64_t N,
+    float* A, int64_t lda,
+    int32_t* ipiv) {
+  return -1;  // Unavailable
+}
+
+int iree_dense_blas_accelerate_getrf_f64(
+    int64_t M, int64_t N,
+    double* A, int64_t lda,
+    int32_t* ipiv) {
   return -1;  // Unavailable
 }
 

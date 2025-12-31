@@ -20,6 +20,9 @@
 #include "iree/modules/dense_blas/gemm_metal.h"
 #endif
 
+#include "iree/modules/dense_blas/backends/accelerate.h"
+#include "iree/modules/dense_blas/hal_buffer_helper.h"
+
 //===----------------------------------------------------------------------===//
 // Module Version
 //===----------------------------------------------------------------------===//
@@ -161,6 +164,63 @@ IREE_VM_ABI_EXPORT(iree_dense_blas_module_matmul,
 }
 
 //===----------------------------------------------------------------------===//
+// GETRF Export (LU Factorization)
+//===----------------------------------------------------------------------===//
+// Exported as: dense_blas.getrf
+// Calling convention: IIIrr_i (3 index, 2 buffer_view refs in, i32 out)
+// Performs: A = P * L * U (LU factorization with partial pivoting)
+
+static iree_status_t iree_dense_blas_module_getrf_impl(
+    iree_vm_stack_t* IREE_RESTRICT stack,
+    iree_dense_blas_module_t* module,
+    iree_dense_blas_module_state_t* state,
+    int64_t m, int64_t n, int64_t lda,
+    iree_hal_buffer_view_t* a,
+    iree_hal_buffer_view_t* ipiv,
+    int32_t* out_info) {
+  // Get native pointers from HAL buffers.
+  iree_hal_device_ptr_info_t a_info;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_get_device_ptr(
+      a, module->device, &a_info));
+  float* a_ptr = (float*)a_info.ptr.cpu_ptr;
+
+  iree_hal_device_ptr_info_t ipiv_info;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_get_device_ptr(
+      ipiv, module->device, &ipiv_info));
+  int32_t* ipiv_ptr = (int32_t*)ipiv_info.ptr.cpu_ptr;
+
+  // Call Accelerate backend (always available on macOS).
+  int info = iree_dense_blas_accelerate_getrf_f32(m, n, a_ptr, lda, ipiv_ptr);
+  *out_info = info;
+
+  return iree_ok_status();
+}
+
+// VM ABI shim for getrf: IIIrr_i
+// Args: m (index), n (index), lda (index), a (ref), ipiv (ref)
+// Returns: info (i32)
+IREE_VM_ABI_EXPORT(iree_dense_blas_module_getrf,
+                   iree_dense_blas_module_state_t, IIIrr, i) {
+  iree_dense_blas_module_t* dense_blas_module = state->module;
+
+  int64_t m = (int64_t)args->i0;
+  int64_t n = (int64_t)args->i1;
+  int64_t lda = (int64_t)args->i2;
+
+  iree_hal_buffer_view_t* a = NULL;
+  iree_hal_buffer_view_t* ipiv = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r0, &a));
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r1, &ipiv));
+
+  int32_t info = 0;
+  IREE_RETURN_IF_ERROR(iree_dense_blas_module_getrf_impl(
+      stack, dense_blas_module, state, m, n, lda, a, ipiv, &info));
+
+  rets->i0 = info;
+  return iree_ok_status();
+}
+
+//===----------------------------------------------------------------------===//
 // VM Module Interface
 //===----------------------------------------------------------------------===//
 
@@ -172,6 +232,10 @@ static const iree_vm_native_function_ptr_t iree_dense_blas_module_funcs_[] = {
         .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrr_v,
         .target = (iree_vm_native_function_target_t)iree_dense_blas_module_matmul,
     },
+    {
+        .shim = (iree_vm_native_function_shim_t)iree_vm_shim_IIIrr_i,
+        .target = (iree_vm_native_function_target_t)iree_dense_blas_module_getrf,
+    },
 };
 
 // Module exports.
@@ -180,6 +244,12 @@ static const iree_vm_native_export_descriptor_t
         {
             .local_name = iree_string_view_literal("matmul"),
             .calling_convention = iree_string_view_literal("0rrr_v"),
+            .attr_count = 0,
+            .attrs = NULL,
+        },
+        {
+            .local_name = iree_string_view_literal("getrf"),
+            .calling_convention = iree_string_view_literal("0IIIrr_i"),
             .attr_count = 0,
             .attrs = NULL,
         },

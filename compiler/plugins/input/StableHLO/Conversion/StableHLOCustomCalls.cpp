@@ -239,6 +239,41 @@ struct ShapeAssertionDrop final
 };
 
 //===----------------------------------------------------------------------===//
+// LAPACK FFI Custom Calls
+//===----------------------------------------------------------------------===//
+// These patterns handle JAX's LAPACK FFI custom calls like lapack_sgetrf_ffi.
+// Currently, IREE does not have full LAPACK support, so these patterns provide
+// clear error messages rather than silent failures.
+
+struct LapackGetrfFfiRewriter final
+    : OpRewritePattern<mlir::stablehlo::CustomCallOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(mlir::stablehlo::CustomCallOp op,
+                                PatternRewriter &rewriter) const final {
+    StringRef target = op.getCallTargetName();
+
+    // Match LAPACK getrf FFI calls (LU factorization).
+    if (target != "lapack_sgetrf_ffi" && target != "lapack_dgetrf_ffi" &&
+        target != "lapack_cgetrf_ffi" && target != "lapack_zgetrf_ffi") {
+      return rewriter.notifyMatchFailure(op, "not a LAPACK getrf FFI call");
+    }
+
+    // TODO: Implement LU factorization lowering.
+    // Options:
+    // 1. Emit pure linalg/scf ops (like Cholesky)
+    // 2. Route to dense_blas.getrf runtime module (Apple Accelerate)
+    //
+    // For now, emit an error so compilation fails clearly rather than
+    // producing incorrect results from output_operand_alias passthrough.
+    return op.emitError()
+           << "LAPACK LU factorization (" << target << ") is not yet "
+           << "supported in IREE. Use jax.numpy.linalg.lu_factor with "
+           << "a CPU backend or implement custom lowering.";
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Pass Definition.
 //===----------------------------------------------------------------------===//
 
@@ -254,7 +289,8 @@ struct LegalizeStableHLOCustomCalls final
     MLIRContext *ctx = f.getContext();
 
     RewritePatternSet patterns(ctx);
-    patterns.add<HouseholderReflectorRewriter, ShapeAssertionDrop>(ctx);
+    patterns.add<HouseholderReflectorRewriter, ShapeAssertionDrop,
+                 LapackGetrfFfiRewriter>(ctx);
     if (failed(applyPatternsGreedily(f, std::move(patterns)))) {
       signalPassFailure();
     }

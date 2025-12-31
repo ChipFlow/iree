@@ -466,6 +466,15 @@ IREE_VM_ABI_FIXED_STRUCT(rrrI, {
   int64_t i3;
 });
 
+// dense_blas: getrf(m, n, lda, a, ipiv) -> info
+IREE_VM_ABI_FIXED_STRUCT(IIIrr, {
+  int64_t i0;
+  int64_t i1;
+  int64_t i2;
+  iree_vm_ref_t r0;
+  iree_vm_ref_t r1;
+});
+
 IREE_VM_ABI_FIXED_STRUCT(rIrrIiiII, {
   iree_vm_ref_t r0;
   int64_t i1;
@@ -815,6 +824,7 @@ IREE_VM_ABI_DECLARE_SHIM(rr, iI);
 IREE_VM_ABI_DECLARE_SHIM(rrr, iI);
 IREE_VM_ABI_DECLARE_SHIM(rrr, r);
 IREE_VM_ABI_DECLARE_SHIM(rrr, v);    // dense_blas, sparse_solver: solve operations
+IREE_VM_ABI_DECLARE_SHIM(IIIrr, i);  // dense_blas: getrf (LU factorization)
 IREE_VM_ABI_DECLARE_SHIM(rrCrIID, v);
 IREE_VM_ABI_DECLARE_SHIM(rriCiD, v);
 IREE_VM_ABI_DECLARE_SHIM(rriiCID, v);

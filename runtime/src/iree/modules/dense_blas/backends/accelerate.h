@@ -26,7 +26,7 @@ extern "C" {
 //
 // All standard BLAS operations are supported including:
 //   - gemm, syrk, trsm (BLAS Level 3)
-//   - potrf (LAPACK)
+//   - potrf, getrf (LAPACK)
 
 // GEMM: C = alpha * op(A) * op(B) + beta * C
 // Wraps cblas_sgemm.
@@ -100,6 +100,22 @@ int iree_dense_blas_accelerate_potrf_f64(
     bool upper,
     int64_t N,
     double* A, int64_t lda);
+
+// GETRF: LU factorization with partial pivoting.
+// Computes A = P * L * U where P is a permutation matrix.
+// Wraps LAPACK sgetrf/dgetrf.
+// The matrix A is overwritten with L (below diagonal) and U (on and above).
+// |ipiv| receives the pivot indices (1-based, size min(M,N)).
+// Returns: 0 on success, >0 if matrix is singular (U(i,i) is exactly zero).
+int iree_dense_blas_accelerate_getrf_f32(
+    int64_t M, int64_t N,
+    float* A, int64_t lda,
+    int32_t* ipiv);
+
+int iree_dense_blas_accelerate_getrf_f64(
+    int64_t M, int64_t N,
+    double* A, int64_t lda,
+    int32_t* ipiv);
 
 #ifdef __cplusplus
 }  // extern "C"

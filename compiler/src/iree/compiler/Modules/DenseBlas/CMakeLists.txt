@@ -27,8 +27,18 @@
 #   -> vm.call @dense_blas.matmul
 #   -> Runtime: dense_blas module executes via Accelerate/cuBLAS/etc.
 
-# For now, just install the imports file.
-# Full integration would add:
-#   add_subdirectory(IR)
-#   add_subdirectory(Conversion)
-#   add_subdirectory(Transforms)
+# Embed the imports file for use by the DenseBlas dialect.
+iree_c_embed_data(
+  NAME
+    dense_blas_imports
+  SRCS
+    "dense_blas.imports.mlir"
+  C_FILE_OUTPUT
+    "dense_blas.imports.c"
+  H_FILE_OUTPUT
+    "dense_blas.imports.h"
+  IDENTIFIER
+    "iree_dense_blas_imports"
+  FLATTEN
+  PUBLIC
+)
