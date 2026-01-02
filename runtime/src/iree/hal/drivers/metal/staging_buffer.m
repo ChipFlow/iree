@@ -23,7 +23,7 @@ iree_status_t iree_hal_metal_staging_buffer_initialize(
   // "For small-sized data that changes frequently, choose the Shared mode. The overhead of copying
   // data to video memory may be more expensive than the overhead of the GPU accessing system memory
   // directly."
-  MTLResourceOptions options = MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined;
+  MTLResourceOptions options = MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache;
   id<MTLBuffer> metal_buffer = [device newBufferWithLength:buffer_capacity options:options];  // +1
   if (!metal_buffer) {
     IREE_TRACE_ZONE_END(z0);

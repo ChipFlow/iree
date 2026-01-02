@@ -82,7 +82,7 @@ void iree_hal_metal_device_params_initialize(iree_hal_metal_device_params_t* out
   out_params->command_buffer_resource_reference_mode =
       IREE_HAL_METAL_COMMAND_BUFFER_RESOURCE_REFERENCE_MODE_UNRETAINED;
   out_params->resource_hazard_tracking_mode =
-      IREE_HAL_METAL_RESOURCE_HAZARD_TRACKING_MODE_UNTRACKED;
+      IREE_HAL_METAL_RESOURCE_HAZARD_TRACKING_MODE_TRACKED;
 }
 
 const iree_hal_metal_device_params_t* iree_hal_metal_device_params(
