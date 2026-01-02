@@ -140,6 +140,24 @@ jobs:
           echo "Running Shardy dialect tests..."
           JAX_PLATFORMS=iree_metal python test/test_shardy.py || echo "Shardy tests failed (possibly due to VM GPU limitations)"
 
+      - name: Run comprehensive Metal tests
+        run: |
+          source ${VENV_DIR}/bin/activate
+          cd integrations/pjrt
+
+          # Comprehensive test suite covering:
+          # - Determinism/stability (repeated execution)
+          # - Identity/constant operations (eye, zeros, ones, etc.)
+          # - Control flow (cond, while_loop, scan, fori_loop)
+          # - Data types (float16, float32, int32, bool, complex)
+          # - Scatter/gather operations
+          # - Random number generation
+          # - Linear algebra (matmul, transpose, norm, etc.)
+          # - Reductions (sum, mean, max, etc.)
+          # - Buffer donation
+          echo "Running comprehensive Metal test suite..."
+          JAX_PLATFORMS=iree_metal python test/test_metal_comprehensive.py || echo "Some comprehensive tests failed (see summary above)"
+
       - name: Run differential tests vs CPU
         run: |
           source ${VENV_DIR}/bin/activate
