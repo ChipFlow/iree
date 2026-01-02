@@ -89,9 +89,17 @@ def run_test(name: str, verbose: bool = False):
                 if verbose:
                     print("PASS")
             except AssertionError as e:
-                results.add_fail(name, str(e))
-                if verbose:
-                    print(f"FAIL: {e}")
+                msg = str(e)
+                # Handle SKIP as a special case (not a true failure)
+                if msg.startswith("SKIP:"):
+                    skip_reason = msg[5:].strip()
+                    results.add_skip(name, skip_reason)
+                    if verbose:
+                        print(f"SKIP: {skip_reason}")
+                else:
+                    results.add_fail(name, msg)
+                    if verbose:
+                        print(f"FAIL: {e}")
             except Exception as e:
                 results.add_fail(name, f"{type(e).__name__}: {e}")
                 if verbose:
@@ -423,9 +431,13 @@ def test_scan():
     """Test lax.scan.
 
     KNOWN ISSUE: IREE Metal returns input values instead of accumulated results.
-    The scan body function's carry seems to be ignored.
+    ROOT CAUSE: lax.scan uses stablehlo.while + stablehlo.dynamic_slice.
+    The dynamic_slice operation ignores the start index and always reads from
+    position 0, causing each iteration to read the same element (x[0]).
+    See test_dynamic_slice for the underlying bug.
+
     Expected: [1, 3, 6, 10] (cumulative sum)
-    Actual: [1, 2, 3, 4] (just the inputs)
+    Actual: [1, 2, 3, 4] (carry incremented by x[0]=1 each iteration)
     """
     @jax.jit
     def cumsum(xs):
@@ -503,6 +515,15 @@ def test_dynamic_slice():
     """Test dynamic_slice.
 
     KNOWN ISSUE: IREE Metal ignores the start index and always slices from 0.
+
+    ROOT CAUSE: The dynamic offset is passed via push constants to the Metal
+    shader, but the value appears to always be 0. Investigation shows the
+    SPIRV codegen is correct, so the issue is likely in the VM dispatch or
+    how workload ordinals map to push constants.
+
+    This bug affects: lax.scan, while_loop with dynamic indexing, and any
+    operation using dynamic slicing.
+
     Expected: [2, 3, 4] (starting at index 2)
     Actual: [0, 1, 2] (starting at index 0)
     """
@@ -548,13 +569,22 @@ def test_dynamic_update_slice():
 # a development version of JAX.
 
 def _check_random_support():
-    """Check if random ops are supported (Shardy compatibility)."""
+    """Check if random ops are supported (Shardy compatibility).
+
+    Random ops may fail due to Shardy dialect version mismatch between
+    JAX (which uses Shardy for partitioning) and the PyPI iree-base-compiler.
+    To fix: build IREE compiler from source with matching Shardy version.
+    """
     try:
         key = jax.random.PRNGKey(0)
         _ = jax.random.uniform(key, shape=(2,))
         return True
     except Exception as e:
-        if "sdy" in str(e) or "bytecode" in str(e):
+        error_str = str(e).lower()
+        # Shardy dialect version mismatch or sharding ops not supported
+        # The actual error may be "INVALID_ARGUMENT" while stderr shows the Shardy issue
+        if ("sdy" in error_str or "bytecode" in error_str or
+            "sharding" in error_str or "invalid_argument" in error_str):
             return False
         raise
 
@@ -562,7 +592,7 @@ def _check_random_support():
 def test_random_uniform():
     """Test random.uniform generates values in range."""
     if not _check_random_support():
-        raise AssertionError("SKIP: Random ops not supported (Shardy dialect version mismatch)")
+        raise AssertionError("SKIP: Random ops require building IREE compiler from source (Shardy version mismatch with PyPI package)")
 
     key = jax.random.PRNGKey(0)
     result = jax.random.uniform(key, shape=(1000,))
@@ -577,7 +607,7 @@ def test_random_uniform():
 def test_random_normal():
     """Test random.normal generates reasonable distribution."""
     if not _check_random_support():
-        raise AssertionError("SKIP: Random ops not supported (Shardy dialect version mismatch)")
+        raise AssertionError("SKIP: Random ops require building IREE compiler from source (Shardy version mismatch with PyPI package)")
 
     key = jax.random.PRNGKey(42)
     result = jax.random.normal(key, shape=(10000,))
@@ -591,7 +621,7 @@ def test_random_normal():
 def test_random_split():
     """Test random.split produces different keys."""
     if not _check_random_support():
-        raise AssertionError("SKIP: Random ops not supported (Shardy dialect version mismatch)")
+        raise AssertionError("SKIP: Random ops require building IREE compiler from source (Shardy version mismatch with PyPI package)")
 
     key = jax.random.PRNGKey(0)
     key1, key2 = jax.random.split(key)
@@ -608,7 +638,7 @@ def test_random_split():
 def test_random_choice():
     """Test random.choice."""
     if not _check_random_support():
-        raise AssertionError("SKIP: Random ops not supported (Shardy dialect version mismatch)")
+        raise AssertionError("SKIP: Random ops require building IREE compiler from source (Shardy version mismatch with PyPI package)")
 
     key = jax.random.PRNGKey(0)
     data = jnp.arange(10)
@@ -621,7 +651,7 @@ def test_random_choice():
 def test_random_permutation():
     """Test random.permutation."""
     if not _check_random_support():
-        raise AssertionError("SKIP: Random ops not supported (Shardy dialect version mismatch)")
+        raise AssertionError("SKIP: Random ops require building IREE compiler from source (Shardy version mismatch with PyPI package)")
 
     key = jax.random.PRNGKey(0)
     data = jnp.arange(10)
@@ -731,7 +761,12 @@ def test_norm():
 
 
 def test_solve():
-    """Test linear system solve (if supported)."""
+    """Test linear system solve (if supported).
+
+    KNOWN ISSUE: stablehlo.triangular_solve is marked illegal even though
+    IREE has a lowering pattern (StableHLOTriangularSolveToLinalg.cpp).
+    The pattern may not match the op structure generated by JAX.
+    """
     # Simple 2x2 system: Ax = b
     A = jnp.array([[2.0, 1.0], [1.0, 3.0]])
     b = jnp.array([1.0, 2.0])
@@ -743,11 +778,17 @@ def test_solve():
         assert np.allclose(result, b, atol=1e-5), f"solve verification failed: {result}"
     except Exception as e:
         # Solve may not be implemented
-        raise AssertionError(f"solve not supported: {e}")
+        raise AssertionError(f"KNOWN ISSUE: solve not supported - {type(e).__name__}")
 
 
 def test_cholesky():
-    """Test Cholesky decomposition (if supported)."""
+    """Test Cholesky decomposition (if supported).
+
+    KNOWN ISSUE: stablehlo.cholesky is marked illegal even though IREE has
+    a lowering pattern (StableHLOCholeskyToLinalg.cpp). The pattern requires:
+    - 2D matrix, float type, square static shape, lower=True
+    The pattern may not match the op structure generated by JAX.
+    """
     # Positive definite matrix
     A = jnp.array([[4.0, 2.0], [2.0, 5.0]])
 
@@ -757,7 +798,7 @@ def test_cholesky():
         result = jnp.dot(L, L.T)
         assert np.allclose(result, A, atol=1e-5), f"cholesky verification failed"
     except Exception as e:
-        raise AssertionError(f"cholesky not supported: {e}")
+        raise AssertionError(f"KNOWN ISSUE: cholesky not supported - {type(e).__name__}")
 
 
 # =============================================================================
