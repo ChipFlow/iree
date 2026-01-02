@@ -261,6 +261,16 @@ static void iree_hal_metal_command_buffer_reset(iree_hal_metal_command_buffer_t*
   iree_hal_metal_end_compute_encoder(command_buffer);
   iree_hal_metal_command_segment_list_reset(&command_buffer->segments);
   iree_arena_reset(&command_buffer->arena);
+  // Release the indirect bindings buffer if present. We allocate a fresh one
+  // for each recording to avoid race conditions where GPU is still reading
+  // from the old buffer while we reset. This is necessary because command
+  // buffers may be reused before GPU execution completes.
+  if (command_buffer->indirect_bindings_buffer != nil) {
+    [command_buffer->indirect_bindings_buffer release];  // -1
+    command_buffer->indirect_bindings_buffer = nil;
+    command_buffer->indirect_bindings_capacity = 0;
+  }
+  command_buffer->indirect_bindings_offset = 0;
   IREE_TRACE_ZONE_END(z0);
 }
 
