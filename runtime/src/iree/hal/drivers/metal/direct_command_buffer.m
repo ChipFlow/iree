@@ -952,39 +952,104 @@ static iree_status_t iree_hal_metal_command_segment_record_dispatch(
   // Record argument buffers for all descriptors and record buffer usages.
   iree_hal_metal_descriptor_t* descriptors = segment->descriptors;
 
-  // Build argument encoder and argument buffer for the current descriptor set.
-  // TODO(antiagainst): Use a cache layer to cache and reuse argument buffers with the same
-  // content, to avoid duplicating overhead.
-  id<MTLBuffer> argument_buffer = command_buffer->staging_buffer->metal_buffer;
-  id<MTLArgumentEncoder> argument_encoder =
-      [segment->pipeline->function newArgumentEncoderWithBufferIndex:0];  // +1
-  IREE_ASSERT(argument_encoder != nil);
+  if (segment->pipeline->uses_indirect_bindings) {
+    // For indirect bindings (PhysicalStorageBuffer), build a two-level pointer structure.
+    // The MSL structure is:
+    //   struct _6 { device T* _m0; device T* _m1; ... };  // inner: actual buffer pointers
+    //   struct spvDescriptorSetBuffer3 { device _6* _resource_var_indirect_0_; };  // outer
+    // Buffer(3) must contain spvDescriptorSetBuffer3, which points to _6.
+    id<MTLBuffer> staging_buffer = command_buffer->staging_buffer->metal_buffer;
 
-  // Reserve space for the argument buffer from shared staging buffer.
-  iree_byte_span_t reservation = iree_byte_span_empty();
-  uint32_t argument_buffer_offset = 0;
-  IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, iree_hal_metal_staging_buffer_reserve(
-              command_buffer->staging_buffer, argument_encoder.encodedLength,
-              argument_encoder.alignment, &reservation, &argument_buffer_offset));
-  [argument_encoder setArgumentBuffer:argument_buffer offset:argument_buffer_offset];
+    // Determine the maximum binding index to size the inner struct.
+    uint32_t max_binding = 0;
+    for (iree_host_size_t i = 0; i < segment->descriptor_count; ++i) {
+      if (descriptors[i].binding > max_binding) {
+        max_binding = descriptors[i].binding;
+      }
+    }
+    size_t inner_struct_size = (max_binding + 1) * sizeof(uint64_t);
 
-  // Now record all bound buffers belonging to the current set into the argument buffer.
-  for (iree_host_size_t i = 0; i < segment->descriptor_count; ++i) {
-    uint32_t current_binding = descriptors[i].binding;
-    id<MTLBuffer> current_buffer =
-        iree_hal_metal_buffer_handle(iree_hal_buffer_allocated_buffer(descriptors[i].buffer));
-    iree_host_size_t offset =
-        iree_hal_buffer_byte_offset(descriptors[i].buffer) + descriptors[i].offset;
-    [argument_encoder setBuffer:current_buffer offset:offset atIndex:current_binding];
+    // Reserve space for inner struct (contains GPU addresses for each binding).
+    iree_byte_span_t inner_reservation = iree_byte_span_empty();
+    uint32_t inner_offset = 0;
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_metal_staging_buffer_reserve(
+                command_buffer->staging_buffer, inner_struct_size,
+                /*alignment=*/sizeof(uint64_t), &inner_reservation, &inner_offset));
 
-    // Also record buffer usages.
-    [compute_encoder useResource:current_buffer usage:descriptors[i].usage];
+    // Fill the inner struct with GPU addresses.
+    uint64_t* address_table = (uint64_t*)inner_reservation.data;
+    memset(address_table, 0, inner_struct_size);
+    for (iree_host_size_t i = 0; i < segment->descriptor_count; ++i) {
+      uint32_t current_binding = descriptors[i].binding;
+      id<MTLBuffer> current_buffer =
+          iree_hal_metal_buffer_handle(iree_hal_buffer_allocated_buffer(descriptors[i].buffer));
+      iree_host_size_t offset =
+          iree_hal_buffer_byte_offset(descriptors[i].buffer) + descriptors[i].offset;
+
+      address_table[current_binding] = current_buffer.gpuAddress + offset;
+      [compute_encoder useResource:current_buffer usage:descriptors[i].usage];
+    }
+
+    // Reserve space for outer struct (contains pointer to inner struct).
+    iree_byte_span_t outer_reservation = iree_byte_span_empty();
+    uint32_t outer_offset = 0;
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_metal_staging_buffer_reserve(
+                command_buffer->staging_buffer, sizeof(uint64_t),
+                /*alignment=*/sizeof(uint64_t), &outer_reservation, &outer_offset));
+
+    // Fill the outer struct with pointer to inner struct.
+    uint64_t* outer_ptr = (uint64_t*)outer_reservation.data;
+    *outer_ptr = staging_buffer.gpuAddress + inner_offset;
+
+    // Ensure CPU writes to staging buffer are visible to GPU.
+    // Use ARM64-specific data memory barrier for store completion.
+#if defined(__aarch64__)
+    __asm__ __volatile__("dmb ishst" ::: "memory");  // Store barrier
+    __asm__ __volatile__("dsb sy" ::: "memory");     // Full sync
+#else
+    __sync_synchronize();
+#endif
+
+    // Pass the outer struct at buffer index 3.
+    [compute_encoder setBuffer:staging_buffer offset:outer_offset atIndex:3];
+  } else {
+    // Standard path: use argument encoders for descriptor sets.
+    // Build argument encoder and argument buffer for the current descriptor set.
+    // TODO(antiagainst): Use a cache layer to cache and reuse argument buffers with the same
+    // content, to avoid duplicating overhead.
+    id<MTLBuffer> argument_buffer = command_buffer->staging_buffer->metal_buffer;
+    id<MTLArgumentEncoder> argument_encoder =
+        [segment->pipeline->function newArgumentEncoderWithBufferIndex:0];  // +1
+    IREE_ASSERT(argument_encoder != nil);
+
+    // Reserve space for the argument buffer from shared staging buffer.
+    iree_byte_span_t reservation = iree_byte_span_empty();
+    uint32_t argument_buffer_offset = 0;
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_metal_staging_buffer_reserve(
+                command_buffer->staging_buffer, argument_encoder.encodedLength,
+                argument_encoder.alignment, &reservation, &argument_buffer_offset));
+    [argument_encoder setArgumentBuffer:argument_buffer offset:argument_buffer_offset];
+
+    // Now record all bound buffers belonging to the current set into the argument buffer.
+    for (iree_host_size_t i = 0; i < segment->descriptor_count; ++i) {
+      uint32_t current_binding = descriptors[i].binding;
+      id<MTLBuffer> current_buffer =
+          iree_hal_metal_buffer_handle(iree_hal_buffer_allocated_buffer(descriptors[i].buffer));
+      iree_host_size_t offset =
+          iree_hal_buffer_byte_offset(descriptors[i].buffer) + descriptors[i].offset;
+      [argument_encoder setBuffer:current_buffer offset:offset atIndex:current_binding];
+
+      // Also record buffer usages.
+      [compute_encoder useResource:current_buffer usage:descriptors[i].usage];
+    }
+    // Record the argument buffer.
+    [compute_encoder setBuffer:argument_buffer offset:argument_buffer_offset atIndex:0];
+
+    [argument_encoder release];  // -1
   }
-  // Record the argument buffer.
-  [compute_encoder setBuffer:argument_buffer offset:argument_buffer_offset atIndex:0];
-
-  [argument_encoder release];  // -1
 
   // Record the dispatch, either direct or indirect.
   if (segment->workgroups_buffer == nil) {
