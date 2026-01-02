@@ -37,6 +37,7 @@ MetalBuildCMake = iree_pjrt_setup.create_cmake_build_class(
         # baspacho_wrapper.cpp is compiled with -fexceptions -frtti to handle
         # BaSpaCho's C++ exceptions, with all exceptions caught at the C API boundary.
         "-DIREE_EXTERNAL_SPARSE_SOLVER=ON",
+        # Use the reference folder's baspacho which has Metal backend support
         f"-DBASPACHO_SOURCE_DIR={THIS_DIR.parent.parent.parent.parent.parent / 'baspacho'}",
         "-DBASPACHO_USE_CUBLAS=OFF",
         "-DBLA_VENDOR=Apple",

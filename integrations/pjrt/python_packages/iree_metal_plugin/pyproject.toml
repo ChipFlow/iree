@@ -39,6 +39,8 @@ iree-metal = "jax_plugins.iree_metal"
 [tool.uv.sources]
 # Use patched JAX (path relative to this package)
 jax = { path = "../../../../../jax", editable = true }
+# Use prebuilt IREE compiler from PyPI (avoids long build times)
+# iree-base-compiler = { path = "../../../../compiler", editable = true }
 
 [tool.uv]
 # Rebuild when setup.py changes (contains cmake args) or cmake env vars change
