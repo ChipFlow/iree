@@ -178,6 +178,13 @@ typedef struct iree_hal_metal_command_buffer_t {
   // buffers and buffer update source buffers.
   iree_hal_metal_staging_buffer_t* staging_buffer;
 
+  // Per-command-buffer dedicated buffer for indirect bindings (PhysicalStorageBuffer).
+  // This buffer is owned by this command buffer and not shared, preventing race conditions
+  // where the GPU reads stale data while another command buffer overwrites shared staging buffer.
+  id<MTLBuffer> indirect_bindings_buffer;
+  uint32_t indirect_bindings_capacity;  // Current allocated capacity in bytes
+  uint32_t indirect_bindings_offset;    // Current write offset in bytes
+
   iree_allocator_t host_allocator;
 
   // Maintains a reference to all resources used within the command buffer. Resets on each begin.
@@ -314,6 +321,58 @@ static id<MTLBlitCommandEncoder> iree_hal_metal_get_or_begin_blit_encoder(
   return command_buffer->state.blit_encoder;
 }
 
+// Default initial capacity for the indirect bindings buffer (4KB should be plenty for most cases).
+#define IREE_HAL_METAL_INDIRECT_BINDINGS_BUFFER_DEFAULT_CAPACITY (4 * 1024)
+
+// Reserves space in the per-command-buffer indirect bindings buffer.
+// Allocates or grows the buffer as needed. Returns the host pointer and buffer offset.
+static iree_status_t iree_hal_metal_indirect_bindings_buffer_reserve(
+    iree_hal_metal_command_buffer_t* command_buffer, iree_host_size_t length,
+    iree_host_size_t alignment, uint8_t** out_host_ptr, uint32_t* out_offset) {
+  // Calculate aligned offset.
+  uint32_t aligned_offset = iree_host_align(command_buffer->indirect_bindings_offset, alignment);
+  uint32_t required_capacity = aligned_offset + (uint32_t)length;
+
+  // Allocate or grow the buffer if needed.
+  if (required_capacity > command_buffer->indirect_bindings_capacity) {
+    // Determine new capacity (start with default, then double as needed).
+    uint32_t new_capacity = command_buffer->indirect_bindings_capacity == 0
+                                ? IREE_HAL_METAL_INDIRECT_BINDINGS_BUFFER_DEFAULT_CAPACITY
+                                : command_buffer->indirect_bindings_capacity * 2;
+    while (new_capacity < required_capacity) {
+      new_capacity *= 2;
+    }
+
+    // Allocate new buffer with shared storage mode and default cache mode.
+    // This matches staging_buffer.m settings for CPU-GPU coherency.
+    MTLResourceOptions options = MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache;
+    id<MTLBuffer> new_buffer = [command_buffer->queue.device newBufferWithLength:new_capacity
+                                                                         options:options];  // +1
+    if (!new_buffer) {
+      return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                              "failed to allocate indirect bindings buffer with size = %u bytes",
+                              new_capacity);
+    }
+
+    // Copy existing data if growing an existing buffer.
+    if (command_buffer->indirect_bindings_buffer != nil) {
+      memcpy(new_buffer.contents, command_buffer->indirect_bindings_buffer.contents,
+             command_buffer->indirect_bindings_offset);
+      [command_buffer->indirect_bindings_buffer release];  // -1
+    }
+
+    command_buffer->indirect_bindings_buffer = new_buffer;
+    command_buffer->indirect_bindings_capacity = new_capacity;
+  }
+
+  // Update offset and return reservation.
+  command_buffer->indirect_bindings_offset = aligned_offset + (uint32_t)length;
+  *out_host_ptr = (uint8_t*)command_buffer->indirect_bindings_buffer.contents + aligned_offset;
+  *out_offset = aligned_offset;
+
+  return iree_ok_status();
+}
+
 // Destroys the given |base_command_buffer| itself, without decreasing refcount in the shared
 // staging buffer yet.
 static void iree_hal_metal_command_buffer_destroy_internal(
@@ -383,6 +442,10 @@ iree_status_t iree_hal_metal_direct_command_buffer_create(
     command_buffer->state.blit_encoder = nil;
     command_buffer->state.encoder_event = [queue.device newEvent];  // +1
     command_buffer->state.next_encoder_event_value = 1;
+    // Initialize per-command-buffer indirect bindings buffer (allocated lazily on first use).
+    command_buffer->indirect_bindings_buffer = nil;
+    command_buffer->indirect_bindings_capacity = 0;
+    command_buffer->indirect_bindings_offset = 0;
   }
 
   if (iree_status_is_ok(status)) {
@@ -413,6 +476,10 @@ static void iree_hal_metal_command_buffer_destroy_internal(
   IREE_ASSERT_EQ(command_buffer->state.blit_encoder, nil);
   [command_buffer->command_buffer release];  // -1
   [command_buffer->queue release];           // -1
+  // Release per-command-buffer indirect bindings buffer if allocated.
+  if (command_buffer->indirect_bindings_buffer != nil) {
+    [command_buffer->indirect_bindings_buffer release];  // -1
+  }
   iree_hal_resource_set_free(command_buffer->resource_set);
   iree_arena_deinitialize(&command_buffer->arena);
   iree_allocator_free(command_buffer->host_allocator, command_buffer);
@@ -958,7 +1025,9 @@ static iree_status_t iree_hal_metal_command_segment_record_dispatch(
     //   struct _6 { device T* _m0; device T* _m1; ... };  // inner: actual buffer pointers
     //   struct spvDescriptorSetBuffer3 { device _6* _resource_var_indirect_0_; };  // outer
     // Buffer(3) must contain spvDescriptorSetBuffer3, which points to _6.
-    id<MTLBuffer> staging_buffer = command_buffer->staging_buffer->metal_buffer;
+    //
+    // We use a per-command-buffer dedicated buffer to avoid race conditions where the GPU
+    // reads stale data while another command buffer overwrites shared staging buffer data.
 
     // Determine the maximum binding index to size the inner struct.
     uint32_t max_binding = 0;
@@ -970,15 +1039,15 @@ static iree_status_t iree_hal_metal_command_segment_record_dispatch(
     size_t inner_struct_size = (max_binding + 1) * sizeof(uint64_t);
 
     // Reserve space for inner struct (contains GPU addresses for each binding).
-    iree_byte_span_t inner_reservation = iree_byte_span_empty();
+    uint8_t* inner_host_ptr = NULL;
     uint32_t inner_offset = 0;
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
-        z0, iree_hal_metal_staging_buffer_reserve(
-                command_buffer->staging_buffer, inner_struct_size,
-                /*alignment=*/sizeof(uint64_t), &inner_reservation, &inner_offset));
+        z0, iree_hal_metal_indirect_bindings_buffer_reserve(
+                command_buffer, inner_struct_size,
+                /*alignment=*/sizeof(uint64_t), &inner_host_ptr, &inner_offset));
 
     // Fill the inner struct with GPU addresses.
-    uint64_t* address_table = (uint64_t*)inner_reservation.data;
+    uint64_t* address_table = (uint64_t*)inner_host_ptr;
     memset(address_table, 0, inner_struct_size);
     for (iree_host_size_t i = 0; i < segment->descriptor_count; ++i) {
       uint32_t current_binding = descriptors[i].binding;
@@ -992,18 +1061,20 @@ static iree_status_t iree_hal_metal_command_segment_record_dispatch(
     }
 
     // Reserve space for outer struct (contains pointer to inner struct).
-    iree_byte_span_t outer_reservation = iree_byte_span_empty();
+    uint8_t* outer_host_ptr = NULL;
     uint32_t outer_offset = 0;
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
-        z0, iree_hal_metal_staging_buffer_reserve(
-                command_buffer->staging_buffer, sizeof(uint64_t),
-                /*alignment=*/sizeof(uint64_t), &outer_reservation, &outer_offset));
+        z0, iree_hal_metal_indirect_bindings_buffer_reserve(
+                command_buffer, sizeof(uint64_t),
+                /*alignment=*/sizeof(uint64_t), &outer_host_ptr, &outer_offset));
 
     // Fill the outer struct with pointer to inner struct.
-    uint64_t* outer_ptr = (uint64_t*)outer_reservation.data;
-    *outer_ptr = staging_buffer.gpuAddress + inner_offset;
+    // Use the dedicated buffer's GPU address for the inner struct pointer.
+    id<MTLBuffer> indirect_buffer = command_buffer->indirect_bindings_buffer;
+    uint64_t* outer_ptr = (uint64_t*)outer_host_ptr;
+    *outer_ptr = indirect_buffer.gpuAddress + inner_offset;
 
-    // Ensure CPU writes to staging buffer are visible to GPU.
+    // Ensure CPU writes to the dedicated buffer are visible to GPU.
     // Use ARM64-specific data memory barrier for store completion.
 #if defined(__aarch64__)
     __asm__ __volatile__("dmb ishst" ::: "memory");  // Store barrier
@@ -1013,7 +1084,7 @@ static iree_status_t iree_hal_metal_command_segment_record_dispatch(
 #endif
 
     // Pass the outer struct at buffer index 3.
-    [compute_encoder setBuffer:staging_buffer offset:outer_offset atIndex:3];
+    [compute_encoder setBuffer:indirect_buffer offset:outer_offset atIndex:3];
   } else {
     // Standard path: use argument encoders for descriptor sets.
     // Build argument encoder and argument buffer for the current descriptor set.
