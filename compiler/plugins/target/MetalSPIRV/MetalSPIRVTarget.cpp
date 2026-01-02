@@ -32,6 +32,7 @@ namespace {
 struct MetalSPIRVOptions {
   MetalTargetPlatform targetPlatform = MetalTargetPlatform::macOS;
   bool compileToMetalLib = true;
+  bool indirectBindings = false;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("MetalSPIRV HAL Target");
@@ -49,6 +50,11 @@ struct MetalSPIRVOptions {
         llvm::cl::desc("Compile to .metallib and embed in IREE deployable "
                        "flatbuffer if true; "
                        "otherwise stop at and embed MSL source code"));
+    binder.opt<bool>(
+        "iree-metal-experimental-indirect-bindings", indirectBindings,
+        llvm::cl::cat(category),
+        llvm::cl::desc("Use indirect bindings (PhysicalStorageBuffer) for "
+                       "passing buffer addresses via GPU pointers"));
   }
 };
 } // namespace
@@ -99,7 +105,9 @@ public:
     }
 
     return b.getAttr<IREE::HAL::ExecutableTargetAttr>(
-        b.getStringAttr("metal-spirv"), b.getStringAttr("metal-msl-fb"),
+        b.getStringAttr("metal-spirv"),
+        options.indirectBindings ? b.getStringAttr("metal-msl-fb-ptr")
+                                 : b.getStringAttr("metal-msl-fb"),
         b.getDictionaryAttr(configItems));
   }
 

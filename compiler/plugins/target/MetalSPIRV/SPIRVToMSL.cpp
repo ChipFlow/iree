@@ -18,7 +18,8 @@
 
 /// The [[buffer(N)]] index for push constants.
 /// Note that this MUST be kept consistent with the Metal HAL driver.
-#define IREE_HAL_METAL_PUSH_CONSTANT_BUFFER_INDEX 3
+/// Index 3 is reserved for indirect bindings (PhysicalStorageBuffer).
+#define IREE_HAL_METAL_PUSH_CONSTANT_BUFFER_INDEX 30
 
 namespace mlir::iree_compiler {
 
@@ -75,7 +76,8 @@ public:
             *hasPushConstant = true;
             return;
           case spv::StorageClassUniform:
-          case spv::StorageClassStorageBuffer: {
+          case spv::StorageClassStorageBuffer:
+          case spv::StorageClassPhysicalStorageBuffer: {
             uint32_t setNo = get_decoration(id, spv::DecorationDescriptorSet);
             uint32_t bindingNo = get_decoration(id, spv::DecorationBinding);
             descriptors->emplace_back(setNo, bindingNo);

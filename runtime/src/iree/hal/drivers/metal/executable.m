@@ -322,6 +322,7 @@ static iree_status_t iree_hal_metal_create_pipeline_state(
 
 static iree_status_t iree_hal_metal_create_pipeline(id<MTLDevice> device, id<MTLLibrary> library,
                                                     iree_hal_metal_PipelineDef_table_t pipeline_def,
+                                                    bool uses_indirect_bindings,
                                                     iree_hal_metal_pipeline_t* out_pipeline) {
   IREE_TRACE_ZONE_BEGIN(z0);
   flatbuffers_string_t entry_point = iree_hal_metal_PipelineDef_entry_point_get(pipeline_def);
@@ -392,6 +393,8 @@ static iree_status_t iree_hal_metal_create_pipeline(id<MTLDevice> device, id<MTL
         out_pipeline->binding_read_only_bits |= 1ull << i;
       }
     }
+
+    out_pipeline->uses_indirect_bindings = uses_indirect_bindings;
   }
 
   IREE_TRACE_ZONE_END(z0);
@@ -461,6 +464,11 @@ iree_status_t iree_hal_metal_executable_create(
   iree_status_t status =
       iree_hal_metal_load_libraries(device, libraries_vec, &executable->libraries);
 
+  // Detect if this executable uses indirect bindings (PhysicalStorageBuffer).
+  // The "metal-msl-fb-ptr" format indicates indirect bindings are enabled.
+  bool uses_indirect_bindings = iree_string_view_equal(
+      executable_params->executable_format, iree_make_cstring_view("metal-msl-fb-ptr"));
+
   if (iree_status_is_ok(status)) {
     for (iree_host_size_t i = 0; i < pipeline_count; ++i) {
       iree_hal_metal_PipelineDef_table_t pipeline_def =
@@ -470,7 +478,8 @@ iree_status_t iree_hal_metal_executable_create(
       id<MTLLibrary> library = [executable->libraries objectAtIndex:library_ordinal];  // unretained
 
       iree_hal_metal_pipeline_t* pipeline = &executable->pipelines[i];
-      status = iree_hal_metal_create_pipeline(device, library, pipeline_def, pipeline);
+      status = iree_hal_metal_create_pipeline(device, library, pipeline_def, uses_indirect_bindings,
+                                              pipeline);
       if (!iree_status_is_ok(status)) break;
 
       IREE_TRACE({

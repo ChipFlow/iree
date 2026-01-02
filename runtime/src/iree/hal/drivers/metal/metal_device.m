@@ -227,7 +227,10 @@ static iree_status_t iree_hal_metal_device_query_i64(iree_hal_device_t* base_dev
   }
 
   if (iree_string_view_equal(category, iree_make_cstring_view("hal.executable.format"))) {
-    *out_value = iree_string_view_equal(key, iree_make_cstring_view("metal-msl-fb")) ? 1 : 0;
+    *out_value = (iree_string_view_equal(key, iree_make_cstring_view("metal-msl-fb")) ||
+                  iree_string_view_equal(key, iree_make_cstring_view("metal-msl-fb-ptr")))
+                     ? 1
+                     : 0;
     return iree_ok_status();
   }
 

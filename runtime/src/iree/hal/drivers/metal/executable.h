@@ -48,8 +48,8 @@ extern "C" {
 // This depends on the general descriptor set planning in IREE and should adjust
 // with it. Note that it also needs to be consistent with the compiler side when
 // setting up resource location attributes during cross compiling SPIR-V to MSL.
-#define IREE_HAL_METAL_PUSH_CONSTANT_BUFFER_INDEX \
-  (IREE_HAL_METAL_MAX_DESCRIPTOR_SET_COUNT - 1)
+// Index 3 is reserved for indirect bindings (PhysicalStorageBuffer).
+#define IREE_HAL_METAL_PUSH_CONSTANT_BUFFER_INDEX 30
 
 // The max number of push constants supported by the Metal HAL implementation.
 #define IREE_HAL_METAL_MAX_PUSH_CONSTANT_COUNT 64
@@ -80,6 +80,11 @@ typedef struct iree_hal_metal_pipeline_t {
   uint32_t binding_count;
   // One bit per binding indicating whether it is read-only.
   uint64_t binding_read_only_bits;
+
+  // True if this pipeline uses indirect bindings (PhysicalStorageBuffer).
+  // When true, buffer addresses are passed via a two-level pointer structure
+  // at buffer index 3 instead of using Metal argument buffers.
+  bool uses_indirect_bindings;
 
   IREE_TRACE(iree_hal_metal_source_location_t source_location;)
 } iree_hal_metal_pipeline_t;
