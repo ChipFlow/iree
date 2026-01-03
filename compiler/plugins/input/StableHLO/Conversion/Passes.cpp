@@ -6,6 +6,7 @@
 
 #include "compiler/plugins/input/StableHLO/Conversion/Passes.h"
 
+#include "compiler/plugins/input/Shardy/InputConversion/Passes.h"
 #include "compiler/plugins/input/StableHLO/Conversion/Preprocessing/Passes.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "iree/compiler/InputConversion/Common/Passes.h"
@@ -50,6 +51,13 @@ void buildStableHLOInputConversionPassPipelineImpl(
   // If the input is StableHLO, this pass is considered a NOP.
   passManager.addPass(stablehlo::createCheckVHLOStableHloMixUsage());
   ::mlir::stablehlo::createStablehloDeserializePipeline(passManager);
+
+  // Strip Shardy (sdy) dialect ops and attributes. This must run AFTER VHLO
+  // deserialization since sdy ops are embedded in VHLO bytecode. JAX 0.8.2+
+  // uses the Shardy partitioner by default, which adds sdy.mesh and
+  // sdy.sharding_constraint ops. For single-device execution, these are
+  // metadata-only annotations that can be safely removed.
+  passManager.addPass(shardy::createStripShardyDialectPass());
   passManager.addNestedPass<func::FuncOp>(mlir::createCanonicalizerPass());
   passManager.addNestedPass<func::FuncOp>(createStableHLOCanonicalize());
   passManager.addNestedPass<func::FuncOp>(mlir::createCSEPass());

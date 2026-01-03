@@ -230,9 +230,9 @@ std::unique_ptr<CompilerJob> IREECompiler::StartJob() {
         ireeCompilerSessionDestroy(session);
       });
 
-  // The input here should be stablehlo if coming from JAX and xla if
-  // importing from XLA HLO. Set to xla for now as it merely runs an
-  // additional pass. We can flip to auto post more testing.
+  // Use stablehlo_xla input type for JAX/XLA compatibility.
+  // The StableHLO input pipeline now includes Shardy (sdy) dialect stripping
+  // for JAX 0.8.2+ which uses the Shardy partitioner by default.
   if (!job->SetFlag("--iree-input-type=stablehlo_xla") ||
       !job->SetFlag("--iree-input-demote-i64-to-i32=false") ||
       !job->SetFlag("--iree-execution-model=async-external")) {

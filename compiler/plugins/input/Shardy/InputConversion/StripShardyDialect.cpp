@@ -54,24 +54,31 @@ struct StripShardyDialectPass
     }
 
     // Collect sdy ops to remove (can't erase during walk - iterator invalidation)
-    SmallVector<Operation *> sdyOpsToErase;
+    // We handle two categories:
+    // 1. sdy.mesh ops (0 results, 0 operands) - just erase them
+    // 2. sdy.sharding_constraint ops (1 result, 1+ operands) - replace uses then erase
+    SmallVector<Operation *> meshOpsToErase;
+    SmallVector<Operation *> constraintOpsToErase;
     module.walk([&](Operation *op) {
       if (op->getDialect() && op->getDialect()->getNamespace() == "sdy") {
-        if (op->getNumResults() == 1 && op->getNumOperands() >= 1) {
-          sdyOpsToErase.push_back(op);
-        } else if (op->getNumResults() > 0 || op->getNumOperands() > 0) {
-          // Warn about unexpected patterns we can't handle
-          op->emitWarning() << "Unexpected Shardy op pattern (results="
-                            << op->getNumResults()
-                            << ", operands=" << op->getNumOperands()
-                            << ") - may not be fully stripped";
+        if (op->getNumResults() == 0 && op->getNumOperands() == 0) {
+          // sdy.mesh ops - just erase them
+          meshOpsToErase.push_back(op);
+        } else if (op->getNumResults() == 1 && op->getNumOperands() >= 1) {
+          // sdy.sharding_constraint ops - need to replace uses first
+          constraintOpsToErase.push_back(op);
         }
       }
     });
 
-    // Erase in reverse order to handle nested ops correctly
-    for (Operation *op : llvm::reverse(sdyOpsToErase)) {
+    // Erase constraint ops in reverse order, replacing uses
+    for (Operation *op : llvm::reverse(constraintOpsToErase)) {
       op->getResult(0).replaceAllUsesWith(op->getOperand(0));
+      op->erase();
+    }
+
+    // Erase mesh ops
+    for (Operation *op : meshOpsToErase) {
       op->erase();
     }
   }
