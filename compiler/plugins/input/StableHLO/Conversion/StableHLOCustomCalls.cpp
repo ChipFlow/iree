@@ -249,9 +249,7 @@ static Value findPivotRow(Value matrix, Value k, int64_t m,
                           ImplicitLocOpBuilder &b) {
   auto matrixTy = cast<ShapedType>(matrix.getType());
   Type elemTy = matrixTy.getElementType();
-  Type indexTy = b.getIndexType();
 
-  Value kIndex = k;
   Value mIndex = arith::ConstantIndexOp::create(b, m);
   Value one = arith::ConstantIndexOp::create(b, 1);
 
@@ -298,7 +296,6 @@ static Value findPivotRow(Value matrix, Value k, int64_t m,
 static Value swapRows(Value matrix, Value i, Value j, int64_t n,
                       ImplicitLocOpBuilder &b) {
   auto matrixTy = cast<ShapedType>(matrix.getType());
-  Type elemTy = matrixTy.getElementType();
 
   Value one = arith::ConstantIndexOp::create(b, 1);
   Value nIndex = arith::ConstantIndexOp::create(b, n);
@@ -307,33 +304,40 @@ static Value swapRows(Value matrix, Value i, Value j, int64_t n,
   // Check if i == j (no swap needed)
   Value needSwap = arith::CmpIOp::create(b, arith::CmpIPredicate::ne, i, j);
 
-  auto ifOp = scf::IfOp::create(
-      b, matrixTy, needSwap,
-      [&](OpBuilder &bb, Location loc) {
-        ImplicitLocOpBuilder lb(loc, bb);
-        // Loop over columns and swap elements
-        auto forOp = scf::ForOp::create(
-            lb, zero, nIndex, one, ValueRange{matrix},
-            [&](OpBuilder &bbb, Location loc2, Value col, ValueRange args) {
-              ImplicitLocOpBuilder llb(loc2, bbb);
-              Value mat = args[0];
+  // Create IfOp with result types and else region
+  auto ifOp = scf::IfOp::create(b, TypeRange{matrixTy}, needSwap,
+                                /*withElseRegion=*/true);
 
-              // Extract A[i, col] and A[j, col]
-              Value valI = tensor::ExtractOp::create(llb, mat, ValueRange{i, col});
-              Value valJ = tensor::ExtractOp::create(llb, mat, ValueRange{j, col});
+  // Build the then block
+  {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(&ifOp.getThenRegion().front());
+    // Loop over columns and swap elements
+    auto forOp = scf::ForOp::create(
+        b, zero, nIndex, one, ValueRange{matrix},
+        [&](OpBuilder &bbb, Location loc2, Value col, ValueRange args) {
+          ImplicitLocOpBuilder llb(loc2, bbb);
+          Value mat = args[0];
 
-              // Insert swapped values
-              Value mat1 = tensor::InsertOp::create(llb, valJ, mat, ValueRange{i, col});
-              Value mat2 = tensor::InsertOp::create(llb, valI, mat1, ValueRange{j, col});
+          // Extract A[i, col] and A[j, col]
+          Value valI = tensor::ExtractOp::create(llb, mat, ValueRange{i, col});
+          Value valJ = tensor::ExtractOp::create(llb, mat, ValueRange{j, col});
 
-              scf::YieldOp::create(llb, mat2);
-            });
-        scf::YieldOp::create(lb, forOp.getResult(0));
-      },
-      [&](OpBuilder &bb, Location loc) {
-        ImplicitLocOpBuilder lb(loc, bb);
-        scf::YieldOp::create(lb, matrix);
-      });
+          // Insert swapped values
+          Value mat1 = tensor::InsertOp::create(llb, valJ, mat, ValueRange{i, col});
+          Value mat2 = tensor::InsertOp::create(llb, valI, mat1, ValueRange{j, col});
+
+          scf::YieldOp::create(llb, mat2);
+        });
+    scf::YieldOp::create(b, forOp.getResult(0));
+  }
+
+  // Build the else block
+  {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(&ifOp.getElseRegion().front());
+    scf::YieldOp::create(b, matrix);
+  }
 
   return ifOp.getResult(0);
 }
@@ -343,8 +347,7 @@ static std::pair<Value, Value> luStep(Value matrix, Value pivots, Value k,
                                        int64_t m, int64_t n,
                                        ImplicitLocOpBuilder &b) {
   auto matrixTy = cast<ShapedType>(matrix.getType());
-  auto pivotsTy = cast<ShapedType>(pivots.getType());
-  Type elemTy = matrixTy.getElementType();
+  (void)matrixTy;  // Used for type checking assertions
 
   Value one = arith::ConstantIndexOp::create(b, 1);
   Value mIndex = arith::ConstantIndexOp::create(b, m);
@@ -433,7 +436,6 @@ struct LapackGetrfFfiRewriter final
 
     Value inputMatrix = op.getOperand(0);
     auto matrixTy = cast<RankedTensorType>(inputMatrix.getType());
-    auto luTy = cast<RankedTensorType>(op.getResult(0).getType());
     auto pivotsTy = cast<RankedTensorType>(op.getResult(1).getType());
     auto infoTy = cast<RankedTensorType>(op.getResult(2).getType());
 
