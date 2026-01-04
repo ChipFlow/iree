@@ -79,3 +79,51 @@ util.func private @set_affinity() attributes {
   %cst = arith.constant dense<[0, 1]> : tensor<2xi32>
   util.return
 }
+
+// -----
+
+// Tests that constants inside scf.while loop bodies are NOT hoisted.
+// These constants cannot be replaced with global.load because the loop body
+// region cannot access module-level globals.
+
+// CHECK-LABEL: @constantInsideWhileLoop
+// CHECK-NOT: util.global
+util.func @constantInsideWhileLoop(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+  %c0 = arith.constant 0 : index
+  %init = arith.constant dense<0.0> : tensor<2xf32>
+  // CHECK: scf.while
+  %result:2 = scf.while (%iter = %init, %acc = %arg0) : (tensor<2xf32>, tensor<2xf32>) -> (tensor<2xf32>, tensor<2xf32>) {
+    // CHECK: arith.constant dense<[1.000000e+00, 2.000000e+00]>
+    %threshold = arith.constant dense<[1.0, 2.0]> : tensor<2xf32>
+    %cmp = arith.cmpf olt, %iter, %threshold : tensor<2xf32>
+    %any_less = tensor.extract %cmp[%c0] : tensor<2xi1>
+    scf.condition(%any_less) %iter, %acc : tensor<2xf32>, tensor<2xf32>
+  } do {
+  ^bb0(%iter: tensor<2xf32>, %acc: tensor<2xf32>):
+    // CHECK: arith.constant dense<[0.100000{{.*}}, 0.200000{{.*}}]>
+    %step = arith.constant dense<[0.1, 0.2]> : tensor<2xf32>
+    %next = arith.addf %iter, %step : tensor<2xf32>
+    scf.yield %next, %acc : tensor<2xf32>, tensor<2xf32>
+  }
+  util.return %result#1 : tensor<2xf32>
+}
+
+// -----
+
+// Tests that constants inside scf.for loop bodies are NOT hoisted.
+
+// CHECK-LABEL: @constantInsideForLoop
+// CHECK-NOT: util.global
+util.func @constantInsideForLoop(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+  %c0 = arith.constant 0 : index
+  %c10 = arith.constant 10 : index
+  %c1 = arith.constant 1 : index
+  // CHECK: scf.for
+  %result = scf.for %i = %c0 to %c10 step %c1 iter_args(%acc = %arg0) -> tensor<2xf32> {
+    // CHECK: arith.constant dense<[0.100000{{.*}}, 0.200000{{.*}}]>
+    %step = arith.constant dense<[0.1, 0.2]> : tensor<2xf32>
+    %next = arith.addf %acc, %step : tensor<2xf32>
+    scf.yield %next : tensor<2xf32>
+  }
+  util.return %result : tensor<2xf32>
+}

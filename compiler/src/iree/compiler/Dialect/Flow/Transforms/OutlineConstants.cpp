@@ -13,6 +13,7 @@
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "iree/compiler/Utils/StringUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -25,6 +26,19 @@ namespace mlir::iree_compiler::IREE::Flow {
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h.inc"
 
 namespace {
+
+// Returns true if the operation is inside an SCF loop region (while, for,
+// forall). Constants inside loops cannot be hoisted to module-level globals
+// because the global references would be undefined inside loop body regions.
+static bool isInsideLoopRegion(Operation *op) {
+  Operation *parent = op->getParentOp();
+  while (parent) {
+    if (isa<scf::WhileOp, scf::ForOp, scf::ForallOp>(parent))
+      return true;
+    parent = parent->getParentOp();
+  }
+  return false;
+}
 
 // Returns true if |value| is worth outlining (large, etc).
 static bool isOutlinableValue(Attribute value) {
@@ -52,6 +66,12 @@ static SmallVector<ConstantDef> findConstantsInModule(mlir::ModuleOp moduleOp) {
     if (!region)
       continue;
     region->walk([&](Operation *op) {
+      // Skip constants inside loop regions - they cannot reference
+      // module-level globals because scf.while/for/forall body regions
+      // are isolated and cannot access values defined outside.
+      if (isInsideLoopRegion(op))
+        return;
+
       if (auto constantOp = dyn_cast<arith::ConstantOp>(op)) {
         if (isOutlinableValue(constantOp.getValue())) {
           results.push_back(ConstantDef{
