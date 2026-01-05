@@ -23,6 +23,7 @@
 #include "iree/compiler/Dialect/Flow/IR/FlowDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
+#include "iree/compiler/Dialect/SparseSolver/IR/SparseSolverDialect.h"
 #include "iree/compiler/Dialect/Stream/IR/StreamDialect.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
@@ -52,6 +53,7 @@ inline void registerIreeDialects(DialectRegistry &registry) {
                   IREE::LinalgExt::IREELinalgExtDialect,
                   IREE::PCF::PCFDialect,
                   IREE::Encoding::IREEEncodingDialect,
+                  IREE::SparseSolver::SparseSolverDialect,
                   IREE::Stream::StreamDialect,
                   IREE::TensorExt::IREETensorExtDialect,
                   IREE::Util::UtilDialect,

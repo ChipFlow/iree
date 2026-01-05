@@ -43,6 +43,7 @@ iree_cc_library(
     iree::compiler::Dialect::LinalgExt::IR
     iree::compiler::Dialect::LinalgExt::TransformExtensions::LinalgExtExtensions
     iree::compiler::Dialect::LinalgExt::Transforms
+    iree::compiler::Dialect::SparseSolver::IR
     iree::compiler::Dialect::Stream::IR
     iree::compiler::Dialect::Stream::Transforms
     iree::compiler::Dialect::TensorExt::IR
