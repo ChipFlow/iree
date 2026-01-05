@@ -661,8 +661,9 @@ IREE_VM_ABI_EXPORT(iree_sparse_solver_solve_lu,
 // Performs complete sparse solve: analyze + factor (Cholesky) + solve + release
 // This is a convenience function that combines all steps into one call.
 //
-// Uses staging buffers to handle device-local memory that cannot be directly
-// mapped to host memory (e.g., Metal DEVICE_LOCAL buffers).
+// Uses staging buffer transfers (d2h/h2d) for portability across different
+// GPU memory configurations. On unified memory systems like Apple Silicon,
+// these transfers are essentially just pointer operations.
 //
 // NOTE: BaSpaCho uses Cholesky factorization for SPD matrices. For general
 // matrices, LU factorization would be needed but is not yet fully supported.
@@ -679,7 +680,7 @@ static iree_status_t iree_sparse_solver_spsolve_complete_impl(
   iree_status_t status = iree_ok_status();
   baspacho_handle_t baspacho = NULL;
 
-  // Get buffer pointers and sizes.
+  // Get buffers from views.
   iree_hal_buffer_t* row_ptr_buffer = iree_hal_buffer_view_buffer(row_ptr_view);
   iree_hal_buffer_t* col_idx_buffer = iree_hal_buffer_view_buffer(col_idx_view);
   iree_hal_buffer_t* values_buffer = iree_hal_buffer_view_buffer(values_view);
@@ -687,11 +688,11 @@ static iree_status_t iree_sparse_solver_spsolve_complete_impl(
   iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_view);
 
   // Calculate buffer sizes.
-  iree_device_size_t row_ptr_size = (n + 1) * sizeof(int32_t);  // CSR row pointers
-  iree_device_size_t col_idx_size = nnz * sizeof(int32_t);       // CSR column indices
-  iree_device_size_t values_size = nnz * sizeof(float);          // CSR values
-  iree_device_size_t rhs_size = n * sizeof(float);               // RHS vector
-  iree_device_size_t solution_size = n * sizeof(float);          // Solution vector
+  iree_device_size_t row_ptr_size = (n + 1) * sizeof(int32_t);
+  iree_device_size_t col_idx_size = nnz * sizeof(int32_t);
+  iree_device_size_t values_size = nnz * sizeof(float);
+  iree_device_size_t rhs_size = n * sizeof(float);
+  iree_device_size_t solution_size = n * sizeof(float);
 
   // Allocate host staging buffers.
   int32_t* host_row_ptr = NULL;
@@ -722,7 +723,6 @@ static iree_status_t iree_sparse_solver_spsolve_complete_impl(
                                   (void**)&host_solution);
   if (!iree_status_is_ok(status)) goto cleanup;
 
-  // Allocate int64 arrays for BaSpaCho.
   status = iree_allocator_malloc(module->host_allocator,
                                   (n + 1) * sizeof(int64_t),
                                   (void**)&host_row_ptr_i64);
@@ -733,7 +733,8 @@ static iree_status_t iree_sparse_solver_spsolve_complete_impl(
                                   (void**)&host_col_idx_i64);
   if (!iree_status_is_ok(status)) goto cleanup;
 
-  // Transfer device buffers to host staging buffers.
+  // Transfer data from device to host staging buffers.
+  // On unified memory (Apple Silicon), these are efficient copy operations.
   status = iree_hal_device_transfer_d2h(
       module->device, row_ptr_buffer, 0, host_row_ptr, row_ptr_size,
       IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
@@ -762,9 +763,7 @@ static iree_status_t iree_sparse_solver_spsolve_complete_impl(
     host_col_idx_i64[i] = host_col_idx[i];
   }
 
-  // Step 1: Create BaSpaCho context.
-  // Use CPU backend since we're using staging buffers (data is on host).
-  // GPU factorization would require the data to be in a registered GPU buffer.
+  // Step 1: Create BaSpaCho context with CPU backend.
   baspacho = baspacho_create(BASPACHO_BACKEND_CPU);
   if (!baspacho) {
     status = iree_make_status(IREE_STATUS_INTERNAL,

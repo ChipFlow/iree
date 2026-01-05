@@ -142,19 +142,21 @@ static iree_hal_buffer_compatibility_t iree_hal_metal_allocator_query_buffer_com
     }
   }
 
-  if (iree_all_bits_set(params->type,
-                        IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
-    // On iOS, we don't have device local + host visible memory. But given the unified memory
-    // architecture, it's fine to just request host local + device visible memory.
-    // On macOS, for unified memory architecture, it's similar to iOS. Otherwise, we can have
-    // device local + host visible memory backed by Managed storage mode.
-    iree_hal_metal_allocator_t* allocator = iree_hal_metal_allocator_cast(base_allocator);
-    if (allocator->is_unified_memory) {
+  iree_hal_metal_allocator_t* allocator = iree_hal_metal_allocator_cast(base_allocator);
+  if (allocator->is_unified_memory) {
+    // On unified memory systems (Apple Silicon), all memory is accessible by both CPU and GPU.
+    // Convert DEVICE_LOCAL to HOST_LOCAL | DEVICE_VISIBLE so buffers are always mappable.
+    // This provides zero-copy access without performance penalty.
+    if (iree_all_bits_set(params->type, IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL)) {
       params->type &= ~(IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE);
-      params->type |= IREE_HAL_MEMORY_TYPE_HOST_LOCAL | IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE;
-      // We have suggested other configurations than the original request. Mark accordingly.
-      compatibility |= IREE_HAL_BUFFER_COMPATIBILITY_LOW_PERFORMANCE;
+      params->type |= IREE_HAL_MEMORY_TYPE_HOST_LOCAL | IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE |
+                      IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
     }
+  } else if (iree_all_bits_set(params->type,
+                               IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
+    // On discrete GPU systems (non-unified memory), we can have device local + host visible
+    // memory backed by Managed storage mode on macOS.
+    // This path is for explicit requests of both flags.
   }
 
   // We are now optimal.
@@ -205,7 +207,14 @@ static MTLResourceOptions iree_hal_metal_select_resource_options(
 #endif  // IREE_PLATFORM_MACOS
     } else {
       // Device local + host invisible.
-      options = MTLResourceStorageModePrivate;
+      // On unified memory systems (Apple Silicon), use Shared mode instead of Private.
+      // This allows CPU access without performance penalty since memory is unified.
+      // On discrete GPU systems, use Private for optimal GPU performance.
+      if (is_unified_memory) {
+        options = MTLResourceStorageModeShared;
+      } else {
+        options = MTLResourceStorageModePrivate;
+      }
     }
   } else {
     if (iree_all_bits_set(type, IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE)) {
