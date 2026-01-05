@@ -12,6 +12,7 @@
 
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
+#include "iree/hal/buffer_transfer.h"
 #include "iree/modules/hal/types.h"
 #include "iree/modules/sparse_solver/baspacho_wrapper.h"
 #include "iree/vm/api.h"
@@ -506,13 +507,547 @@ IREE_VM_ABI_EXPORT(iree_sparse_solver_get_num_supernodes,
 }
 
 //===----------------------------------------------------------------------===//
+// LU Factorization Exports
+//===----------------------------------------------------------------------===//
+
+// factor.lu: rrr -> i (handle, values, pivots_out -> result)
+IREE_VM_ABI_EXPORT(iree_sparse_solver_factor_lu,
+                   iree_sparse_solver_module_state_t, rrr, i) {
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    rets->i0 = -1;
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+
+  iree_hal_buffer_view_t* values_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r1, &values_view));
+  iree_hal_buffer_view_t* pivots_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r2, &pivots_view));
+
+  // Map values buffer (read-only)
+  iree_hal_buffer_t* values_buffer = iree_hal_buffer_view_buffer(values_view);
+  iree_hal_buffer_mapping_t values_mapping;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      values_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &values_mapping));
+
+  // Map pivots buffer (write)
+  iree_hal_buffer_t* pivots_buffer = iree_hal_buffer_view_buffer(pivots_view);
+  iree_hal_buffer_mapping_t pivots_mapping;
+  iree_status_t status = iree_hal_buffer_map_range(
+      pivots_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_WRITE, 0, IREE_HAL_WHOLE_BUFFER, &pivots_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&values_mapping);
+    rets->i0 = -1;
+    return status;
+  }
+
+  int result = baspacho_factor_lu_f32(handle->baspacho_handle,
+                                       (const float*)values_mapping.contents.data,
+                                       (int64_t*)pivots_mapping.contents.data);
+
+  iree_hal_buffer_unmap_range(&pivots_mapping);
+  iree_hal_buffer_unmap_range(&values_mapping);
+  rets->i0 = result;
+  return iree_ok_status();
+}
+
+// factor.lu.f64: rrr -> i
+IREE_VM_ABI_EXPORT(iree_sparse_solver_factor_lu_f64,
+                   iree_sparse_solver_module_state_t, rrr, i) {
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    rets->i0 = -1;
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+
+  iree_hal_buffer_view_t* values_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r1, &values_view));
+  iree_hal_buffer_view_t* pivots_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r2, &pivots_view));
+
+  iree_hal_buffer_t* values_buffer = iree_hal_buffer_view_buffer(values_view);
+  iree_hal_buffer_mapping_t values_mapping;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      values_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &values_mapping));
+
+  iree_hal_buffer_t* pivots_buffer = iree_hal_buffer_view_buffer(pivots_view);
+  iree_hal_buffer_mapping_t pivots_mapping;
+  iree_status_t status = iree_hal_buffer_map_range(
+      pivots_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_WRITE, 0, IREE_HAL_WHOLE_BUFFER, &pivots_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&values_mapping);
+    rets->i0 = -1;
+    return status;
+  }
+
+  int result = baspacho_factor_lu_f64(handle->baspacho_handle,
+                                       (const double*)values_mapping.contents.data,
+                                       (int64_t*)pivots_mapping.contents.data);
+
+  iree_hal_buffer_unmap_range(&pivots_mapping);
+  iree_hal_buffer_unmap_range(&values_mapping);
+  rets->i0 = result;
+  return iree_ok_status();
+}
+
+// solve.lu: rrrr -> v (handle, pivots, rhs, solution -> void)
+IREE_VM_ABI_EXPORT(iree_sparse_solver_solve_lu,
+                   iree_sparse_solver_module_state_t, rrrr, v) {
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+
+  iree_hal_buffer_view_t* pivots_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r1, &pivots_view));
+  iree_hal_buffer_view_t* rhs_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r2, &rhs_view));
+  iree_hal_buffer_view_t* solution_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r3, &solution_view));
+
+  // Map pivots buffer (read-only)
+  iree_hal_buffer_t* pivots_buffer = iree_hal_buffer_view_buffer(pivots_view);
+  iree_hal_buffer_mapping_t pivots_mapping;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      pivots_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &pivots_mapping));
+
+  // Map RHS buffer (read-only)
+  iree_hal_buffer_t* rhs_buffer = iree_hal_buffer_view_buffer(rhs_view);
+  iree_hal_buffer_mapping_t rhs_mapping;
+  iree_status_t status = iree_hal_buffer_map_range(
+      rhs_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &rhs_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&pivots_mapping);
+    return status;
+  }
+
+  // Map solution buffer (write)
+  iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_view);
+  iree_hal_buffer_mapping_t solution_mapping;
+  status = iree_hal_buffer_map_range(
+      solution_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_WRITE, 0, IREE_HAL_WHOLE_BUFFER, &solution_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&rhs_mapping);
+    iree_hal_buffer_unmap_range(&pivots_mapping);
+    return status;
+  }
+
+  baspacho_solve_lu_f32(handle->baspacho_handle,
+                         (const int64_t*)pivots_mapping.contents.data,
+                         (const float*)rhs_mapping.contents.data,
+                         (float*)solution_mapping.contents.data);
+
+  iree_hal_buffer_unmap_range(&solution_mapping);
+  iree_hal_buffer_unmap_range(&rhs_mapping);
+  iree_hal_buffer_unmap_range(&pivots_mapping);
+  return iree_ok_status();
+}
+
+//===----------------------------------------------------------------------===//
+// Single-Shot Sparse Solve (spsolve_complete)
+//===----------------------------------------------------------------------===//
+
+// spsolve_complete: IIrrrrr -> v
+// Performs complete sparse solve: analyze + factor (Cholesky) + solve + release
+// This is a convenience function that combines all steps into one call.
+//
+// Uses staging buffers to handle device-local memory that cannot be directly
+// mapped to host memory (e.g., Metal DEVICE_LOCAL buffers).
+//
+// NOTE: BaSpaCho uses Cholesky factorization for SPD matrices. For general
+// matrices, LU factorization would be needed but is not yet fully supported.
+static iree_status_t iree_sparse_solver_spsolve_complete_impl(
+    iree_vm_stack_t* IREE_RESTRICT stack,
+    iree_sparse_solver_module_t* module,
+    iree_sparse_solver_module_state_t* state,
+    int64_t n, int64_t nnz,
+    iree_hal_buffer_view_t* row_ptr_view,
+    iree_hal_buffer_view_t* col_idx_view,
+    iree_hal_buffer_view_t* values_view,
+    iree_hal_buffer_view_t* rhs_view,
+    iree_hal_buffer_view_t* solution_view) {
+  iree_status_t status = iree_ok_status();
+  baspacho_handle_t baspacho = NULL;
+
+  // Get buffer pointers and sizes.
+  iree_hal_buffer_t* row_ptr_buffer = iree_hal_buffer_view_buffer(row_ptr_view);
+  iree_hal_buffer_t* col_idx_buffer = iree_hal_buffer_view_buffer(col_idx_view);
+  iree_hal_buffer_t* values_buffer = iree_hal_buffer_view_buffer(values_view);
+  iree_hal_buffer_t* rhs_buffer = iree_hal_buffer_view_buffer(rhs_view);
+  iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_view);
+
+  // Calculate buffer sizes.
+  iree_device_size_t row_ptr_size = (n + 1) * sizeof(int32_t);  // CSR row pointers
+  iree_device_size_t col_idx_size = nnz * sizeof(int32_t);       // CSR column indices
+  iree_device_size_t values_size = nnz * sizeof(float);          // CSR values
+  iree_device_size_t rhs_size = n * sizeof(float);               // RHS vector
+  iree_device_size_t solution_size = n * sizeof(float);          // Solution vector
+
+  // Allocate host staging buffers.
+  int32_t* host_row_ptr = NULL;
+  int32_t* host_col_idx = NULL;
+  float* host_values = NULL;
+  float* host_rhs = NULL;
+  float* host_solution = NULL;
+  int64_t* host_row_ptr_i64 = NULL;  // BaSpaCho expects int64_t
+  int64_t* host_col_idx_i64 = NULL;
+
+  status = iree_allocator_malloc(module->host_allocator, row_ptr_size,
+                                  (void**)&host_row_ptr);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_allocator_malloc(module->host_allocator, col_idx_size,
+                                  (void**)&host_col_idx);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_allocator_malloc(module->host_allocator, values_size,
+                                  (void**)&host_values);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_allocator_malloc(module->host_allocator, rhs_size,
+                                  (void**)&host_rhs);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_allocator_malloc(module->host_allocator, solution_size,
+                                  (void**)&host_solution);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  // Allocate int64 arrays for BaSpaCho.
+  status = iree_allocator_malloc(module->host_allocator,
+                                  (n + 1) * sizeof(int64_t),
+                                  (void**)&host_row_ptr_i64);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_allocator_malloc(module->host_allocator,
+                                  nnz * sizeof(int64_t),
+                                  (void**)&host_col_idx_i64);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  // Transfer device buffers to host staging buffers.
+  status = iree_hal_device_transfer_d2h(
+      module->device, row_ptr_buffer, 0, host_row_ptr, row_ptr_size,
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_hal_device_transfer_d2h(
+      module->device, col_idx_buffer, 0, host_col_idx, col_idx_size,
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_hal_device_transfer_d2h(
+      module->device, values_buffer, 0, host_values, values_size,
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_hal_device_transfer_d2h(
+      module->device, rhs_buffer, 0, host_rhs, rhs_size,
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  // Convert int32 indices to int64 for BaSpaCho.
+  for (int64_t i = 0; i <= n; ++i) {
+    host_row_ptr_i64[i] = host_row_ptr[i];
+  }
+  for (int64_t i = 0; i < nnz; ++i) {
+    host_col_idx_i64[i] = host_col_idx[i];
+  }
+
+  // Step 1: Create BaSpaCho context.
+  // Use CPU backend since we're using staging buffers (data is on host).
+  // GPU factorization would require the data to be in a registered GPU buffer.
+  baspacho = baspacho_create(BASPACHO_BACKEND_CPU);
+  if (!baspacho) {
+    status = iree_make_status(IREE_STATUS_INTERNAL,
+                              "failed to create BaSpaCho context");
+    goto cleanup;
+  }
+
+  // Step 2: Symbolic analysis.
+  int result = baspacho_analyze(baspacho, n, nnz,
+                                 host_row_ptr_i64, host_col_idx_i64);
+  if (result != 0) {
+    status = iree_make_status(IREE_STATUS_INTERNAL,
+                              "BaSpaCho symbolic analysis failed: %d", result);
+    goto cleanup;
+  }
+
+  // Step 3: Cholesky factorization (for SPD matrices).
+  result = baspacho_factor_f32(baspacho, host_values);
+  if (result != 0) {
+    status = iree_make_status(IREE_STATUS_INTERNAL,
+                              "BaSpaCho Cholesky factorization failed: %d", result);
+    goto cleanup;
+  }
+
+  // Step 4: Solve using Cholesky factors.
+  baspacho_solve_f32(baspacho, host_rhs, host_solution);
+
+  // Transfer solution back to device.
+  status = iree_hal_device_transfer_h2d(
+      module->device, host_solution, solution_buffer, 0, solution_size,
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+
+cleanup:
+  if (baspacho) baspacho_destroy(baspacho);
+  if (host_row_ptr) iree_allocator_free(module->host_allocator, host_row_ptr);
+  if (host_col_idx) iree_allocator_free(module->host_allocator, host_col_idx);
+  if (host_values) iree_allocator_free(module->host_allocator, host_values);
+  if (host_rhs) iree_allocator_free(module->host_allocator, host_rhs);
+  if (host_solution) iree_allocator_free(module->host_allocator, host_solution);
+  if (host_row_ptr_i64) iree_allocator_free(module->host_allocator, host_row_ptr_i64);
+  if (host_col_idx_i64) iree_allocator_free(module->host_allocator, host_col_idx_i64);
+  return status;
+}
+
+IREE_VM_ABI_EXPORT(iree_sparse_solver_spsolve_complete,
+                   iree_sparse_solver_module_state_t, IIrrrrr, v) {
+  iree_sparse_solver_module_t* sparse_module = state->module;
+
+  int64_t n = args->i0;
+  int64_t nnz = args->i1;
+  iree_hal_buffer_view_t* row_ptr_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r2, &row_ptr_view));
+  iree_hal_buffer_view_t* col_idx_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r3, &col_idx_view));
+  iree_hal_buffer_view_t* values_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r4, &values_view));
+  iree_hal_buffer_view_t* rhs_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r5, &rhs_view));
+  iree_hal_buffer_view_t* solution_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r6, &solution_view));
+
+  return iree_sparse_solver_spsolve_complete_impl(
+      stack, sparse_module, state, n, nnz, row_ptr_view, col_idx_view,
+      values_view, rhs_view, solution_view);
+}
+
+// spsolve_complete.f64: IIrrrrr -> v
+static iree_status_t iree_sparse_solver_spsolve_complete_f64_impl(
+    iree_vm_stack_t* IREE_RESTRICT stack,
+    iree_sparse_solver_module_t* module,
+    iree_sparse_solver_module_state_t* state,
+    int64_t n, int64_t nnz,
+    iree_hal_buffer_view_t* row_ptr_view,
+    iree_hal_buffer_view_t* col_idx_view,
+    iree_hal_buffer_view_t* values_view,
+    iree_hal_buffer_view_t* rhs_view,
+    iree_hal_buffer_view_t* solution_view) {
+  baspacho_handle_t baspacho = baspacho_create(module->backend);
+  if (!baspacho) {
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                            "failed to create BaSpaCho context");
+  }
+
+  iree_hal_buffer_t* row_ptr_buffer = iree_hal_buffer_view_buffer(row_ptr_view);
+  iree_hal_buffer_mapping_t row_ptr_mapping;
+  iree_status_t status = iree_hal_buffer_map_range(
+      row_ptr_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &row_ptr_mapping);
+  if (!iree_status_is_ok(status)) {
+    baspacho_destroy(baspacho);
+    return status;
+  }
+
+  iree_hal_buffer_t* col_idx_buffer = iree_hal_buffer_view_buffer(col_idx_view);
+  iree_hal_buffer_mapping_t col_idx_mapping;
+  status = iree_hal_buffer_map_range(
+      col_idx_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &col_idx_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&row_ptr_mapping);
+    baspacho_destroy(baspacho);
+    return status;
+  }
+
+  iree_hal_buffer_t* values_buffer = iree_hal_buffer_view_buffer(values_view);
+  iree_hal_buffer_mapping_t values_mapping;
+  status = iree_hal_buffer_map_range(
+      values_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &values_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&col_idx_mapping);
+    iree_hal_buffer_unmap_range(&row_ptr_mapping);
+    baspacho_destroy(baspacho);
+    return status;
+  }
+
+  iree_hal_buffer_t* rhs_buffer = iree_hal_buffer_view_buffer(rhs_view);
+  iree_hal_buffer_mapping_t rhs_mapping;
+  status = iree_hal_buffer_map_range(
+      rhs_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &rhs_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&values_mapping);
+    iree_hal_buffer_unmap_range(&col_idx_mapping);
+    iree_hal_buffer_unmap_range(&row_ptr_mapping);
+    baspacho_destroy(baspacho);
+    return status;
+  }
+
+  iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_view);
+  iree_hal_buffer_mapping_t solution_mapping;
+  status = iree_hal_buffer_map_range(
+      solution_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_WRITE, 0, IREE_HAL_WHOLE_BUFFER, &solution_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&rhs_mapping);
+    iree_hal_buffer_unmap_range(&values_mapping);
+    iree_hal_buffer_unmap_range(&col_idx_mapping);
+    iree_hal_buffer_unmap_range(&row_ptr_mapping);
+    baspacho_destroy(baspacho);
+    return status;
+  }
+
+  int result = baspacho_analyze(baspacho, n, nnz,
+                                 (const int64_t*)row_ptr_mapping.contents.data,
+                                 (const int64_t*)col_idx_mapping.contents.data);
+  if (result != 0) {
+    status = iree_make_status(IREE_STATUS_INTERNAL,
+                              "BaSpaCho symbolic analysis failed: %d", result);
+    goto cleanup;
+  }
+
+  int64_t* pivots = NULL;
+  status = iree_allocator_malloc(module->host_allocator,
+                                  n * sizeof(int64_t), (void**)&pivots);
+  if (!iree_status_is_ok(status)) {
+    goto cleanup;
+  }
+
+  result = baspacho_factor_lu_f64(baspacho,
+                                   (const double*)values_mapping.contents.data,
+                                   pivots);
+  if (result != 0) {
+    iree_allocator_free(module->host_allocator, pivots);
+    status = iree_make_status(IREE_STATUS_INTERNAL,
+                              "BaSpaCho LU factorization failed: %d", result);
+    goto cleanup;
+  }
+
+  baspacho_solve_lu_f64(baspacho, pivots,
+                         (const double*)rhs_mapping.contents.data,
+                         (double*)solution_mapping.contents.data);
+
+  iree_allocator_free(module->host_allocator, pivots);
+  status = iree_ok_status();
+
+cleanup:
+  iree_hal_buffer_unmap_range(&solution_mapping);
+  iree_hal_buffer_unmap_range(&rhs_mapping);
+  iree_hal_buffer_unmap_range(&values_mapping);
+  iree_hal_buffer_unmap_range(&col_idx_mapping);
+  iree_hal_buffer_unmap_range(&row_ptr_mapping);
+  baspacho_destroy(baspacho);
+  return status;
+}
+
+IREE_VM_ABI_EXPORT(iree_sparse_solver_spsolve_complete_f64,
+                   iree_sparse_solver_module_state_t, IIrrrrr, v) {
+  iree_sparse_solver_module_t* sparse_module = state->module;
+
+  int64_t n = args->i0;
+  int64_t nnz = args->i1;
+  iree_hal_buffer_view_t* row_ptr_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r2, &row_ptr_view));
+  iree_hal_buffer_view_t* col_idx_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r3, &col_idx_view));
+  iree_hal_buffer_view_t* values_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r4, &values_view));
+  iree_hal_buffer_view_t* rhs_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r5, &rhs_view));
+  iree_hal_buffer_view_t* solution_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r6, &solution_view));
+
+  return iree_sparse_solver_spsolve_complete_f64_impl(
+      stack, sparse_module, state, n, nnz, row_ptr_view, col_idx_view,
+      values_view, rhs_view, solution_view);
+}
+
+// solve.lu.f64: rrrr -> v
+IREE_VM_ABI_EXPORT(iree_sparse_solver_solve_lu_f64,
+                   iree_sparse_solver_module_state_t, rrrr, v) {
+  iree_vm_ref_t handle_ref = args->r0;
+  iree_sparse_solver_handle_t* handle = iree_sparse_solver_get_handle(&handle_ref);
+  if (!handle || !handle->baspacho_handle) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid handle");
+  }
+
+  iree_hal_buffer_view_t* pivots_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r1, &pivots_view));
+  iree_hal_buffer_view_t* rhs_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r2, &rhs_view));
+  iree_hal_buffer_view_t* solution_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_check_deref(args->r3, &solution_view));
+
+  iree_hal_buffer_t* pivots_buffer = iree_hal_buffer_view_buffer(pivots_view);
+  iree_hal_buffer_mapping_t pivots_mapping;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      pivots_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &pivots_mapping));
+
+  iree_hal_buffer_t* rhs_buffer = iree_hal_buffer_view_buffer(rhs_view);
+  iree_hal_buffer_mapping_t rhs_mapping;
+  iree_status_t status = iree_hal_buffer_map_range(
+      rhs_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, 0, IREE_HAL_WHOLE_BUFFER, &rhs_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&pivots_mapping);
+    return status;
+  }
+
+  iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_view);
+  iree_hal_buffer_mapping_t solution_mapping;
+  status = iree_hal_buffer_map_range(
+      solution_buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_WRITE, 0, IREE_HAL_WHOLE_BUFFER, &solution_mapping);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_unmap_range(&rhs_mapping);
+    iree_hal_buffer_unmap_range(&pivots_mapping);
+    return status;
+  }
+
+  baspacho_solve_lu_f64(handle->baspacho_handle,
+                         (const int64_t*)pivots_mapping.contents.data,
+                         (const double*)rhs_mapping.contents.data,
+                         (double*)solution_mapping.contents.data);
+
+  iree_hal_buffer_unmap_range(&solution_mapping);
+  iree_hal_buffer_unmap_range(&rhs_mapping);
+  iree_hal_buffer_unmap_range(&pivots_mapping);
+  return iree_ok_status();
+}
+
+//===----------------------------------------------------------------------===//
 // VM Module Interface
 //===----------------------------------------------------------------------===//
 
 // Define shims for NEW calling conventions only.
 // Standard shims (r_v, r_I, rr_i, rrr_v) are already defined in shims.c.
-IREE_VM_ABI_DEFINE_SHIM(rrrI, v);   // solve.batched, solve.batched.f64
-IREE_VM_ABI_DEFINE_SHIM(rIIrr, r);  // analyze
+IREE_VM_ABI_DEFINE_SHIM(rrrI, v);    // solve.batched, solve.batched.f64
+IREE_VM_ABI_DEFINE_SHIM(rIIrr, r);   // analyze
+IREE_VM_ABI_DEFINE_SHIM(rrr, i);     // factor.lu, factor.lu.f64
+IREE_VM_ABI_DEFINE_SHIM(rrrr, v);    // solve.lu, solve.lu.f64
+IREE_VM_ABI_DEFINE_SHIM(IIrrrrr, v); // spsolve_complete, spsolve_complete.f64
 
 // Module function table.
 static const iree_vm_native_function_ptr_t iree_sparse_solver_module_funcs_[] =
@@ -577,6 +1112,42 @@ static const iree_vm_native_function_ptr_t iree_sparse_solver_module_funcs_[] =
             .target = (iree_vm_native_function_target_t)
                 iree_sparse_solver_get_num_supernodes,
         },
+        // factor.lu
+        {
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrr_i,
+            .target =
+                (iree_vm_native_function_target_t)iree_sparse_solver_factor_lu,
+        },
+        // factor.lu.f64
+        {
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrr_i,
+            .target =
+                (iree_vm_native_function_target_t)iree_sparse_solver_factor_lu_f64,
+        },
+        // solve.lu
+        {
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrrr_v,
+            .target =
+                (iree_vm_native_function_target_t)iree_sparse_solver_solve_lu,
+        },
+        // solve.lu.f64
+        {
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrrr_v,
+            .target =
+                (iree_vm_native_function_target_t)iree_sparse_solver_solve_lu_f64,
+        },
+        // spsolve_complete
+        {
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_IIrrrrr_v,
+            .target = (iree_vm_native_function_target_t)
+                iree_sparse_solver_spsolve_complete,
+        },
+        // spsolve_complete.f64
+        {
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_IIrrrrr_v,
+            .target = (iree_vm_native_function_target_t)
+                iree_sparse_solver_spsolve_complete_f64,
+        },
 };
 
 // Module exports.
@@ -639,6 +1210,42 @@ static const iree_vm_native_export_descriptor_t
         {
             .local_name = iree_string_view_literal("get_num_supernodes"),
             .calling_convention = iree_string_view_literal("0r_I"),
+            .attr_count = 0,
+            .attrs = NULL,
+        },
+        {
+            .local_name = iree_string_view_literal("factor.lu"),
+            .calling_convention = iree_string_view_literal("0rrr_i"),
+            .attr_count = 0,
+            .attrs = NULL,
+        },
+        {
+            .local_name = iree_string_view_literal("factor.lu.f64"),
+            .calling_convention = iree_string_view_literal("0rrr_i"),
+            .attr_count = 0,
+            .attrs = NULL,
+        },
+        {
+            .local_name = iree_string_view_literal("solve.lu"),
+            .calling_convention = iree_string_view_literal("0rrrr_v"),
+            .attr_count = 0,
+            .attrs = NULL,
+        },
+        {
+            .local_name = iree_string_view_literal("solve.lu.f64"),
+            .calling_convention = iree_string_view_literal("0rrrr_v"),
+            .attr_count = 0,
+            .attrs = NULL,
+        },
+        {
+            .local_name = iree_string_view_literal("spsolve_complete"),
+            .calling_convention = iree_string_view_literal("0IIrrrrr_v"),
+            .attr_count = 0,
+            .attrs = NULL,
+        },
+        {
+            .local_name = iree_string_view_literal("spsolve_complete.f64"),
+            .calling_convention = iree_string_view_literal("0IIrrrrr_v"),
             .attr_count = 0,
             .attrs = NULL,
         },

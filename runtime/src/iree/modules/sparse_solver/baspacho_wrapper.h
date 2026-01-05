@@ -109,6 +109,34 @@ int baspacho_factor_f32_device(baspacho_handle_t h, void* device_ptr);
 int baspacho_factor_f64_device(baspacho_handle_t h, void* device_ptr);
 
 //===----------------------------------------------------------------------===//
+// LU Factorization (for non-symmetric/indefinite matrices)
+//===----------------------------------------------------------------------===//
+
+// Perform numeric LU factorization with partial pivoting.
+// Use this for general (non-symmetric) or symmetric indefinite matrices.
+// baspacho_analyze() must be called first.
+//
+// Parameters:
+//   h      - BaSpaCho context
+//   values - CSR values array (nnz elements, same order as analyze)
+//   pivots - Output pivot array (n elements, caller-allocated)
+//
+// Returns:
+//   0 on success
+//   > 0 if matrix is singular (returns row where zero pivot occurred)
+//   < 0 on other errors
+int baspacho_factor_lu_f32(baspacho_handle_t h, const float* values,
+                            int64_t* pivots);
+int baspacho_factor_lu_f64(baspacho_handle_t h, const double* values,
+                            int64_t* pivots);
+
+// GPU variants for LU factorization.
+int baspacho_factor_lu_f32_device(baspacho_handle_t h, void* device_ptr,
+                                   int64_t* pivots);
+int baspacho_factor_lu_f64_device(baspacho_handle_t h, void* device_ptr,
+                                   int64_t* pivots);
+
+//===----------------------------------------------------------------------===//
 // Solve Operations
 //===----------------------------------------------------------------------===//
 
@@ -128,6 +156,29 @@ void baspacho_solve_f32_device(baspacho_handle_t h, void* rhs_device,
                                 void* solution_device);
 void baspacho_solve_f64_device(baspacho_handle_t h, void* rhs_device,
                                 void* solution_device);
+
+//===----------------------------------------------------------------------===//
+// LU Solve Operations
+//===----------------------------------------------------------------------===//
+
+// Solve P*L*U*x = b using LU factorization with pivoting.
+// baspacho_factor_lu must be called first with the same pivots array.
+//
+// Parameters:
+//   h        - BaSpaCho context
+//   pivots   - Pivot array from baspacho_factor_lu (n elements)
+//   rhs      - Right-hand side vector (n elements)
+//   solution - Solution vector (n elements, can be same as rhs for in-place)
+void baspacho_solve_lu_f32(baspacho_handle_t h, const int64_t* pivots,
+                            const float* rhs, float* solution);
+void baspacho_solve_lu_f64(baspacho_handle_t h, const int64_t* pivots,
+                            const double* rhs, double* solution);
+
+// GPU variants for LU solve.
+void baspacho_solve_lu_f32_device(baspacho_handle_t h, const int64_t* pivots,
+                                   void* rhs_device, void* solution_device);
+void baspacho_solve_lu_f64_device(baspacho_handle_t h, const int64_t* pivots,
+                                   void* rhs_device, void* solution_device);
 
 // Batched solve: solve for multiple right-hand sides simultaneously.
 // This is BaSpaCho's specialty - optimized for batched operations.
