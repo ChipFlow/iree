@@ -220,6 +220,23 @@ void baspacho_solve_f32_async(baspacho_handle_t h, void* rhs_device,
 void baspacho_solve_f64_async(baspacho_handle_t h, void* rhs_device,
                                void* solution_device);
 
+//===----------------------------------------------------------------------===//
+// Buffer Registration (for zero-copy GPU integration)
+//===----------------------------------------------------------------------===//
+
+// Register a Metal buffer with BaSpaCho's buffer registry.
+// This enables zero-copy operations when using baspacho_*_device() functions.
+//
+// Parameters:
+//   host_ptr   - CPU-accessible pointer to buffer contents (from [MTLBuffer contents])
+//   mtl_buffer - The MTLBuffer handle (as void*)
+//   size       - Size of the buffer in bytes
+void baspacho_register_metal_buffer(void* host_ptr, void* mtl_buffer,
+                                     size_t size);
+
+// Unregister a previously registered Metal buffer.
+void baspacho_unregister_metal_buffer(void* host_ptr);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

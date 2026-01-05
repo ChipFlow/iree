@@ -50,8 +50,16 @@ struct baspacho_context_s {
   std::vector<int64_t> block_sizes;
 
   // Factor data storage (for numeric factorization)
+  // For CPU backend, use std::vector
   std::vector<float> factor_data_f32;
   std::vector<double> factor_data_f64;
+
+#ifdef BASPACHO_USE_METAL
+  // For Metal backend, use MetalMirror which auto-registers with registry
+  std::unique_ptr<BaSpaCho::MetalMirror<float>> metal_factor_data_f32;
+  // Temporary buffer for permuted RHS/solution during solve
+  std::unique_ptr<BaSpaCho::MetalMirror<float>> metal_permuted_f32;
+#endif
 
   // GPU device handle (if applicable)
   void* device_handle;
@@ -74,7 +82,12 @@ static BaSpaCho::BackendType convert_backend(baspacho_backend_t backend) {
       return BaSpaCho::BackendOpenCL;
     case BASPACHO_BACKEND_AUTO:
     default:
+#if defined(__APPLE__) && defined(__aarch64__) && defined(BASPACHO_USE_METAL)
+      // Use Metal backend on Apple Silicon for GPU-accelerated factorization.
+      return BaSpaCho::BackendMetal;
+#else
       return BaSpaCho::detectBestBackend();
+#endif
   }
 }
 
@@ -153,7 +166,9 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
     settings.backend = h->backend;
     settings.numThreads = 8;  // Reasonable default
     settings.addFillPolicy = BaSpaCho::AddFillComplete;
-    settings.findSparseEliminationRanges = true;
+    // Disable sparse elimination for now - there's a bug with large matrices
+    // that causes incorrect results when sparse elimination is enabled.
+    settings.findSparseEliminationRanges = false;
 
     // Create solver (performs symbolic analysis)
     h->solver = BaSpaCho::createSolver(settings, h->block_sizes, ss);
@@ -171,7 +186,23 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
 
     // Allocate factor storage
     int64_t data_size = h->solver->dataSize();
+
+#ifdef BASPACHO_USE_METAL
+    if (h->backend == BaSpaCho::BackendMetal) {
+      // For Metal backend, use MetalMirror which auto-registers with registry.
+      // This is required because BaSpaCho's Metal backend looks up buffers
+      // in MetalBufferRegistry when performing GPU operations.
+      h->metal_factor_data_f32 = std::make_unique<BaSpaCho::MetalMirror<float>>();
+      h->metal_factor_data_f32->resizeToAtLeast(data_size);
+      // Also allocate permuted buffer for solve operations
+      h->metal_permuted_f32 = std::make_unique<BaSpaCho::MetalMirror<float>>();
+      h->metal_permuted_f32->resizeToAtLeast(n);
+    } else {
+      h->factor_data_f32.resize(data_size);
+    }
+#else
     h->factor_data_f32.resize(data_size);
+#endif
     h->factor_data_f64.resize(data_size);
 
     return 0;  // Success
@@ -199,18 +230,41 @@ int baspacho_factor_f32(baspacho_handle_t h, const float* values) {
   if (!h || !h->solver || !values) return -1;
 
   try {
-    float* data = h->factor_data_f32.data();
+    float* data = nullptr;
+    size_t data_size = 0;
+
+#ifdef BASPACHO_USE_METAL
+    if (h->backend == BaSpaCho::BackendMetal && h->metal_factor_data_f32) {
+      // Use MetalMirror buffer for GPU factorization.
+      // MetalMirror auto-registers with MetalBufferRegistry.
+      data = h->metal_factor_data_f32->ptr();
+      data_size = h->metal_factor_data_f32->allocSize();
+    } else {
+      data = h->factor_data_f32.data();
+      data_size = h->factor_data_f32.size();
+    }
+#else
+    data = h->factor_data_f32.data();
+    data_size = h->factor_data_f32.size();
+#endif
 
     // Zero out factor storage
-    std::memset(data, 0, h->factor_data_f32.size() * sizeof(float));
+    std::memset(data, 0, data_size * sizeof(float));
 
     // Load CSR values into BaSpaCho's internal format using original CSR structure
     // This handles the permutation and format conversion automatically
     h->solver->loadFromCsr(h->csr_row_ptr.data(), h->csr_col_idx.data(),
                            h->block_sizes.data(), values, data);
 
-    // Perform numeric factorization
+    // Perform numeric factorization (GPU or CPU depending on backend)
     h->solver->factor(data);
+
+#ifdef BASPACHO_USE_METAL
+    // Metal operations are batched - synchronize to ensure GPU work is complete
+    if (h->backend == BaSpaCho::BackendMetal) {
+      BaSpaCho::MetalContext::instance().synchronize();
+    }
+#endif
 
     return 0;  // Success
   } catch (const std::exception& e) {
@@ -336,22 +390,83 @@ void baspacho_solve_f32(baspacho_handle_t h, const float* rhs, float* solution) 
   if (!h || !h->solver || !rhs || !solution) return;
 
   try {
-    // Copy RHS to solution (solve is in-place)
-    std::memcpy(solution, rhs, h->n * sizeof(float));
+    float* factor_data = nullptr;
+    float* permuted = nullptr;
 
-    // Apply permutation to solution vector
-    std::vector<float> permuted(h->n);
+    // Debug: force CPU solve to check if Metal solve is the issue
+    static bool force_cpu = (getenv("BASPACHO_FORCE_CPU_SOLVE") != nullptr);
+
+#ifdef BASPACHO_USE_METAL
+    if (force_cpu && h->backend == BaSpaCho::BackendMetal &&
+        h->metal_factor_data_f32) {
+      // Copy Metal factor data to CPU for CPU solve test
+      // This is slow but useful for debugging
+      size_t data_size = h->metal_factor_data_f32->allocSize();
+      h->factor_data_f32.resize(data_size);
+      BaSpaCho::MetalContext::instance().synchronize();
+      std::memcpy(h->factor_data_f32.data(), h->metal_factor_data_f32->ptr(),
+                  data_size * sizeof(float));
+      fprintf(stderr, "Copied Metal factor data to CPU (%zu elements)\n", data_size);
+    }
+
+    if (!force_cpu && h->backend == BaSpaCho::BackendMetal &&
+        h->metal_factor_data_f32 && h->metal_permuted_f32) {
+      // Use Metal buffers - both are registered with MetalBufferRegistry
+      factor_data = h->metal_factor_data_f32->ptr();
+      permuted = h->metal_permuted_f32->ptr();
+
+      // Apply permutation to RHS: permuted[p[i]] = rhs[i] (scatter)
+      // BaSpaCho's solve does NOT apply permutation internally for Cholesky
+      for (int64_t i = 0; i < h->n; ++i) {
+        permuted[h->permutation[i]] = rhs[i];
+      }
+
+      // Solve in-place using GPU (Metal backend finds buffers in registry)
+      h->solver->solve(factor_data, permuted, h->n, 1);
+
+      // Metal operations are batched - synchronize to ensure GPU work is complete
+      BaSpaCho::MetalContext::instance().synchronize();
+
+      // Apply inverse permutation to solution: solution[i] = permuted[p[i]] (gather)
+      for (int64_t i = 0; i < h->n; ++i) {
+        solution[i] = permuted[h->permutation[i]];
+      }
+    } else {
+      // CPU backend path
+      factor_data = h->factor_data_f32.data();
+      std::vector<float> permuted_vec(h->n);
+
+      // Apply permutation to RHS: permuted[p[i]] = rhs[i] (scatter)
+      for (int64_t i = 0; i < h->n; ++i) {
+        permuted_vec[h->permutation[i]] = rhs[i];
+      }
+
+      // Solve in-place
+      h->solver->solve(factor_data, permuted_vec.data(), h->n, 1);
+
+      // Apply inverse permutation to solution: solution[i] = permuted[p[i]] (gather)
+      for (int64_t i = 0; i < h->n; ++i) {
+        solution[i] = permuted_vec[h->permutation[i]];
+      }
+    }
+#else
+    // CPU-only build
+    factor_data = h->factor_data_f32.data();
+    std::vector<float> permuted_vec(h->n);
+
+    // Apply permutation to RHS: permuted[p[i]] = rhs[i] (scatter)
     for (int64_t i = 0; i < h->n; ++i) {
-      permuted[h->permutation[i]] = solution[i];
+      permuted_vec[h->permutation[i]] = rhs[i];
     }
 
     // Solve in-place
-    h->solver->solve(h->factor_data_f32.data(), permuted.data(), h->n, 1);
+    h->solver->solve(factor_data, permuted_vec.data(), h->n, 1);
 
-    // Apply inverse permutation
+    // Apply inverse permutation to solution: solution[i] = permuted[p[i]] (gather)
     for (int64_t i = 0; i < h->n; ++i) {
-      solution[i] = permuted[h->permutation[i]];
+      solution[i] = permuted_vec[h->permutation[i]];
     }
+#endif
   } catch (const std::exception&) {
     // Silently fail - could log error
   }
@@ -361,15 +476,17 @@ void baspacho_solve_f64(baspacho_handle_t h, const double* rhs, double* solution
   if (!h || !h->solver || !rhs || !solution) return;
 
   try {
-    std::memcpy(solution, rhs, h->n * sizeof(double));
-
     std::vector<double> permuted(h->n);
+
+    // Apply permutation to RHS: permuted[p[i]] = rhs[i] (scatter)
     for (int64_t i = 0; i < h->n; ++i) {
-      permuted[h->permutation[i]] = solution[i];
+      permuted[h->permutation[i]] = rhs[i];
     }
 
+    // Solve in-place
     h->solver->solve(h->factor_data_f64.data(), permuted.data(), h->n, 1);
 
+    // Apply inverse permutation to solution: solution[i] = permuted[p[i]] (gather)
     for (int64_t i = 0; i < h->n; ++i) {
       solution[i] = permuted[h->permutation[i]];
     }
@@ -392,11 +509,9 @@ void baspacho_solve_f32_device(baspacho_handle_t h, void* rhs_device,
     if (rhs != sol) {
 #ifdef BASPACHO_USE_METAL
       if (h->backend == BaSpaCho::BackendMetal) {
-        // Metal: Use buffer registry to find MTLBuffers
-        auto& registry = BaSpaCho::MetalBufferRegistry::instance();
-        auto [rhsBuf, rhsOff] = registry.findBuffer(rhs);
-        auto [solBuf, solOff] = registry.findBuffer(sol);
-        // Would need Metal blit encoder to copy - for now use CPU path
+        // Metal: Use buffer registry to find MTLBuffers.
+        // On unified memory systems, the CPU pointers work directly.
+        // This is a placeholder for future Metal blit encoder support.
       }
 #endif
 #ifdef BASPACHO_USE_OPENCL
@@ -551,29 +666,67 @@ void baspacho_solve_batched_f32(baspacho_handle_t h, const float* rhs,
   if (!h || !h->solver || !rhs || !solution || num_rhs <= 0) return;
 
   try {
-    // Copy and permute all RHS vectors
     int64_t n = h->n;
-    std::vector<float> permuted(n * num_rhs);
+    float* factor_data = nullptr;
 
-    // Apply permutation to each RHS vector
-    for (int64_t k = 0; k < num_rhs; ++k) {
-      for (int64_t i = 0; i < n; ++i) {
-        permuted[h->permutation[i] + k * n] = rhs[i + k * n];
+#ifdef BASPACHO_USE_METAL
+    if (h->backend == BaSpaCho::BackendMetal && h->metal_factor_data_f32) {
+      // Use Metal buffer for GPU solve
+      factor_data = h->metal_factor_data_f32->ptr();
+
+      // Resize permuted buffer if needed for batched solve
+      size_t needed_size = n * num_rhs;
+      if (!h->metal_permuted_f32 || h->metal_permuted_f32->allocSize() < needed_size) {
+        h->metal_permuted_f32.reset(new BaSpaCho::MetalMirror<float>());
+        h->metal_permuted_f32->resizeToAtLeast(needed_size);
+      }
+      float* permuted = h->metal_permuted_f32->ptr();
+
+      // Apply permutation to each RHS vector: permuted[p[i]] = rhs[i] (scatter)
+      for (int64_t k = 0; k < num_rhs; ++k) {
+        for (int64_t i = 0; i < n; ++i) {
+          permuted[h->permutation[i] + k * n] = rhs[i + k * n];
+        }
+      }
+
+      // Batched solve in-place using GPU
+      h->solver->solve(factor_data, permuted, n, static_cast<int>(num_rhs));
+
+      // Metal operations are batched - synchronize to ensure GPU work is complete
+      BaSpaCho::MetalContext::instance().synchronize();
+
+      // Apply inverse permutation to all solution vectors: solution[i] = permuted[p[i]] (gather)
+      for (int64_t k = 0; k < num_rhs; ++k) {
+        for (int64_t i = 0; i < n; ++i) {
+          solution[i + k * n] = permuted[h->permutation[i] + k * n];
+        }
+      }
+    } else
+#endif
+    {
+      // CPU backend path
+      factor_data = h->factor_data_f32.data();
+      std::vector<float> permuted(n * num_rhs);
+
+      // Apply permutation to each RHS vector: permuted[p[i]] = rhs[i] (scatter)
+      for (int64_t k = 0; k < num_rhs; ++k) {
+        for (int64_t i = 0; i < n; ++i) {
+          permuted[h->permutation[i] + k * n] = rhs[i + k * n];
+        }
+      }
+
+      // Batched solve in-place
+      h->solver->solve(factor_data, permuted.data(), n, static_cast<int>(num_rhs));
+
+      // Apply inverse permutation to all solution vectors: solution[i] = permuted[p[i]] (gather)
+      for (int64_t k = 0; k < num_rhs; ++k) {
+        for (int64_t i = 0; i < n; ++i) {
+          solution[i + k * n] = permuted[h->permutation[i] + k * n];
+        }
       }
     }
-
-    // Batched solve in-place
-    h->solver->solve(h->factor_data_f32.data(), permuted.data(), n,
-                     static_cast<int>(num_rhs));
-
-    // Apply inverse permutation to all solution vectors
-    for (int64_t k = 0; k < num_rhs; ++k) {
-      for (int64_t i = 0; i < n; ++i) {
-        solution[i + k * n] = permuted[h->permutation[i] + k * n];
-      }
-    }
-  } catch (const std::exception&) {
-    // Silently fail
+  } catch (const std::exception& e) {
+    fprintf(stderr, "baspacho_solve_batched_f32 exception: %s\n", e.what());
   }
 }
 
@@ -585,15 +738,18 @@ void baspacho_solve_batched_f64(baspacho_handle_t h, const double* rhs,
     int64_t n = h->n;
     std::vector<double> permuted(n * num_rhs);
 
+    // Apply permutation to each RHS vector: permuted[p[i]] = rhs[i] (scatter)
     for (int64_t k = 0; k < num_rhs; ++k) {
       for (int64_t i = 0; i < n; ++i) {
         permuted[h->permutation[i] + k * n] = rhs[i + k * n];
       }
     }
 
+    // Batched solve in-place
     h->solver->solve(h->factor_data_f64.data(), permuted.data(), n,
                      static_cast<int>(num_rhs));
 
+    // Apply inverse permutation to all solution vectors: solution[i] = permuted[p[i]] (gather)
     for (int64_t k = 0; k < num_rhs; ++k) {
       for (int64_t i = 0; i < n; ++i) {
         solution[i + k * n] = permuted[h->permutation[i] + k * n];
@@ -644,4 +800,43 @@ void baspacho_solve_f32_async(baspacho_handle_t h, void* rhs_device,
 void baspacho_solve_f64_async(baspacho_handle_t h, void* rhs_device,
                                void* solution_device) {
   baspacho_solve_f64_device(h, rhs_device, solution_device);
+}
+
+//===----------------------------------------------------------------------===//
+// Buffer Registration
+//===----------------------------------------------------------------------===//
+
+void baspacho_register_metal_buffer(void* host_ptr, void* mtl_buffer,
+                                     size_t size) {
+#ifdef BASPACHO_USE_METAL
+  if (!host_ptr || !mtl_buffer || size == 0) return;
+
+  try {
+    auto& registry = BaSpaCho::MetalBufferRegistry::instance();
+    // mtl_buffer is passed as void* from C; cast to appropriate type
+    // BaSpaCho's registerBuffer expects the buffer handle
+    registry.registerBuffer(host_ptr, mtl_buffer, size);
+  } catch (const std::exception&) {
+    // Silently fail - buffer won't be found for zero-copy operations
+  }
+#else
+  (void)host_ptr;
+  (void)mtl_buffer;
+  (void)size;
+#endif
+}
+
+void baspacho_unregister_metal_buffer(void* host_ptr) {
+#ifdef BASPACHO_USE_METAL
+  if (!host_ptr) return;
+
+  try {
+    auto& registry = BaSpaCho::MetalBufferRegistry::instance();
+    registry.unregisterBuffer(host_ptr);
+  } catch (const std::exception&) {
+    // Silently fail
+  }
+#else
+  (void)host_ptr;
+#endif
 }

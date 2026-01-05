@@ -18,6 +18,11 @@
 #include "iree/vm/api.h"
 #include "iree/vm/native_module.h"
 
+// Metal-specific helpers for direct GPU buffer access (when available).
+#if defined(IREE_HAL_HAVE_METAL_DRIVER)
+#include "iree/modules/sparse_solver/module_metal.h"
+#endif
+
 //===----------------------------------------------------------------------===//
 // Module Version
 //===----------------------------------------------------------------------===//
@@ -657,6 +662,108 @@ IREE_VM_ABI_EXPORT(iree_sparse_solver_solve_lu,
 // Single-Shot Sparse Solve (spsolve_complete)
 //===----------------------------------------------------------------------===//
 
+#if defined(IREE_HAL_HAVE_METAL_DRIVER)
+// Metal-optimized implementation that uses direct buffer access on unified
+// memory systems (Apple Silicon). This avoids staging buffer copies.
+static iree_status_t iree_sparse_solver_spsolve_complete_metal_impl(
+    iree_vm_stack_t* IREE_RESTRICT stack,
+    iree_sparse_solver_module_t* module,
+    iree_sparse_solver_module_state_t* state,
+    int64_t n, int64_t nnz,
+    iree_hal_buffer_view_t* row_ptr_view,
+    iree_hal_buffer_view_t* col_idx_view,
+    iree_hal_buffer_view_t* values_view,
+    iree_hal_buffer_view_t* rhs_view,
+    iree_hal_buffer_view_t* solution_view) {
+  iree_status_t status = iree_ok_status();
+  baspacho_handle_t baspacho = NULL;
+
+  // Get Metal device handle.
+  void* mtl_device = iree_sparse_solver_metal_get_device(module->device);
+  if (!mtl_device) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "failed to get Metal device handle");
+  }
+
+  // Get buffers from views.
+  iree_hal_buffer_t* row_ptr_buffer = iree_hal_buffer_view_buffer(row_ptr_view);
+  iree_hal_buffer_t* col_idx_buffer = iree_hal_buffer_view_buffer(col_idx_view);
+  iree_hal_buffer_t* values_buffer = iree_hal_buffer_view_buffer(values_view);
+  iree_hal_buffer_t* rhs_buffer = iree_hal_buffer_view_buffer(rhs_view);
+  iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_view);
+
+  // Get direct buffer contents (works on unified memory).
+  int32_t* row_ptr_data = (int32_t*)iree_sparse_solver_metal_buffer_contents(row_ptr_buffer);
+  int32_t* col_idx_data = (int32_t*)iree_sparse_solver_metal_buffer_contents(col_idx_buffer);
+  float* values_data = (float*)iree_sparse_solver_metal_buffer_contents(values_buffer);
+  float* rhs_data = (float*)iree_sparse_solver_metal_buffer_contents(rhs_buffer);
+  float* solution_data = (float*)iree_sparse_solver_metal_buffer_contents(solution_buffer);
+
+  if (!row_ptr_data || !col_idx_data || !values_data || !rhs_data || !solution_data) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "failed to get Metal buffer contents");
+  }
+
+  // Convert int32 indices to int64 for BaSpaCho (temporary allocation).
+  int64_t* row_ptr_i64 = NULL;
+  int64_t* col_idx_i64 = NULL;
+
+  status = iree_allocator_malloc(module->host_allocator,
+                                  (n + 1) * sizeof(int64_t),
+                                  (void**)&row_ptr_i64);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_allocator_malloc(module->host_allocator,
+                                  nnz * sizeof(int64_t),
+                                  (void**)&col_idx_i64);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  for (int64_t i = 0; i <= n; ++i) {
+    row_ptr_i64[i] = row_ptr_data[i];
+  }
+  for (int64_t i = 0; i < nnz; ++i) {
+    col_idx_i64[i] = col_idx_data[i];
+  }
+
+  // Create BaSpaCho with AUTO backend - defaults to Metal on Apple Silicon.
+  // On unified memory systems, the CPU can access Metal buffer contents directly
+  // via [MTLBuffer contents], avoiding staging buffer copies.
+  (void)mtl_device;  // Device is used internally by BaSpaCho Metal backend.
+
+  baspacho = baspacho_create(BASPACHO_BACKEND_AUTO);
+  if (!baspacho) {
+    status = iree_make_status(IREE_STATUS_INTERNAL,
+                              "failed to create BaSpaCho context");
+    goto cleanup;
+  }
+
+  // Symbolic analysis (uses converted indices).
+  int result = baspacho_analyze(baspacho, n, nnz, row_ptr_i64, col_idx_i64);
+  if (result != 0) {
+    status = iree_make_status(IREE_STATUS_INTERNAL,
+                              "BaSpaCho symbolic analysis failed: %d", result);
+    goto cleanup;
+  }
+
+  // Cholesky factorization - GPU accelerated on Apple Silicon via Metal.
+  result = baspacho_factor_f32(baspacho, values_data);
+  if (result != 0) {
+    status = iree_make_status(IREE_STATUS_INTERNAL,
+                              "BaSpaCho Cholesky factorization failed: %d", result);
+    goto cleanup;
+  }
+
+  // Triangular solve - GPU accelerated on Apple Silicon via Metal.
+  baspacho_solve_f32(baspacho, rhs_data, solution_data);
+
+cleanup:
+  if (baspacho) baspacho_destroy(baspacho);
+  if (row_ptr_i64) iree_allocator_free(module->host_allocator, row_ptr_i64);
+  if (col_idx_i64) iree_allocator_free(module->host_allocator, col_idx_i64);
+  return status;
+}
+#endif  // IREE_HAL_HAVE_METAL_DRIVER
+
 // spsolve_complete: IIrrrrr -> v
 // Performs complete sparse solve: analyze + factor (Cholesky) + solve + release
 // This is a convenience function that combines all steps into one call.
@@ -830,6 +937,17 @@ IREE_VM_ABI_EXPORT(iree_sparse_solver_spsolve_complete,
   IREE_RETURN_IF_ERROR(
       iree_hal_buffer_view_check_deref(args->r6, &solution_view));
 
+#if defined(IREE_HAL_HAVE_METAL_DRIVER)
+  // Use Metal-optimized path with direct buffer access on unified memory.
+  if (sparse_module->backend == BASPACHO_BACKEND_METAL &&
+      iree_sparse_solver_metal_is_unified_memory(sparse_module->device)) {
+    return iree_sparse_solver_spsolve_complete_metal_impl(
+        stack, sparse_module, state, n, nnz, row_ptr_view, col_idx_view,
+        values_view, rhs_view, solution_view);
+  }
+#endif
+
+  // Fallback: staging buffer path for non-Metal or discrete GPU systems.
   return iree_sparse_solver_spsolve_complete_impl(
       stack, sparse_module, state, n, nnz, row_ptr_view, col_idx_view,
       values_view, rhs_view, solution_view);
