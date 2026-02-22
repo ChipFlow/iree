@@ -161,6 +161,18 @@
          <lastmod>2026-02-22</lastmod>
     </url>
     <url>
+         <loc>https://iree.dev/developers/design-docs/async-scheduling/</loc>
+         <lastmod>2026-02-22</lastmod>
+    </url>
+    <url>
+         <loc>https://iree.dev/developers/design-docs/async-scheduling/comparisons/</loc>
+         <lastmod>2026-02-22</lastmod>
+    </url>
+    <url>
+         <loc>https://iree.dev/developers/design-docs/async-scheduling/scenarios/</loc>
+         <lastmod>2026-02-22</lastmod>
+    </url>
+    <url>
          <loc>https://iree.dev/developers/general/contributing/</loc>
          <lastmod>2026-02-22</lastmod>
     </url>
