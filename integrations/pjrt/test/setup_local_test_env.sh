@@ -1,109 +1,101 @@
 #!/bin/bash
-# Setup local test environment for IREE Metal PJRT plugin
+# Setup local test environment for IREE Metal PJRT plugin using uv.
 #
-# This script creates a clean venv and builds the PJRT plugin with matching
-# compiler/runtime versions to avoid ABI mismatches.
+# The pyproject.toml in this directory declares the plugin as an editable
+# source install, which transitively pulls JAX and iree-base-compiler from
+# local checkouts. This script validates prerequisites, installs the compiler
+# Python packages, and runs `uv sync`.
+#
+# Prerequisites:
+#   - uv (https://docs.astral.sh/uv/)
+#   - IREE compiler build at compiler/build/b (cmake --build)
+#   - JAX source checkout at ../jax (sibling to the IREE repo root)
 #
 # Usage:
-#   ./setup_local_test_env.sh [--clean]
+#   bash setup_local_test_env.sh [--clean]
 #
 # Options:
-#   --clean    Remove existing build and venv directories before setup
+#   --clean    Remove .venv and uv.lock before setup
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PJRT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PLUGIN_DIR="${PJRT_DIR}/python_packages/iree_metal_plugin"
-BUILD_DIR="${PLUGIN_DIR}/build"
-VENV_DIR="${BUILD_DIR}/.venv"
+IREE_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+IREE_COMPILER_BUILD="${IREE_ROOT}/compiler/build/b"
+PJRT_PLUGIN="${SCRIPT_DIR}/../python_packages/iree_metal_plugin"
+JAX_ROOT="${IREE_ROOT}/../jax"
 
 echo "=== IREE Metal PJRT Local Test Environment Setup ==="
-echo "PJRT_DIR: ${PJRT_DIR}"
-echo "PLUGIN_DIR: ${PLUGIN_DIR}"
-echo "VENV_DIR: ${VENV_DIR}"
+echo "IREE_ROOT:            ${IREE_ROOT}"
+echo "IREE_COMPILER_BUILD:  ${IREE_COMPILER_BUILD}"
+echo "PJRT_PLUGIN:          ${PJRT_PLUGIN}"
+echo "JAX_ROOT:             ${JAX_ROOT}"
 
-# Handle --clean flag
-if [[ "$1" == "--clean" ]]; then
+# ── Validate prerequisites ───────────────────────────────────────────────────
+
+if ! command -v uv &>/dev/null; then
+    echo "ERROR: uv is not installed. Install it from https://docs.astral.sh/uv/"
+    exit 1
+fi
+
+if [[ ! -d "${IREE_COMPILER_BUILD}" ]]; then
+    echo "ERROR: IREE compiler build not found at ${IREE_COMPILER_BUILD}"
+    echo "Build it first:  cmake -G Ninja -B compiler/build/b -S . && cmake --build compiler/build/b"
+    exit 1
+fi
+
+if [[ ! -d "${JAX_ROOT}" ]]; then
+    echo "ERROR: JAX source checkout not found at ${JAX_ROOT}"
+    echo "Clone it:  git clone https://github.com/jax-ml/jax.git ${JAX_ROOT}"
+    exit 1
+fi
+
+if [[ ! -d "${PJRT_PLUGIN}" ]]; then
+    echo "ERROR: Metal PJRT plugin not found at ${PJRT_PLUGIN}"
+    exit 1
+fi
+
+# ── Handle --clean flag ──────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "--clean" ]]; then
     echo ""
-    echo "=== Cleaning existing build ==="
-    rm -rf "${BUILD_DIR}"
-    echo "Removed ${BUILD_DIR}"
+    echo "=== Cleaning existing environment ==="
+    rm -rf "${SCRIPT_DIR}/.venv" "${SCRIPT_DIR}/uv.lock"
+    echo "Removed .venv and uv.lock"
 fi
 
-# Create venv if it doesn't exist
-# Use Python 3.12 as iree-base-compiler doesn't have 3.14 wheels yet
-if [[ ! -d "${VENV_DIR}" ]]; then
-    echo ""
-    echo "=== Creating virtual environment (Python 3.12) ==="
-    uv venv --python 3.12 "${VENV_DIR}"
-fi
+# ── Install compiler Python packages ─────────────────────────────────────────
 
-# Activate venv
-source "${VENV_DIR}/bin/activate"
-echo "Activated venv: ${VIRTUAL_ENV}"
-echo "Python version: $(python --version)"
-
-# Upgrade pip and install build requirements
 echo ""
-echo "=== Installing build requirements ==="
-uv pip install --upgrade pip wheel setuptools
-uv pip install ninja cmake
+echo "=== Installing compiler Python packages ==="
+cmake --install "${IREE_COMPILER_BUILD}" --prefix "${IREE_ROOT}/compiler/build/i" --component IREECompilerPythonPackages
+echo "Installed to ${IREE_ROOT}/compiler/build/i"
 
-# Install runtime build requirements (for nanobind, etc.)
-RUNTIME_REQS="${PJRT_DIR}/../../runtime/bindings/python/iree/runtime/build_requirements.txt"
-if [[ -f "${RUNTIME_REQS}" ]]; then
-    uv pip install -r "${RUNTIME_REQS}"
-fi
+# ── Sync the environment ─────────────────────────────────────────────────────
 
-# Install JAX and test dependencies
 echo ""
-echo "=== Installing JAX and test dependencies ==="
-uv pip install numpy jax jaxlib pytest absl-py hypothesis
+echo "=== Running uv sync (first run builds the plugin — may take 15-30 min) ==="
+cd "${SCRIPT_DIR}"
+uv sync
 
-# Install iree-base-compiler from pip (provides libIREECompiler.dylib)
-# This is faster than building from source and works for testing
-echo ""
-echo "=== Installing IREE compiler ==="
-uv pip install iree-base-compiler
+# ── Verify installation ──────────────────────────────────────────────────────
 
-# Build and install the Metal PJRT plugin
-# We use the pip-installed iree-base-compiler for the compiler library
-# and only build the PJRT runtime from source
-echo ""
-echo "=== Building and installing Metal PJRT plugin ==="
-echo "Building PJRT plugin with compiler from source..."
-echo "First build takes 15-30 minutes. Subsequent builds with ccache are faster."
-
-# Set build environment variables
-export CMAKE_OSX_ARCHITECTURES=arm64
-export CMAKE_SYSTEM_PROCESSOR=arm64
-# Note: We build the compiler from source (IREE_BUILD_COMPILER=ON by default)
-# The pip iree-base-compiler provides libIREECompiler.dylib for JAX JIT at runtime
-# Suppress warnings from protobuf's abseil on ARM64
-export CFLAGS="-Wno-unused-command-line-argument"
-export CXXFLAGS="-Wno-unused-command-line-argument"
-export CMAKE_C_FLAGS="-Wno-unused-command-line-argument"
-export CMAKE_CXX_FLAGS="-Wno-unused-command-line-argument"
-
-# Use ccache if available
-if command -v ccache &> /dev/null; then
-    export CMAKE_C_COMPILER_LAUNCHER=ccache
-    export CMAKE_CXX_COMPILER_LAUNCHER=ccache
-    echo "Using ccache for faster rebuilds"
-fi
-
-# Install the plugin (this triggers the build)
-uv pip install -v --no-deps --no-build-isolation "${PLUGIN_DIR}"
-
-# Verify installation
 echo ""
 echo "=== Verifying installation ==="
-python -c "
+
+uv run python -c "
+import sys
+print(f'Python: {sys.version}')
+
 import jax
 print(f'JAX version: {jax.__version__}')
 
-# Check Metal plugin
+try:
+    import iree.compiler
+    print(f'iree-base-compiler: {iree.compiler.__path__}')
+except Exception as e:
+    print(f'iree-base-compiler: import error: {e}')
+
 try:
     import iree._pjrt_libs.metal as m
     import os
@@ -111,43 +103,23 @@ try:
 except ImportError as e:
     print(f'Metal plugin import error: {e}')
 
-# Check compiler library
+# Check Metal devices are visible
 try:
-    from iree.compiler.api import ctypes_dl
-    lib_path = ctypes_dl._probe_iree_compiler_dylib()
-    print(f'Compiler library: {lib_path}')
+    jax.config.update('jax_platforms', 'iree_metal')
+    devices = jax.devices()
+    print(f'Metal devices: {devices}')
 except Exception as e:
-    print(f'Compiler probe error: {e}')
+    print(f'Metal device probe: {e}')
 "
-
-# Clone JAX for tests if not present
-JAX_TEST_DIR="/tmp/jax_metal_test"
-if [[ ! -d "${JAX_TEST_DIR}" ]]; then
-    echo ""
-    echo "=== Cloning JAX for tests ==="
-    git clone --depth=1 https://github.com/jax-ml/jax.git "${JAX_TEST_DIR}"
-fi
-
-# Apply patches
-echo ""
-echo "=== Applying IREE Metal patches ==="
-cd "${JAX_TEST_DIR}"
-git checkout -- . 2>/dev/null || true  # Reset any previous patches
-for patch in "${PJRT_DIR}/test/patches/"*.patch; do
-    if [[ -f "$patch" ]]; then
-        echo "Applying: $(basename $patch)"
-        patch -p1 < "$patch" || echo "Patch may have already been applied"
-    fi
-done
 
 echo ""
 echo "=== Setup Complete ==="
 echo ""
-echo "To activate the environment:"
-echo "  source ${VENV_DIR}/bin/activate"
-echo ""
 echo "To run tests:"
-echo "  JAX_PLATFORMS=iree_metal JAX_ENABLE_X64=0 pytest ${JAX_TEST_DIR}/tests/api_test.py::JitTest -v --tb=short"
+echo "  cd ${SCRIPT_DIR}"
+echo "  uv run python -c \"import jax; jax.config.update('jax_platforms', 'iree_metal'); print(jax.devices())\""
+echo "  uv run pytest test_metal.py -v"
 echo ""
 echo "To run a quick smoke test:"
-echo "  JAX_PLATFORMS=iree_metal python ${PJRT_DIR}/test/test_add.py"
+echo "  cd ${SCRIPT_DIR}"
+echo "  uv run python test_add.py"

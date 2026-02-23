@@ -1,0 +1,23 @@
+[project]
+name = "iree-metal-test-env"
+version = "0.0.0"
+description = "Local test environment for IREE Metal PJRT plugin"
+requires-python = ">=3.11"
+dependencies = [
+    "iree-pjrt-plugin-metal",
+    "numpy",
+    "scipy",
+    "pytest",
+    "hypothesis",
+    "absl-py",
+]
+
+[tool.uv.sources]
+# Editable install — transitively pulls JAX and iree-base-compiler
+# via the plugin's own [tool.uv.sources]
+iree-pjrt-plugin-metal = { path = "../python_packages/iree_metal_plugin", editable = true }
+
+[tool.uv.extra-build-variables.iree-pjrt-plugin-metal]
+# Enable ccache for native builds of the PJRT plugin
+CMAKE_C_COMPILER_LAUNCHER = "ccache"
+CMAKE_CXX_COMPILER_LAUNCHER = "ccache"
