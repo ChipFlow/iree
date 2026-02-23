@@ -92,7 +92,7 @@ jobs:
       - name: Build and sync test environment
         run: |
           cd integrations/pjrt/test
-          uv sync
+          uv sync -vvv
 
       - name: Verify installation
         run: |
