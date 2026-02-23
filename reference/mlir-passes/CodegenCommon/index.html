@@ -4067,6 +4067,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#-iree-codegen-insert-batch-dim-for-batchless-conv" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -iree-codegen-insert-batch-dim-for-batchless-conv
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#-iree-codegen-instrument-memory-accesses" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -8207,6 +8218,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#-iree-codegen-insert-batch-dim-for-batchless-conv" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -iree-codegen-insert-batch-dim-for-batchless-conv
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#-iree-codegen-instrument-memory-accesses" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -9355,6 +9377,15 @@ scf.for loops.</p>
 <p><em>Hoist unrolled vector (extract, insert) pairs out of scf.for op</em></p>
 <h3 id="-iree-codegen-inject-assume-alignment"><code>-iree-codegen-inject-assume-alignment</code><a class="headerlink" href="#-iree-codegen-inject-assume-alignment" title="Permanent link">link</a></h3>
 <p><em>Insert memref.assume_alignment ops right after hal.interface.binding.subspan ops, if alignment is present in bindings.</em></p>
+<h3 id="-iree-codegen-insert-batch-dim-for-batchless-conv"><code>-iree-codegen-insert-batch-dim-for-batchless-conv</code><a class="headerlink" href="#-iree-codegen-insert-batch-dim-for-batchless-conv" title="Permanent link">link</a></h3>
+<p><em>Inserts batch dimension for batch-less convolutions.</em></p>
+<p>Detects convolution operations that have been generalized and had their
+batch dimension (N=1) stripped by upstream IREE transformations. It
+restores the batch dimension by inserting tensor.expand_shape and
+tensor.collapse_shape operations, enabling downstream convolution-specific
+patterns (like DownscaleConv and vectorization) to match and apply.</p>
+<p>The reshape operations are propagated to the boundary and folded into
+dispatch tensor load/store operations, resulting in zero runtime cost.</p>
 <h3 id="-iree-codegen-instrument-memory-accesses"><code>-iree-codegen-instrument-memory-accesses</code><a class="headerlink" href="#-iree-codegen-instrument-memory-accesses" title="Permanent link">link</a></h3>
 <p><em>Instruments memory reads and writes for address tracking when dispatch instrumentation is enabled.</em></p>
 <h3 id="-iree-codegen-iree-bufferize-constants"><code>-iree-codegen-iree-bufferize-constants</code><a class="headerlink" href="#-iree-codegen-iree-bufferize-constants" title="Permanent link">link</a></h3>
