@@ -40,3 +40,7 @@
 [submodule "third_party/shardy"]
 	path = third_party/shardy
 	url = https://github.com/openxla/shardy.git
+[submodule "integrations/pjrt/vendor/baspacho"]
+	path = integrations/pjrt/vendor/baspacho
+	url = https://github.com/robtaylor/baspacho.git
+	branch = metal-backend
