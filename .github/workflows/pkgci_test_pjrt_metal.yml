@@ -16,22 +16,12 @@ on:
       write-caches:
         required: false
         type: string
-        default: "1"  # Enable cache saving by default for manual runs
+        default: "1"
 
 jobs:
   build_and_test:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14
-            name: macOS 14 (ARM64)
-          - runner: macos-15
-            name: macOS 15 (ARM64)
-    name: Metal PJRT - ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    env:
-      VENV_DIR: ${{ github.workspace }}/.venv
+    name: Metal PJRT (macos-latest-xlarge)
+    runs-on: macos-latest-xlarge
     defaults:
       run:
         shell: bash
@@ -44,6 +34,9 @@ jobs:
       - name: Updating git submodules
         run: git submodule update --init --jobs 8 --depth 1
 
+      - name: Clone JAX source
+        run: git clone --depth=1 --branch add-iree-metal-donation-support https://github.com/robtaylor/jax.git ../jax
+
       # Select latest Xcode for Metal toolchain
       - name: Update Xcode command line tools path
         run: |
@@ -51,14 +44,11 @@ jobs:
           xcrun metal --version
           xcrun metallib --version
 
-      - name: Setting up Python
-        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
-        with:
-          python-version: "3.11"
-          cache: "pip"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
 
-      - name: Installing requirements
-        run: brew install ninja ccache coreutils bash
+      - name: Installing build requirements
+        run: brew install ninja ccache coreutils
 
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -71,107 +61,78 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
+            compiler/build/b
             integrations/pjrt/python_packages/iree_metal_plugin/build
-          # v11: use pip iree-base-compiler instead of building from source
-          key: cmake-pjrt-metal-v11-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
+          key: cmake-pjrt-metal-v12-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
           restore-keys: |
-            cmake-pjrt-metal-v11-${{ runner.os }}-${{ runner.arch }}-
+            cmake-pjrt-metal-v12-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Clean stale CMake cache if needed
-        run: |
-          CACHE_FILE="integrations/pjrt/python_packages/iree_metal_plugin/build/cmake/CMakeCache.txt"
-          if [ -f "$CACHE_FILE" ]; then
-            # Check if cache has wrong architecture setting
-            if grep -q "CMAKE_OSX_ARCHITECTURES:STRING=$" "$CACHE_FILE" 2>/dev/null; then
-              echo "Removing stale CMake cache with wrong architecture"
-              rm -rf integrations/pjrt/python_packages/iree_metal_plugin/build/cmake/CMakeCache.txt
-              rm -rf integrations/pjrt/python_packages/iree_metal_plugin/build/cmake/CMakeFiles
-            fi
-          fi
-
-      - name: Setup venv and install dependencies
-        run: |
-          python -m venv ${VENV_DIR}
-          source ${VENV_DIR}/bin/activate
-          pip install -r runtime/bindings/python/iree/runtime/build_requirements.txt
-          # Install iree-base-compiler from pip for the libIREECompiler.dylib
-          # Building it from source requires Shardy tablegen which isn't built by PJRT
-          pip install iree-base-compiler
-          pip install numpy jax jaxlib
-
-      - name: Build and install Metal PJRT plugin
+      - name: Build IREE compiler
         env:
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
-          # Set architecture to arm64 to prevent x86 SSE flags being applied by abseil
-          CMAKE_OSX_ARCHITECTURES: arm64
-          CMAKE_SYSTEM_PROCESSOR: arm64
-          # Workaround for protobuf-bundled abseil adding x86 SIMD flags on ARM64
-          # The flags are unused but cause errors on macOS 15's stricter Clang
-          # Set via both CFLAGS/CXXFLAGS and CMAKE_*_FLAGS for maximum coverage
-          CFLAGS: "-Wno-unused-command-line-argument"
-          CXXFLAGS: "-Wno-unused-command-line-argument"
-          CMAKE_C_FLAGS: "-Wno-unused-command-line-argument"
-          CMAKE_CXX_FLAGS: "-Wno-unused-command-line-argument"
         run: |
-          source ${VENV_DIR}/bin/activate
-          echo "CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
-          echo "CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}"
-          echo "CMAKE_C_FLAGS=${CMAKE_C_FLAGS}"
-          echo "CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}"
-          # Build and install the PJRT plugin with Metal support
-          # This builds the compiler from source for version compatibility
-          pip install -v --no-deps integrations/pjrt/python_packages/iree_metal_plugin
+          cmake -G Ninja -B compiler/build/b -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DIREE_BUILD_COMPILER=ON \
+            -DIREE_BUILD_TESTS=OFF \
+            -DIREE_BUILD_SAMPLES=OFF
+          cmake --build compiler/build/b
+
+      - name: Install compiler Python packages
+        run: |
+          cmake --install compiler/build/b \
+            --prefix compiler/build/i \
+            --component IREECompilerPythonPackages
+
+      - name: Build and sync test environment
+        run: |
+          cd integrations/pjrt/test
+          uv sync
+
+      - name: Verify installation
+        run: |
+          cd integrations/pjrt/test
+          uv run python -c "
+          import jax
+          print(f'JAX version: {jax.__version__}')
+          import iree._pjrt_libs.metal as m
+          import os
+          print(f'Metal PJRT plugin: {os.path.dirname(m.__file__)}')
+          jax.config.update('jax_platforms', 'iree_metal')
+          print(f'Metal devices: {jax.devices()}')
+          "
 
       - name: Run Metal PJRT tests
         run: |
-          source ${VENV_DIR}/bin/activate
-          cd integrations/pjrt
+          cd integrations/pjrt/test
 
-          # Show where the PJRT plugin was installed
-          python -c "import iree._pjrt_libs.metal as m; import os; print(f'Metal PJRT plugin: {os.path.dirname(m.__file__)}')"
-          # Verify iree.compiler is available (from pip package)
-          python -c "from iree.compiler.api import ctypes_dl; print(f'Compiler lib: {ctypes_dl._probe_iree_compiler_dylib()}')"
-
-          # Note: macOS CI runners use paravirtualized GPUs which may not support
-          # all Metal operations. Tests may fail due to VM GPU limitations.
           echo "Running Metal-specific tests..."
-          JAX_PLATFORMS=iree_metal python test/test_metal.py || echo "Metal tests failed (possibly due to VM GPU limitations)"
+          uv run python -m pytest test_metal.py -v || echo "Metal tests failed (possibly due to VM GPU limitations)"
+
           echo "Running Shardy dialect tests..."
-          JAX_PLATFORMS=iree_metal python test/test_shardy.py || echo "Shardy tests failed (possibly due to VM GPU limitations)"
+          JAX_PLATFORMS=iree_metal uv run python test_shardy.py || echo "Shardy tests failed (possibly due to VM GPU limitations)"
 
       - name: Run comprehensive Metal tests
         run: |
-          source ${VENV_DIR}/bin/activate
-          cd integrations/pjrt
-
-          # Comprehensive test suite covering:
-          # - Determinism/stability (repeated execution)
-          # - Identity/constant operations (eye, zeros, ones, etc.)
-          # - Control flow (cond, while_loop, scan, fori_loop)
-          # - Data types (float16, float32, int32, bool, complex)
-          # - Scatter/gather operations
-          # - Random number generation
-          # - Linear algebra (matmul, transpose, norm, etc.)
-          # - Reductions (sum, mean, max, etc.)
-          # - Buffer donation
+          cd integrations/pjrt/test
           echo "Running comprehensive Metal test suite..."
-          JAX_PLATFORMS=iree_metal python test/test_metal_comprehensive.py || echo "Some comprehensive tests failed (see summary above)"
+          JAX_PLATFORMS=iree_metal uv run python test_metal_comprehensive.py || echo "Some comprehensive tests failed (see summary above)"
 
       - name: Run differential tests vs CPU
         run: |
-          source ${VENV_DIR}/bin/activate
-          cd integrations/pjrt
+          cd integrations/pjrt/test
 
-          # Compare Metal results with CPU baseline
-          # Note: These tests may fail on VM GPUs due to paravirtualization limitations
           echo "Running differential tests (Metal vs CPU)..."
-
           diff_test_failed=0
-          for test in test/test_add.py test/test_simple.py; do
+          for test in test_add.py test_simple.py; do
             echo "Testing ${test}..."
-            expected=$(JAX_PLATFORMS=cpu python ${test}) || { echo "CPU baseline failed for ${test}"; diff_test_failed=1; continue; }
-            actual=$(JAX_PLATFORMS=iree_metal python ${test} 2>&1) || { echo "Metal execution failed for ${test} (possibly VM GPU limitation)"; diff_test_failed=1; continue; }
+            expected=$(JAX_PLATFORMS=cpu uv run python ${test}) || { echo "CPU baseline failed for ${test}"; diff_test_failed=1; continue; }
+            actual=$(JAX_PLATFORMS=iree_metal uv run python ${test} 2>&1) || { echo "Metal execution failed for ${test} (possibly VM GPU limitation)"; diff_test_failed=1; continue; }
             if [ "$expected" != "$actual" ]; then
               echo "FAIL: Output mismatch for ${test}"
               echo "Expected: $expected"
@@ -186,15 +147,9 @@ jobs:
             echo "Some differential tests failed (possibly due to VM GPU limitations)"
           fi
 
-      - name: Clone JAX repository for test suite
-        run: |
-          git clone --depth=1 https://github.com/jax-ml/jax.git /tmp/jax
-          echo "JAX version: $(cat /tmp/jax/jax/version.py | grep __version__)"
-
       - name: Apply IREE Metal patches to JAX tests
         run: |
-          cd /tmp/jax
-          # Apply patches to skip XLA-specific tests on IREE Metal
+          cd ${{ github.workspace }}/../jax
           for patch in ${{ github.workspace }}/integrations/pjrt/test/patches/*.patch; do
             if [ -f "$patch" ]; then
               echo "Applying patch: $patch"
@@ -202,29 +157,20 @@ jobs:
             fi
           done
 
-      - name: Install JAX test dependencies
-        run: |
-          source ${VENV_DIR}/bin/activate
-          pip install pytest absl-py hypothesis
-
       - name: Run JAX test suite
-        timeout-minutes: 10  # JitTest runs quickly (~15s)
+        timeout-minutes: 10
         run: |
-          source ${VENV_DIR}/bin/activate
-          cd /tmp/jax
+          cd integrations/pjrt/test
 
-          # Run JitTest subset against IREE Metal
-          # With patches applied: 82 pass, 18 skipped, 22 fail
-          # See integrations/pjrt/test/metal_expected_passing.txt for baseline
           echo "Running JAX JitTest suite against IREE Metal..."
-          JAX_PLATFORMS=iree_metal JAX_ENABLE_X64=0 pytest tests/api_test.py::JitTest \
+          JAX_PLATFORMS=iree_metal JAX_ENABLE_X64=0 uv run pytest \
+            ${{ github.workspace }}/../jax/tests/api_test.py::JitTest \
             --tb=no -v 2>&1 | tee /tmp/jaxtest_output.txt || true
 
           # Extract results
-          grep "PASSED" /tmp/jaxtest_output.txt | wc -l > /tmp/metal_passing.txt || true
-          grep "FAILED" /tmp/jaxtest_output.txt | wc -l > /tmp/metal_failing.txt || true
+          grep -c "PASSED" /tmp/jaxtest_output.txt > /tmp/metal_passing.txt || true
+          grep -c "FAILED" /tmp/jaxtest_output.txt > /tmp/metal_failing.txt || true
 
-          # Report results
           echo ""
           echo "=== JAX JitTest Results ==="
           passing=$(cat /tmp/metal_passing.txt 2>/dev/null || echo "0")
@@ -232,7 +178,6 @@ jobs:
           echo "Passing tests: $passing"
           echo "Failing tests: $failing"
 
-          # Check for regressions against baseline (80 expected passing)
           if [ "$passing" -lt 75 ]; then
             echo "WARNING: Significant regression detected! Expected ~80 passing tests."
             exit 1
@@ -242,9 +187,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: jax-test-results-${{ matrix.runner }}
+          name: jax-test-results
           path: |
-            /tmp/jaxtest/
+            /tmp/jaxtest_output.txt
             /tmp/metal_passing.txt
             /tmp/metal_failing.txt
           retention-days: 7
@@ -254,5 +199,5 @@ jobs:
         if: failure() && github.ref_name == 'main' && github.repository_owner == 'iree-org'
         with:
           webhook: ${{ secrets.DISCORD_WEBHOOK }}
-          description: "The ${{ github.workflow }} workflow failed on ${{ matrix.name }}"
+          description: "The ${{ github.workflow }} workflow failed"
           url: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}"
