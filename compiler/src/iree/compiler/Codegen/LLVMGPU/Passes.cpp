@@ -569,7 +569,7 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(createCSEPass());
   funcPassManager.addPass(createPropagateDispatchSizeBoundsPass());
   funcPassManager.addPass(createIREELoopInvariantCodeMotionPass());
-  funcPassManager.addPass(createGPUCombineValueSemanticBarriersPass());
+  funcPassManager.addPass(IREE::GPU::createCombineBarrierRegionsPass());
 
   // Step 6. Lower special ops and vectorize.
   funcPassManager.addPass(
@@ -579,7 +579,7 @@ void addGPUTileAndFusePassPipeline(OpPassManager &funcPassManager,
                             /*enableMasking=*/true,
                             /*foldIdentitySlices=*/true);
   funcPassManager.addPass(createCleanupBufferAllocViewPass());
-  funcPassManager.addPass(createGPUCombineValueSemanticBarriersPass());
+  funcPassManager.addPass(createGPUCombineValueBarriersPass());
 
   // Step 7. Bufferize.
   addGPUBufferizePasses(funcPassManager);
@@ -860,7 +860,7 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(createGPUVectorAllocPass());
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
-  funcPassManager.addPass(createGPUCombineValueSemanticBarriersPass());
+  funcPassManager.addPass(createGPUCombineValueBarriersPass());
 
   // Tensor -> Memref
   addVectorBufferizePasses(funcPassManager);

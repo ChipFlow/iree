@@ -50,9 +50,9 @@ def GPUCombineLayoutTransformationPass :
   ];
 }
 
-def GPUCombineValueSemanticBarriersPass :
-    Pass<"iree-codegen-gpu-combine-value-semantic-barriers", ""> {
-  let summary = "Combines `iree_gpu.value_barrier` and `iree_gpu.barrier_region` ops";
+def GPUCombineValueBarriersPass :
+    Pass<"iree-codegen-gpu-combine-value-barriers", ""> {
+  let summary = "Combines `iree_gpu.value_barrier` ops";
   let dependentDialects = ["::mlir::iree_compiler::IREE::GPU::IREEGPUDialect"];
 }
 
