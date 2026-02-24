@@ -36,11 +36,17 @@ struct baspacho_context_s {
 
   // Sparse structure info
   int64_t n;    // Matrix dimension
-  int64_t nnz;  // Number of non-zeros
+  int64_t nnz;  // Number of non-zeros (in lower triangular part)
+  int64_t original_nnz;  // Number of non-zeros (in original input)
 
-  // Original CSR structure (needed for loadFromCsr)
+  // Lower triangular CSR structure (for loadFromCsr)
+  // BaSpaCho expects lower triangular input for Cholesky factorization
   std::vector<int64_t> csr_row_ptr;
   std::vector<int64_t> csr_col_idx;
+
+  // Mapping from lower triangular positions to original CSR positions
+  // Used to extract lower triangular values from full matrix input
+  std::vector<int64_t> lower_to_original_idx;
 
   // Permutation for reordering
   std::vector<int64_t> permutation;
@@ -100,6 +106,7 @@ baspacho_handle_t baspacho_create(baspacho_backend_t backend) {
   ctx->backend = convert_backend(backend);
   ctx->n = 0;
   ctx->nnz = 0;
+  ctx->original_nnz = 0;
   ctx->device_handle = nullptr;
   ctx->command_queue = nullptr;
   return ctx;
@@ -147,28 +154,68 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
 
   try {
     h->n = n;
-    h->nnz = nnz;
-
-    // Store original CSR structure for later use in loadFromCsr
-    h->csr_row_ptr.assign(row_ptr, row_ptr + n + 1);
-    h->csr_col_idx.assign(col_idx, col_idx + nnz);
+    h->original_nnz = nnz;
 
     // For scalar CSR, each block is size 1
     h->block_sizes.assign(n, 1);
 
-    // Create sparse structure from CSR
+    // BaSpaCho expects LOWER TRIANGULAR CSR for Cholesky factorization.
+    // The input may be a full symmetric matrix, so we extract only the
+    // lower triangular part (entries where col <= row).
+    //
+    // We also build a mapping from lower triangular positions to original
+    // positions so we can extract the correct values during factorization.
+    h->csr_row_ptr.resize(n + 1);
+    h->csr_row_ptr[0] = 0;
+
+    // First pass: count lower triangular entries per row
+    for (int64_t row = 0; row < n; ++row) {
+      int64_t count = 0;
+      for (int64_t ptr = row_ptr[row]; ptr < row_ptr[row + 1]; ++ptr) {
+        int64_t col = col_idx[ptr];
+        if (col <= row) {  // Lower triangular (including diagonal)
+          ++count;
+        }
+      }
+      h->csr_row_ptr[row + 1] = h->csr_row_ptr[row] + count;
+    }
+
+    int64_t lower_nnz = h->csr_row_ptr[n];
+    h->nnz = lower_nnz;
+    h->csr_col_idx.resize(lower_nnz);
+    h->lower_to_original_idx.resize(lower_nnz);
+
+    // Debug: print extraction stats
+    fprintf(stderr, "[BaSpaCho] Lower triangular extraction: n=%lld, original_nnz=%lld, lower_nnz=%lld\n",
+            (long long)n, (long long)nnz, (long long)lower_nnz);
+
+    // Second pass: extract lower triangular entries and build mapping
+    int64_t lower_idx = 0;
+    for (int64_t row = 0; row < n; ++row) {
+      for (int64_t ptr = row_ptr[row]; ptr < row_ptr[row + 1]; ++ptr) {
+        int64_t col = col_idx[ptr];
+        if (col <= row) {  // Lower triangular (including diagonal)
+          h->csr_col_idx[lower_idx] = col;
+          h->lower_to_original_idx[lower_idx] = ptr;  // Map to original position
+          ++lower_idx;
+        }
+      }
+    }
+
+    // Create sparse structure from lower triangular CSR
     BaSpaCho::SparseStructure ss;
-    ss.ptrs.assign(row_ptr, row_ptr + n + 1);
-    ss.inds.assign(col_idx, col_idx + nnz);
+    ss.ptrs = h->csr_row_ptr;
+    ss.inds = h->csr_col_idx;
 
     // Create solver settings
     BaSpaCho::Settings settings;
-    settings.backend = h->backend;
+    settings.backend = h->backend;  // Use configured backend (Metal on Apple Silicon)
     settings.numThreads = 8;  // Reasonable default
     settings.addFillPolicy = BaSpaCho::AddFillComplete;
-    // Disable sparse elimination for now - there's a bug with large matrices
-    // that causes incorrect results when sparse elimination is enabled.
-    settings.findSparseEliminationRanges = false;
+    // Enable sparse elimination for both CPU and Metal backends
+    settings.findSparseEliminationRanges = true;
+    fprintf(stderr, "[BaSpaCho] Using backend: %d (0=Ref, 1=Fast, 2=CUDA, 3=Metal)\n",
+            (int)settings.backend);
 
     // Create solver (performs symbolic analysis)
     h->solver = BaSpaCho::createSolver(settings, h->block_sizes, ss);
@@ -177,6 +224,15 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
       return -2;  // Symbolic analysis failed
     }
 
+    // Check if sparse elimination ranges were created
+    const auto& ranges = h->solver->sparseEliminationRanges();
+    fprintf(stderr, "[BaSpaCho] Sparse elim ranges: %zu elements: [", ranges.size());
+    for (size_t i = 0; i < std::min(ranges.size(), size_t(10)); ++i) {
+      fprintf(stderr, "%lld%s", (long long)ranges[i], i + 1 < ranges.size() ? ", " : "");
+    }
+    if (ranges.size() > 10) fprintf(stderr, ", ...");
+    fprintf(stderr, "]\n");
+
     // Store permutation
     h->permutation = h->solver->paramToSpan();
     h->inverse_permutation.resize(n);
@@ -184,25 +240,21 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
       h->inverse_permutation[h->permutation[i]] = i;
     }
 
-    // Allocate factor storage
+    // Note: Factor storage will be allocated during factor_f32/factor_f64 calls.
+    // For Metal backend, MetalMirror is created from std::vector to match
+    // BaSpaCho test pattern (ensures proper buffer initialization).
+    // Pre-allocate permuted buffer for solve operations.
     int64_t data_size = h->solver->dataSize();
 
 #ifdef BASPACHO_USE_METAL
     if (h->backend == BaSpaCho::BackendMetal) {
-      // For Metal backend, use MetalMirror which auto-registers with registry.
-      // This is required because BaSpaCho's Metal backend looks up buffers
-      // in MetalBufferRegistry when performing GPU operations.
-      h->metal_factor_data_f32 = std::make_unique<BaSpaCho::MetalMirror<float>>();
-      h->metal_factor_data_f32->resizeToAtLeast(data_size);
-      // Also allocate permuted buffer for solve operations
+      // Allocate permuted buffer for solve operations (factor buffer created in factor_f32)
       h->metal_permuted_f32 = std::make_unique<BaSpaCho::MetalMirror<float>>();
       h->metal_permuted_f32->resizeToAtLeast(n);
-    } else {
-      h->factor_data_f32.resize(data_size);
     }
-#else
-    h->factor_data_f32.resize(data_size);
 #endif
+    // CPU factor storage (used for CPU backend or fallback)
+    h->factor_data_f32.resize(data_size);
     h->factor_data_f64.resize(data_size);
 
     return 0;  // Success
@@ -230,34 +282,76 @@ int baspacho_factor_f32(baspacho_handle_t h, const float* values) {
   if (!h || !h->solver || !values) return -1;
 
   try {
-    float* data = nullptr;
-    size_t data_size = 0;
+    int64_t data_size = h->solver->dataSize();
 
-#ifdef BASPACHO_USE_METAL
-    if (h->backend == BaSpaCho::BackendMetal && h->metal_factor_data_f32) {
-      // Use MetalMirror buffer for GPU factorization.
-      // MetalMirror auto-registers with MetalBufferRegistry.
-      data = h->metal_factor_data_f32->ptr();
-      data_size = h->metal_factor_data_f32->allocSize();
-    } else {
-      data = h->factor_data_f32.data();
-      data_size = h->factor_data_f32.size();
+    // Extract lower triangular values from the input using the mapping.
+    // The input 'values' array is in original (possibly full symmetric) CSR order,
+    // but BaSpaCho expects lower triangular only.
+    std::vector<float> lower_values(h->nnz);
+    for (int64_t i = 0; i < h->nnz; ++i) {
+      lower_values[i] = values[h->lower_to_original_idx[i]];
     }
-#else
-    data = h->factor_data_f32.data();
-    data_size = h->factor_data_f32.size();
-#endif
 
-    // Zero out factor storage
-    std::memset(data, 0, data_size * sizeof(float));
+    // Debug: print first few values
+    fprintf(stderr, "[BaSpaCho] factor_f32: data_size=%lld, nnz=%lld\n",
+            (long long)data_size, (long long)h->nnz);
+    fprintf(stderr, "[BaSpaCho] First 5 lower_values: ");
+    for (int i = 0; i < std::min(5, (int)h->nnz); ++i) {
+      fprintf(stderr, "%.4f ", lower_values[i]);
+    }
+    fprintf(stderr, "\n");
 
-    // Load CSR values into BaSpaCho's internal format using original CSR structure
+    // Following BaSpaCho test pattern exactly:
+    // 1. Load CSR values into a CPU std::vector first
+    // 2. Then copy to MetalMirror (which triggers proper initialization)
+    // This ensures correct data flow for Metal GPU operations.
+    std::vector<float> factorData(data_size, 0.0f);
+
+    // Load CSR values into BaSpaCho's internal format using lower triangular structure
     // This handles the permutation and format conversion automatically
     h->solver->loadFromCsr(h->csr_row_ptr.data(), h->csr_col_idx.data(),
-                           h->block_sizes.data(), values, data);
+                           h->block_sizes.data(), lower_values.data(), factorData.data());
+
+    // Debug: print first few factor data values after loadFromCsr
+    fprintf(stderr, "[BaSpaCho] First 10 factor data after loadFromCsr: ");
+    for (int i = 0; i < std::min(10, (int)data_size); ++i) {
+      fprintf(stderr, "%.4f ", factorData[i]);
+    }
+    fprintf(stderr, "\n");
+
+    float* data = nullptr;
+
+#ifdef BASPACHO_USE_METAL
+    if (h->backend == BaSpaCho::BackendMetal) {
+      // Copy factor data to MetalMirror using load() method
+      // This matches the BaSpaCho test pattern: MetalMirror<T> dataGpu(factorData);
+      h->metal_factor_data_f32 = std::make_unique<BaSpaCho::MetalMirror<float>>(factorData);
+      data = h->metal_factor_data_f32->ptr();
+      fprintf(stderr, "[BaSpaCho] Copied %lld floats to MetalMirror, ptr=%p\n",
+              (long long)data_size, (void*)data);
+    } else {
+      h->factor_data_f32 = factorData;
+      data = h->factor_data_f32.data();
+    }
+#else
+    h->factor_data_f32 = factorData;
+    data = h->factor_data_f32.data();
+#endif
 
     // Perform numeric factorization (GPU or CPU depending on backend)
     h->solver->factor(data);
+
+    // Debug: print first few factor data values after factor
+    fprintf(stderr, "[BaSpaCho] First 10 factor data after factor: ");
+#ifdef BASPACHO_USE_METAL
+    if (h->backend == BaSpaCho::BackendMetal) {
+      BaSpaCho::MetalContext::instance().synchronize();
+    }
+#endif
+    for (int i = 0; i < std::min(10, (int)data_size); ++i) {
+      fprintf(stderr, "%.4f ", data[i]);
+    }
+    fprintf(stderr, "\n");
 
 #ifdef BASPACHO_USE_METAL
     // Metal operations are batched - synchronize to ensure GPU work is complete
@@ -281,9 +375,15 @@ int baspacho_factor_f64(baspacho_handle_t h, const double* values) {
     double* data = h->factor_data_f64.data();
     std::memset(data, 0, h->factor_data_f64.size() * sizeof(double));
 
-    // Load CSR values into BaSpaCho's internal format using original CSR structure
+    // Extract lower triangular values from the input using the mapping.
+    std::vector<double> lower_values(h->nnz);
+    for (int64_t i = 0; i < h->nnz; ++i) {
+      lower_values[i] = values[h->lower_to_original_idx[i]];
+    }
+
+    // Load CSR values into BaSpaCho's internal format using lower triangular structure
     h->solver->loadFromCsr(h->csr_row_ptr.data(), h->csr_col_idx.data(),
-                           h->block_sizes.data(), values, data);
+                           h->block_sizes.data(), lower_values.data(), data);
 
     h->solver->factor(data);
     return 0;
@@ -328,9 +428,15 @@ int baspacho_factor_lu_f32(baspacho_handle_t h, const float* values,
     float* data = h->factor_data_f32.data();
     std::memset(data, 0, h->factor_data_f32.size() * sizeof(float));
 
-    // Copy values to factor storage (with format conversion if needed)
-    std::memcpy(data, values, std::min((size_t)h->nnz,
-                h->factor_data_f32.size()) * sizeof(float));
+    // Extract lower triangular values from the input using the mapping.
+    std::vector<float> lower_values(h->nnz);
+    for (int64_t i = 0; i < h->nnz; ++i) {
+      lower_values[i] = values[h->lower_to_original_idx[i]];
+    }
+
+    // Load CSR values into BaSpaCho's internal format using lower triangular structure
+    h->solver->loadFromCsr(h->csr_row_ptr.data(), h->csr_col_idx.data(),
+                           h->block_sizes.data(), lower_values.data(), data);
 
     // Perform LU factorization with partial pivoting
     h->solver->factorLU(data, pivots);
@@ -348,8 +454,15 @@ int baspacho_factor_lu_f64(baspacho_handle_t h, const double* values,
     double* data = h->factor_data_f64.data();
     std::memset(data, 0, h->factor_data_f64.size() * sizeof(double));
 
-    std::memcpy(data, values, std::min((size_t)h->nnz,
-                h->factor_data_f64.size()) * sizeof(double));
+    // Extract lower triangular values from the input using the mapping.
+    std::vector<double> lower_values(h->nnz);
+    for (int64_t i = 0; i < h->nnz; ++i) {
+      lower_values[i] = values[h->lower_to_original_idx[i]];
+    }
+
+    // Load CSR values into BaSpaCho's internal format using lower triangular structure
+    h->solver->loadFromCsr(h->csr_row_ptr.data(), h->csr_col_idx.data(),
+                           h->block_sizes.data(), lower_values.data(), data);
 
     h->solver->factorLU(data, pivots);
     return 0;
@@ -393,7 +506,7 @@ void baspacho_solve_f32(baspacho_handle_t h, const float* rhs, float* solution) 
     float* factor_data = nullptr;
     float* permuted = nullptr;
 
-    // Debug: force CPU solve to check if Metal solve is the issue
+    // Check environment variable to force CPU solve for debugging
     static bool force_cpu = (getenv("BASPACHO_FORCE_CPU_SOLVE") != nullptr);
 
 #ifdef BASPACHO_USE_METAL
@@ -415,22 +528,73 @@ void baspacho_solve_f32(baspacho_handle_t h, const float* rhs, float* solution) 
       factor_data = h->metal_factor_data_f32->ptr();
       permuted = h->metal_permuted_f32->ptr();
 
+      // Debug: print pointer addresses and factor data
+      fprintf(stderr, "[BaSpaCho] solve: factor_data ptr=%p, permuted ptr=%p\n",
+              (void*)factor_data, (void*)permuted);
+      fprintf(stderr, "[BaSpaCho] solve: n=%lld, permutation.size()=%zu\n",
+              (long long)h->n, h->permutation.size());
+      fprintf(stderr, "[BaSpaCho] solve: First 10 permutation: ");
+      for (int i = 0; i < std::min(10, (int)h->permutation.size()); ++i) {
+        fprintf(stderr, "%lld ", (long long)h->permutation[i]);
+      }
+      fprintf(stderr, "\n");
+      fprintf(stderr, "[BaSpaCho] solve: First 5 factor data in solve: ");
+      for (int i = 0; i < 5; ++i) {
+        fprintf(stderr, "%.4f ", factor_data[i]);
+      }
+      fprintf(stderr, "\n");
+
+      // Debug: print first few RHS values
+      fprintf(stderr, "[BaSpaCho] solve: First 5 RHS values: ");
+      for (int i = 0; i < std::min(5, (int)h->n); ++i) {
+        fprintf(stderr, "%.4f ", rhs[i]);
+      }
+      fprintf(stderr, "\n");
+
       // Apply permutation to RHS: permuted[p[i]] = rhs[i] (scatter)
       // BaSpaCho's solve does NOT apply permutation internally for Cholesky
       for (int64_t i = 0; i < h->n; ++i) {
         permuted[h->permutation[i]] = rhs[i];
       }
 
+      // IMPORTANT: Synchronize to ensure CPU writes are visible to GPU
+      // On unified memory, this flushes any CPU caches to ensure coherency
+      BaSpaCho::MetalContext::instance().synchronize();
+
+      // Debug: print first few permuted values
+      fprintf(stderr, "[BaSpaCho] solve: First 5 permuted values: ");
+      for (int i = 0; i < std::min(5, (int)h->n); ++i) {
+        fprintf(stderr, "%.4f ", permuted[i]);
+      }
+      fprintf(stderr, "\n");
+
       // Solve in-place using GPU (Metal backend finds buffers in registry)
+      fprintf(stderr, "[Wrapper] About to call h->solver->solve() with factor_data=%p, permuted=%p\n",
+              (void*)factor_data, (void*)permuted);
       h->solver->solve(factor_data, permuted, h->n, 1);
+      fprintf(stderr, "[Wrapper] h->solver->solve() returned\n");
 
       // Metal operations are batched - synchronize to ensure GPU work is complete
       BaSpaCho::MetalContext::instance().synchronize();
+
+      // Debug: print solution before inverse permutation
+      fprintf(stderr, "[BaSpaCho] solve: First 5 permuted after solve: ");
+      for (int i = 0; i < std::min(5, (int)h->n); ++i) {
+        fprintf(stderr, "%.4f ", permuted[i]);
+      }
+      fprintf(stderr, "\n");
 
       // Apply inverse permutation to solution: solution[i] = permuted[p[i]] (gather)
       for (int64_t i = 0; i < h->n; ++i) {
         solution[i] = permuted[h->permutation[i]];
       }
+
+      // Debug: print final solution
+      fprintf(stderr, "[BaSpaCho] solve: First 5 solution values: ");
+      for (int i = 0; i < std::min(5, (int)h->n); ++i) {
+        fprintf(stderr, "%.4f ", solution[i]);
+      }
+      fprintf(stderr, "\n");
     } else {
       // CPU backend path
       factor_data = h->factor_data_f32.data();
@@ -467,8 +631,9 @@ void baspacho_solve_f32(baspacho_handle_t h, const float* rhs, float* solution) 
       solution[i] = permuted_vec[h->permutation[i]];
     }
 #endif
-  } catch (const std::exception&) {
-    // Silently fail - could log error
+  } catch (const std::exception& e) {
+    // Log error - this is critical for debugging
+    fprintf(stderr, "[BaSpaCho] solve_f32 EXCEPTION: %s\n", e.what());
   }
 }
 

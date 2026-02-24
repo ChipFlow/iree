@@ -12,6 +12,7 @@
 #include "iree/compiler/Utils/StringUtils.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
@@ -26,6 +27,19 @@ namespace mlir::iree_compiler::IREE::Util {
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h.inc"
 
 namespace {
+
+// Returns true if the operation is inside an SCF loop region (while, for,
+// forall). Values inside loops cannot be hoisted to module-level globals
+// because the global references would be undefined inside loop body regions.
+static bool isInsideLoopRegion(Operation *op) {
+  Operation *parent = op->getParentOp();
+  while (parent) {
+    if (isa<scf::WhileOp, scf::ForOp, scf::ForallOp>(parent))
+      return true;
+    parent = parent->getParentOp();
+  }
+  return false;
+}
 
 static llvm::cl::opt<std::string> clPrintDotGraphToFile(
     "iree-util-hoist-into-globals-print-constexpr-dotgraph-to",
@@ -110,6 +124,12 @@ public:
       if (isa<IREE::Util::InitializerOpInterface>(funcOp.getOperation()))
         continue;
       auto walkRes = funcOp.walk<WalkOrder::PreOrder>([&](Operation *iterOp) {
+        // Skip operations inside loop regions - they cannot reference
+        // module-level globals because scf.while/for/forall body regions
+        // are isolated and cannot access values defined outside.
+        if (isInsideLoopRegion(iterOp))
+          return WalkResult::advance();
+
         // We only want to look at const-expr ops (non roots) since they may
         // have interesting escapes. Early exit here for efficiency.
         auto *iterInfo = constExprs.lookup(iterOp);

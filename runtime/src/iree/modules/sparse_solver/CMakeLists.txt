@@ -86,9 +86,17 @@ endif()
 # Metal backend (requires BaSpaCho metal-backend branch).
 if(APPLE AND IREE_HAL_DRIVER_METAL)
   list(APPEND SPARSE_SOLVER_DEFINES IREE_SPARSE_SOLVER_HAVE_METAL=1)
+  list(APPEND SPARSE_SOLVER_DEFINES IREE_HAL_HAVE_METAL_DRIVER=1)
+  # BaSpaCho Metal integration requires buffer registration.
+  list(APPEND SPARSE_SOLVER_DEFINES BASPACHO_USE_METAL=1)
   find_library(METAL_FRAMEWORK Metal REQUIRED)
   list(APPEND SPARSE_SOLVER_DEPS ${METAL_FRAMEWORK})
-  message(STATUS "sparse_solver: Metal backend enabled")
+  # Add Metal HAL driver dependency for direct buffer access.
+  list(APPEND SPARSE_SOLVER_DEPS iree::hal::drivers::metal)
+  # Add Metal helper source file (Objective-C).
+  list(APPEND SPARSE_SOLVER_SOURCES module_metal.m)
+  list(APPEND SPARSE_SOLVER_SOURCES module_metal.h)
+  message(STATUS "sparse_solver: Metal backend enabled with direct buffer access")
 endif()
 
 # CUDA backend.

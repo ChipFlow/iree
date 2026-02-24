@@ -30,6 +30,10 @@ iree_status_t iree_hal_metal_device_create(
 const iree_hal_metal_device_params_t* iree_hal_metal_device_params(
     const iree_hal_device_t* device);
 
+// Returns the underlying Metal device handle for the given |device|.
+// This allows external libraries to use the same Metal device for GPU operations.
+id<MTLDevice> iree_hal_metal_device_handle(const iree_hal_device_t* device);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

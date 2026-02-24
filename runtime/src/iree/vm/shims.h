@@ -458,6 +458,18 @@ IREE_VM_ABI_FIXED_STRUCT(rrrIii, {
   int32_t i5;
 });
 
+// sparse_solver: spsolve_complete(n, nnz, row_ptr, col_idx, values, rhs,
+// solution)
+IREE_VM_ABI_FIXED_STRUCT(IIrrrrr, {
+  int64_t i0;
+  int64_t i1;
+  iree_vm_ref_t r2;
+  iree_vm_ref_t r3;
+  iree_vm_ref_t r4;
+  iree_vm_ref_t r5;
+  iree_vm_ref_t r6;
+});
+
 // sparse_solver: solve.batched(handle, rhs, solution, num_rhs)
 IREE_VM_ABI_FIXED_STRUCT(rrrI, {
   iree_vm_ref_t r0;

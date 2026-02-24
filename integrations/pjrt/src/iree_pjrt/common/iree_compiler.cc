@@ -233,9 +233,14 @@ std::unique_ptr<CompilerJob> IREECompiler::StartJob() {
   // Use stablehlo_xla input type for JAX/XLA compatibility.
   // The StableHLO input pipeline now includes Shardy (sdy) dialect stripping
   // for JAX 0.8.2+ which uses the Shardy partitioner by default.
+  //
+  // Note: Strip source maps to work around a FlatBuffer serialization bug
+  // with vhlo dialect locations. See investigation: vhlo input + source map
+  // causes "union element absent without type NONE" verification failures.
   if (!job->SetFlag("--iree-input-type=stablehlo_xla") ||
       !job->SetFlag("--iree-input-demote-i64-to-i32=false") ||
-      !job->SetFlag("--iree-execution-model=async-external")) {
+      !job->SetFlag("--iree-execution-model=async-external") ||
+      !job->SetFlag("--iree-vm-bytecode-module-strip-source-map=true")) {
     error_message_ = job->GetErrorMessage();
     return nullptr;
   }
