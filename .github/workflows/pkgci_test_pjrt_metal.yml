@@ -52,8 +52,9 @@ jobs:
       - name: Installing build requirements
         run: |
           brew install ninja ccache coreutils llvm
-          # Add llvm-ar to PATH (required by BaSpaCho's BundleStaticLibrary.cmake)
-          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          # Symlink llvm-ar to /usr/local/bin (required by BaSpaCho's BundleStaticLibrary.cmake)
+          # Don't add full llvm/bin to PATH — that would override system clang
+          sudo ln -sf "$(brew --prefix llvm)/bin/llvm-ar" /usr/local/bin/llvm-ar
 
       - name: Configure ccache
         run: |
