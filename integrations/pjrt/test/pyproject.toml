@@ -19,5 +19,6 @@ iree-pjrt-plugin-metal = { path = "../python_packages/iree_metal_plugin", editab
 
 [tool.uv.extra-build-variables.iree-pjrt-plugin-metal]
 # Enable ccache for native builds of the PJRT plugin
+# CCACHE_DIR is inherited from the environment (set at job level in CI)
 CMAKE_C_COMPILER_LAUNCHER = "ccache"
 CMAKE_CXX_COMPILER_LAUNCHER = "ccache"

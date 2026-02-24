@@ -22,6 +22,8 @@ jobs:
   build_and_test:
     name: Metal PJRT (macos-latest-xlarge)
     runs-on: macos-latest-xlarge
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
     defaults:
       run:
         shell: bash
@@ -50,22 +52,19 @@ jobs:
       - name: Installing build requirements
         run: brew install ninja ccache coreutils
 
-      - name: ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: pjrt-metal-${{ runner.os }}-${{ runner.arch }}
-          save: ${{ inputs.write-caches == '1' }}
-          max-size: 2G
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=2G
+          ccache --set-config=cache_dir=${{ github.workspace }}/.ccache
+          ccache -z
 
-      - name: Cache CMake build directory
+      - name: Restore ccache
         uses: actions/cache@v4
         with:
-          path: |
-            compiler/build/b
-            integrations/pjrt/python_packages/iree_metal_plugin/build
-          key: cmake-pjrt-metal-v12-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('integrations/pjrt/CMakeLists.txt', 'integrations/pjrt/src/**') }}
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-pjrt-metal-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
           restore-keys: |
-            cmake-pjrt-metal-v12-${{ runner.os }}-${{ runner.arch }}-
+            ccache-pjrt-metal-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build IREE compiler
         env:
@@ -93,6 +92,9 @@ jobs:
         run: |
           cd integrations/pjrt/test
           uv sync -vvv
+
+      - name: ccache stats
+        run: ccache -s
 
       - name: Verify installation
         run: |
