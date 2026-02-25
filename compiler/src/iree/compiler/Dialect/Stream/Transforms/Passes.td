@@ -272,6 +272,29 @@ def ScheduleExecutionPass :
   ];
 }
 
+def FuseLoopIterationExecutionPass :
+    InterfacePass<"iree-stream-fuse-loop-iteration-execution", "mlir::CallableOpInterface"> {
+  let summary = "Fuses loop iterations into single execution regions to reduce submission overhead.";
+  let description = [{
+    Analyzes `scf.for` loops containing `stream.async.execute` regions and
+    fuses multiple iterations into a single execution region when the loop has
+    a statically known trip count. This eliminates per-iteration CPU-GPU
+    synchronization overhead (timepoint await/signal pairs) by converting them
+    into intra-command-buffer sequencing.
+
+    Currently handles `scf.for` loops where:
+    - Bounds and step are compile-time constants
+    - Trip count is within the unroll threshold (default 128)
+    - All loop-carried values (iter_args) are stream resources
+    - The loop body contains exactly one `stream.async.execute`
+    - The execute results (after await) are the `scf.yield` operands
+  }];
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "IREE::Stream::StreamDialect",
+  ];
+}
+
 def ScheduleConcurrencyPass :
     InterfacePass<"iree-stream-schedule-concurrency", "mlir::CallableOpInterface"> {
   let summary = "Identifies and groups asynchronous operations within executable regions that can run concurrently and groups them into streams.";

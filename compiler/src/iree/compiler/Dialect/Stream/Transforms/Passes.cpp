@@ -250,6 +250,9 @@ void buildStreamAsyncPassPipeline(OpPassManager &passManager,
   FunctionLikeNest(passManager)
       // Combine async work into execution regions.
       .addPass(IREE::Stream::createScheduleExecutionPass)
+      // Fuse loop iterations into single execution regions to reduce
+      // per-iteration submission overhead (e.g., scan/while loops on GPU).
+      .addPass(IREE::Stream::createFuseLoopIterationExecutionPass)
       // Group concurrently executable work into waves.
       .addPass(IREE::Stream::createScheduleConcurrencyPass);
 
