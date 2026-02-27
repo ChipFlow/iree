@@ -465,3 +465,173 @@ util.func public @i32InductionVariable(%init: !stream.resource<*>, %buf: !stream
 
   util.return %result : !stream.resource<*>
 }
+
+// -----
+
+// Tests that while loops with a single execute in the body get batched into
+// an inner scf.for that is then fused. With default batch size (32), the inner
+// for should be fused into a single execute with 32 dispatches.
+
+stream.executable private @while_dispatch {
+  stream.executable.export public @entry
+  builtin.module {
+    func.func @entry(%arg0: !stream.binding, %arg1: !stream.binding) {
+      return
+    }
+  }
+}
+
+// CHECK-LABEL: @simpleWhileBatch
+util.func public @simpleWhileBatch(%init: !stream.resource<*>, %cond_init: i1) -> !stream.resource<*> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+
+  // The while loop body should be batched into an inner for, then that
+  // for should be fused. We check for the while remaining and the fused
+  // execute inside it.
+  // CHECK: scf.while
+  // CHECK: scf.condition
+  // CHECK: } do {
+  // CHECK: stream.async.execute
+  // Multiple dispatches fused together:
+  // CHECK: stream.async.dispatch @while_dispatch::@entry
+  // CHECK: stream.async.dispatch @while_dispatch::@entry
+  // CHECK: stream.yield
+  // CHECK: stream.timepoint.await
+  // CHECK: scf.yield
+
+  %result = scf.while (%carry = %init, %cond = %cond_init) : (!stream.resource<*>, i1) -> !stream.resource<*> {
+    scf.condition(%cond) %carry : !stream.resource<*>
+  } do {
+  ^bb0(%arg0: !stream.resource<*>):
+    %exec_result, %tp = stream.async.execute
+        with(%arg0 as %inner: !stream.resource<*>{%c4})
+        -> !stream.resource<*>{%c4} {
+      %d = stream.async.dispatch @while_dispatch::@entry[%c1](
+          %inner[%c0 to %c4 for %c4]) : (!stream.resource<*>{%c4}) -> !stream.resource<*>{%c4}
+      stream.yield %d : !stream.resource<*>{%c4}
+    } => !stream.timepoint
+    %awaited = stream.timepoint.await %tp => %exec_result : !stream.resource<*>{%c4}
+    scf.yield %awaited, %cond_init : !stream.resource<*>, i1
+  }
+
+  util.return %result : !stream.resource<*>
+}
+
+// -----
+
+// Tests that while loops with an execute in the condition region are NOT batched.
+
+// CHECK-LABEL: @whileWithConditionDispatchNotBatched
+util.func public @whileWithConditionDispatchNotBatched(%init: !stream.resource<*>) -> !stream.resource<*> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %true = arith.constant true
+
+  // The while loop should NOT be batched (execute in condition region).
+  // CHECK: scf.while
+  // CHECK-NOT: scf.for
+  %result = scf.while (%carry = %init) : (!stream.resource<*>) -> !stream.resource<*> {
+    %exec_result, %tp = stream.async.execute
+        with(%carry as %inner: !stream.resource<*>{%c4})
+        -> !stream.resource<*>{%c4} {
+      %d = stream.async.dispatch @dispatch::@entry[%c1](
+          %inner[%c0 to %c4 for %c4]) : (!stream.resource<*>{%c4}) -> !stream.resource<*>{%c4}
+      stream.yield %d : !stream.resource<*>{%c4}
+    } => !stream.timepoint
+    %awaited = stream.timepoint.await %tp => %exec_result : !stream.resource<*>{%c4}
+    scf.condition(%true) %awaited : !stream.resource<*>
+  } do {
+  ^bb0(%arg0: !stream.resource<*>):
+    scf.yield %arg0 : !stream.resource<*>
+  }
+
+  util.return %result : !stream.resource<*>
+}
+
+// -----
+
+// Tests that while loops with multiple executes in the body are NOT batched.
+
+stream.executable private @while_kernel_a {
+  stream.executable.export public @entry
+  builtin.module {
+    func.func @entry(%arg0: !stream.binding, %arg1: !stream.binding) {
+      return
+    }
+  }
+}
+
+stream.executable private @while_kernel_b {
+  stream.executable.export public @entry
+  builtin.module {
+    func.func @entry(%arg0: !stream.binding, %arg1: !stream.binding) {
+      return
+    }
+  }
+}
+
+// CHECK-LABEL: @whileMultipleExecutesNotBatched
+util.func public @whileMultipleExecutesNotBatched(%init: !stream.resource<*>, %cond_init: i1) -> !stream.resource<*> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+
+  // CHECK: scf.while
+  // CHECK-NOT: scf.for
+  %result = scf.while (%carry = %init, %cond = %cond_init) : (!stream.resource<*>, i1) -> !stream.resource<*> {
+    scf.condition(%cond) %carry : !stream.resource<*>
+  } do {
+  ^bb0(%arg0: !stream.resource<*>):
+    %exec_a, %tp_a = stream.async.execute
+        with(%arg0 as %inner: !stream.resource<*>{%c4})
+        -> !stream.resource<*>{%c4} {
+      %d = stream.async.dispatch @while_kernel_a::@entry[%c1](
+          %inner[%c0 to %c4 for %c4]) : (!stream.resource<*>{%c4}) -> !stream.resource<*>{%c4}
+      stream.yield %d : !stream.resource<*>{%c4}
+    } => !stream.timepoint
+    %awaited_a = stream.timepoint.await %tp_a => %exec_a : !stream.resource<*>{%c4}
+    %exec_b, %tp_b = stream.async.execute
+        with(%awaited_a as %inner2: !stream.resource<*>{%c4})
+        -> !stream.resource<*>{%c4} {
+      %d2 = stream.async.dispatch @while_kernel_b::@entry[%c1](
+          %inner2[%c0 to %c4 for %c4]) : (!stream.resource<*>{%c4}) -> !stream.resource<*>{%c4}
+      stream.yield %d2 : !stream.resource<*>{%c4}
+    } => !stream.timepoint
+    %awaited_b = stream.timepoint.await %tp_b => %exec_b : !stream.resource<*>{%c4}
+    scf.yield %awaited_b, %cond_init : !stream.resource<*>, i1
+  }
+
+  util.return %result : !stream.resource<*>
+}
+
+// -----
+
+// Bug fix regression: loops where outer ops reference iter_args should NOT
+// be fused (the outer ops would get the wrong value for k>0).
+
+// CHECK-LABEL: @outerOpUsesIterArgNotFused
+util.func public @outerOpUsesIterArgNotFused(%init: !stream.resource<*>) -> !stream.resource<*> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+
+  // CHECK: scf.for
+  %result = scf.for %i = %c0 to %c4 step %c1 iter_args(%carry = %init) -> !stream.resource<*> {
+    // This op uses %carry (an iter_arg) - should prevent fusion.
+    %size = stream.resource.size %carry : !stream.resource<*>
+    %exec_result, %tp = stream.async.execute
+        with(%carry as %arg0: !stream.resource<*>{%size})
+        -> !stream.resource<*>{%size} {
+      %d = stream.async.dispatch @dispatch::@entry[%c1](
+          %arg0[%c0 to %size for %size]) : (!stream.resource<*>{%size}) -> !stream.resource<*>{%size}
+      stream.yield %d : !stream.resource<*>{%size}
+    } => !stream.timepoint
+    %awaited = stream.timepoint.await %tp => %exec_result : !stream.resource<*>{%size}
+    scf.yield %awaited : !stream.resource<*>
+  }
+
+  util.return %result : !stream.resource<*>
+}

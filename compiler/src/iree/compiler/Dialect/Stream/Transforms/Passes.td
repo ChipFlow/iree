@@ -282,16 +282,34 @@ def FuseLoopIterationExecutionPass :
     synchronization overhead (timepoint await/signal pairs) by converting them
     into intra-command-buffer sequencing.
 
-    Currently handles `scf.for` loops where:
+    Also handles `scf.while` loops by batching K iterations of the while-loop
+    body into an inner `scf.for` that the existing fusion logic then handles.
+    This reduces GPU submission overhead from every iteration to every K
+    iterations (default K=32).
+
+    Handles `scf.for` loops where:
     - Bounds and step are compile-time constants
     - Trip count is within the unroll threshold (default 128)
     - All loop-carried values (iter_args) are stream resources
     - The loop body contains exactly one `stream.async.execute`
     - The execute results (after await) are the `scf.yield` operands
+
+    Handles `scf.while` loops where:
+    - The "after" (body) region contains exactly one `stream.async.execute`
+    - The execute is followed by a `timepoint.await`
+    - The "before" (condition) region does NOT contain `stream.async.execute`
+    - Resource iter_args flow through the execute
+    - No tied operands on the execute
   }];
   let dependentDialects = [
     "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect",
     "IREE::Stream::StreamDialect",
+  ];
+  let options = [
+    Option<"whileBatchSize", "while-batch-size", "int64_t",
+           /*default=*/"32",
+           "Number of while loop iterations to batch per GPU submission">,
   ];
 }
 

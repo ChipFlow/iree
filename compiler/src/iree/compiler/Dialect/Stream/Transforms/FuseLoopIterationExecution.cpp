@@ -75,6 +75,10 @@ static std::optional<LoopFusionInfo> analyzeForFusion(scf::ForOp forOp) {
 
   info.lowerBound = *lb;
   info.step = *step;
+  if (*ub <= *lb) {
+    LLVM_DEBUG(llvm::dbgs() << "Upper bound <= lower bound, no iterations\n");
+    return std::nullopt;
+  }
   info.tripCount = (*ub - *lb + *step - 1) / *step;
   if (info.tripCount <= 1) {
     LLVM_DEBUG(llvm::dbgs() << "Trip count <= 1, no fusion needed\n");
@@ -119,6 +123,11 @@ static std::optional<LoopFusionInfo> analyzeForFusion(scf::ForOp forOp) {
   }
   if (!awaitOp) {
     LLVM_DEBUG(llvm::dbgs() << "No await on execute timepoint\n");
+    return std::nullopt;
+  }
+  // Verify the await is inside the loop body, not elsewhere.
+  if (awaitOp->getParentOp() != forOp.getOperation()) {
+    LLVM_DEBUG(llvm::dbgs() << "Await op is not in the loop body\n");
     return std::nullopt;
   }
   info.awaitOp = awaitOp;
@@ -204,7 +213,20 @@ static std::optional<LoopFusionInfo> analyzeForFusion(scf::ForOp forOp) {
     info.externalAwaitTimepoint = tp;
   }
 
-  // 8. Check that non-execute ops in the body don't have side effects
+  // 8. Check that the execute has no tied operands (the fusion drops tied
+  // operand semantics since it creates a new execute with untied results).
+  if (auto tiedOp =
+          dyn_cast<IREE::Util::TiedOpInterface>(execOp.getOperation())) {
+    for (unsigned i = 0; i < execOp.getResults().size(); ++i) {
+      if (tiedOp.getTiedResultOperandIndex(i).has_value()) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "Execute has tied operands, cannot fuse\n");
+        return std::nullopt;
+      }
+    }
+  }
+
+  // 9. Check that non-execute ops in the body don't have side effects
   // that prevent fusion (except arith/index ops for offset computation).
   for (auto &op : *body) {
     if (&op == execOp.getOperation())
@@ -219,6 +241,24 @@ static std::optional<LoopFusionInfo> analyzeForFusion(scf::ForOp forOp) {
     LLVM_DEBUG(llvm::dbgs()
                << "Non-pure non-execute op in loop body: " << op << "\n");
     return std::nullopt;
+  }
+
+  // 10. Check that pure non-execute ops don't reference iter_args. Outer ops
+  // are cloned with iter_args mapped to initial values, which is incorrect for
+  // iterations k>0 if they actually use the carried values.
+  for (auto &op : *body) {
+    if (&op == execOp.getOperation() || &op == awaitOp.getOperation() ||
+        isa<scf::YieldOp>(op))
+      continue;
+    for (auto operand : op.getOperands()) {
+      for (auto iterArg : forOp.getRegionIterArgs()) {
+        if (operand == iterArg) {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "Non-execute op references iter_arg: " << op << "\n");
+          return std::nullopt;
+        }
+      }
+    }
   }
 
   LLVM_DEBUG(llvm::dbgs() << "Loop is fusible with trip count "
@@ -496,12 +536,324 @@ static LogicalResult fuseForLoop(LoopFusionInfo &info) {
 }
 
 //===----------------------------------------------------------------------===//
+// While-loop batching
+//===----------------------------------------------------------------------===//
+
+// Analysis result for a batchable scf.while loop.
+struct WhileLoopBatchInfo {
+  scf::WhileOp whileOp;
+  IREE::Stream::AsyncExecuteOp executeOp;
+  IREE::Stream::TimepointAwaitOp awaitOp;
+  int64_t batchSize;
+
+  // Indices of "after" region block args that are resource types flowing
+  // through the execute.
+  SmallVector<unsigned> resourceArgIndices;
+
+  // Indices of "after" region block args that are scalars (not resources).
+  SmallVector<unsigned> scalarArgIndices;
+};
+
+// Analyzes an scf.while loop to determine if it can be batched.
+// Returns std::nullopt if the loop cannot be batched.
+static std::optional<WhileLoopBatchInfo>
+analyzeWhileFusion(scf::WhileOp whileOp, int64_t batchSize) {
+  if (batchSize <= 1) {
+    LLVM_DEBUG(llvm::dbgs() << "While batch size <= 1, skipping\n");
+    return std::nullopt;
+  }
+
+  WhileLoopBatchInfo info;
+  info.whileOp = whileOp;
+  info.batchSize = batchSize;
+
+  // 1. Check that the "before" region does NOT contain any async.execute ops.
+  Block *beforeBody = whileOp.getBeforeBody();
+  for (auto &op : *beforeBody) {
+    if (isa<IREE::Stream::AsyncExecuteOp>(op)) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "While condition region contains async.execute\n");
+      return std::nullopt;
+    }
+  }
+
+  // 2. Find exactly one AsyncExecuteOp in the "after" (body) region.
+  Block *afterBody = whileOp.getAfterBody();
+  IREE::Stream::AsyncExecuteOp execOp;
+  for (auto &op : *afterBody) {
+    if (auto exec = dyn_cast<IREE::Stream::AsyncExecuteOp>(&op)) {
+      if (execOp) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "Multiple execute ops in while body\n");
+        return std::nullopt;
+      }
+      execOp = exec;
+    }
+  }
+  if (!execOp) {
+    LLVM_DEBUG(llvm::dbgs() << "No execute op in while body\n");
+    return std::nullopt;
+  }
+  info.executeOp = execOp;
+
+  // 3. Find the TimepointAwaitOp in the after body.
+  Value timepoint = execOp.getResultTimepoint();
+  IREE::Stream::TimepointAwaitOp awaitOp;
+  for (auto *user : timepoint.getUsers()) {
+    if (auto await = dyn_cast<IREE::Stream::TimepointAwaitOp>(user)) {
+      if (awaitOp) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "Multiple awaits on execute timepoint in while body\n");
+        return std::nullopt;
+      }
+      awaitOp = await;
+    }
+  }
+  if (!awaitOp) {
+    LLVM_DEBUG(llvm::dbgs() << "No await on execute timepoint in while body\n");
+    return std::nullopt;
+  }
+  if (awaitOp->getParentOp() != whileOp.getOperation()) {
+    LLVM_DEBUG(llvm::dbgs() << "Await is not in while body\n");
+    return std::nullopt;
+  }
+  info.awaitOp = awaitOp;
+
+  // 4. Check that the execute has no tied operands.
+  if (auto tiedOp =
+          dyn_cast<IREE::Util::TiedOpInterface>(execOp.getOperation())) {
+    for (unsigned i = 0; i < execOp.getResults().size(); ++i) {
+      if (tiedOp.getTiedResultOperandIndex(i).has_value()) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "While body execute has tied operands\n");
+        return std::nullopt;
+      }
+    }
+  }
+
+  // 5. Classify after-region block args into resource and scalar types.
+  for (auto [idx, arg] : llvm::enumerate(afterBody->getArguments())) {
+    if (isa<IREE::Stream::ResourceType>(arg.getType())) {
+      info.resourceArgIndices.push_back(idx);
+    } else {
+      info.scalarArgIndices.push_back(idx);
+    }
+  }
+
+  // Must have at least one resource arg (otherwise nothing to batch).
+  if (info.resourceArgIndices.empty()) {
+    LLVM_DEBUG(llvm::dbgs() << "No resource args in while body\n");
+    return std::nullopt;
+  }
+
+  // 6. Check that non-execute/non-await ops in the body are pure.
+  for (auto &op : *afterBody) {
+    if (&op == execOp.getOperation())
+      continue;
+    if (&op == awaitOp.getOperation())
+      continue;
+    if (isa<scf::YieldOp>(op))
+      continue;
+    if (isPure(&op))
+      continue;
+    LLVM_DEBUG(llvm::dbgs()
+               << "Non-pure non-execute op in while body: " << op << "\n");
+    return std::nullopt;
+  }
+
+  // 7. Check that the yield operands are either awaited results (for resource
+  // args) or unchanged block args / pure op results (for scalar args).
+  auto yieldOp = cast<scf::YieldOp>(afterBody->getTerminator());
+  for (auto [yieldIdx, yieldVal] : llvm::enumerate(yieldOp.getOperands())) {
+    bool isAwaitResult = false;
+    for (auto result : awaitOp.getResults()) {
+      if (yieldVal == result) {
+        isAwaitResult = true;
+        break;
+      }
+    }
+    if (isAwaitResult)
+      continue;
+    // For non-await yield operands: allow after-body block args passed through
+    // unchanged, results of pure ops in the body, or values defined outside the
+    // while loop (loop-invariant values like function arguments or constants).
+    bool isAfterBlockArg = isa<BlockArgument>(yieldVal) &&
+                           cast<BlockArgument>(yieldVal).getOwner() == afterBody;
+    bool isPureResult =
+        yieldVal.getDefiningOp() && isPure(yieldVal.getDefiningOp());
+    bool isExternalValue =
+        !isa<BlockArgument>(yieldVal)
+            ? (yieldVal.getDefiningOp() &&
+               !whileOp->isAncestor(yieldVal.getDefiningOp()))
+            : (cast<BlockArgument>(yieldVal).getOwner() != afterBody &&
+               cast<BlockArgument>(yieldVal).getOwner() !=
+                   whileOp.getBeforeBody());
+    if (!isAfterBlockArg && !isPureResult && !isExternalValue) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "While yield operand is neither await result, "
+                    "passthrough, pure, nor external: "
+                 << yieldVal << "\n");
+      return std::nullopt;
+    }
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "While loop is batchable with batch size "
+                          << batchSize << "\n");
+  return info;
+}
+
+// Batches a while loop by wrapping its body in an scf.for with K iterations.
+// The existing for-loop fusion pass will then fuse the inner for-loop.
+//
+// The scf.while structure is:
+//   scf.while (%before_args = %inits) : (init_types) -> (result_types)
+//     // "before" region: block args match init_types
+//     scf.condition(%cond) %forwarded_args : forwarded_types
+//   } do {
+//     // "after" region: block args match forwarded_types (from condition)
+//     ... body ops ...
+//     scf.yield %new_inits : init_types  // fed back to before region
+//   }
+//
+// The inner for carries the after-body block args as iter_args:
+//   } do {
+//   ^bb0(%after_args: forwarded_types):
+//     %batched = scf.for %i = 0 to K step 1
+//         iter_args(%carry = %after_args) -> (forwarded_types) {
+//       ... cloned body ops ...
+//       scf.yield %new_carry : forwarded_types
+//     }
+//     scf.yield %batched : init_types  // outer yield, possibly different types
+//   }
+//
+// The tricky part: the inner for's yield types must match its iter_arg types
+// (= after-body block arg types = forwarded_types from condition), but the
+// outer yield types must match init_types (= while loop operand types).
+// These may differ if the condition forwards different values/types than
+// what the yield sends back.
+//
+// For our supported pattern, the execute consumes resource after-args and
+// produces resources. The yield sends back the awaited resources plus any
+// scalars (which may be after-body args, external values, or pure op results).
+// The inner for carries the after-body args and produces the same types for
+// its yield, making the outer yield straightforward.
+static LogicalResult batchWhileLoop(WhileLoopBatchInfo &info) {
+  scf::WhileOp whileOp = info.whileOp;
+  Block *afterBody = whileOp.getAfterBody();
+
+  // Capture the outer yield and its operands before we start modifying.
+  auto outerYield = cast<scf::YieldOp>(afterBody->getTerminator());
+
+  // The inner for carries the after-body block args as iter_args.
+  // These are the values forwarded from scf.condition into the body.
+  SmallVector<Value> innerInitValues;
+  for (auto arg : afterBody->getArguments())
+    innerInitValues.push_back(arg);
+
+  OpBuilder builder(afterBody, afterBody->begin());
+  Location loc = whileOp.getLoc();
+
+  // Create the inner scf.for: for %i = 0 to batchSize step 1.
+  Value c0 = arith::ConstantIndexOp::create(builder, loc, 0);
+  Value cBatchSize =
+      arith::ConstantIndexOp::create(builder, loc, info.batchSize);
+  Value c1 = arith::ConstantIndexOp::create(builder, loc, 1);
+
+  // Note: scf::ForOp::build with initArgs but no bodyBuilder creates a block
+  // WITHOUT a terminator. We provide a bodyBuilder that creates a placeholder
+  // yield, which we'll replace after cloning the body ops.
+  auto innerFor = scf::ForOp::create(
+      builder, loc, c0, cBatchSize, c1, innerInitValues,
+      [&](OpBuilder &b, Location l, Value /*iv*/, ValueRange iterArgs) {
+        scf::YieldOp::create(b, l, iterArgs);
+      });
+
+  Block *innerBody = innerFor.getBody();
+
+  // Map after-body block args -> inner for iter_args.
+  IRMapping mapping;
+  for (auto [afterArg, innerIterArg] : llvm::zip(afterBody->getArguments(),
+                                                  innerFor.getRegionIterArgs()))
+    mapping.map(afterArg, innerIterArg);
+
+  // Collect ops to clone (everything except the yield and the constants/for
+  // we just created).
+  SmallVector<Operation *> opsToClone;
+  for (auto &op : *afterBody) {
+    if (isa<scf::YieldOp>(op))
+      continue;
+    // Skip ops we just created at the start of the block.
+    if (&op == c0.getDefiningOp() || &op == cBatchSize.getDefiningOp() ||
+        &op == c1.getDefiningOp() || &op == innerFor.getOperation())
+      continue;
+    opsToClone.push_back(&op);
+  }
+
+  // Clone into the inner for body (before its auto-generated yield).
+  OpBuilder innerBuilder = OpBuilder::atBlockTerminator(innerBody);
+  for (auto *op : opsToClone) {
+    innerBuilder.clone(*op, mapping);
+  }
+
+  // Build the inner for's yield. The inner for's yield values feed back as
+  // the next iteration's iter_args, which have the same types as the
+  // after-body block args. We need to find, for each after-body arg, what
+  // value the original outer yield would send for that position.
+  //
+  // The outer yield sends values back to the before-region (matching
+  // whileOp.getInits() types). The condition then may forward a subset to
+  // the after region. For a proper inner-for carry, we need the inner yield
+  // to produce after-body-arg-typed values that represent the "next iteration"
+  // state.
+  //
+  // Strategy: For each after-body block arg at index i, find which outer yield
+  // operand corresponds to the same loop state, and remap it. This works when
+  // the condition forwards a subset of before-args to the after region, and
+  // the yield sends values back in the same order as the before-args.
+  //
+  // For the simple case we support: condition forwards before-args 0..N-1 to
+  // after-body as args 0..N-1, and the yield has M operands where M >= N.
+  // The inner for carries the N after-body args and its yield must produce
+  // N values. We take the first N outer yield operands (remapped).
+  unsigned numAfterArgs = afterBody->getNumArguments();
+  SmallVector<Value> innerYieldValues;
+  for (unsigned i = 0; i < numAfterArgs; ++i) {
+    Value outerYieldVal = outerYield.getOperand(i);
+    innerYieldValues.push_back(mapping.lookupOrDefault(outerYieldVal));
+  }
+
+  // Replace the inner for's auto-generated yield.
+  auto existingInnerYield = cast<scf::YieldOp>(innerBody->getTerminator());
+  innerBuilder.setInsertionPoint(existingInnerYield);
+  scf::YieldOp::create(innerBuilder, loc, innerYieldValues);
+  existingInnerYield.erase();
+
+  // Update the outer yield: replace the first N operands with inner for
+  // results, keep the rest (extra scalars going back to before-region).
+  // First, update outer yield to use inner for results for the carried values.
+  outerYield->setOperands(0, numAfterArgs, innerFor.getResults());
+
+  // Now erase the original ops from the after body (in reverse order to
+  // handle use-def chains). The outer yield no longer references them.
+  for (auto it = opsToClone.rbegin(); it != opsToClone.rend(); ++it) {
+    (*it)->erase();
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "Batched while loop with batch size "
+                          << info.batchSize << "\n");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // --iree-stream-fuse-loop-iteration-execution
 //===----------------------------------------------------------------------===//
 
 struct FuseLoopIterationExecutionPass
     : public IREE::Stream::impl::FuseLoopIterationExecutionPassBase<
           FuseLoopIterationExecutionPass> {
+  using IREE::Stream::impl::FuseLoopIterationExecutionPassBase<
+      FuseLoopIterationExecutionPass>::FuseLoopIterationExecutionPassBase;
+
   void runOnOperation() override {
     mlir::CallableOpInterface parentOp = getOperation();
     if (!parentOp.getCallableRegion() ||
@@ -511,8 +863,21 @@ struct FuseLoopIterationExecutionPass
 
     auto &region = *parentOp.getCallableRegion();
 
-    // Collect scf.for ops to fuse. We process inner-most loops first
-    // (post-order) to handle nested loops correctly.
+    // Phase 1: Batch scf.while loops by wrapping their body in an inner
+    // scf.for. This creates fusible for-loops that Phase 2 will handle.
+    SmallVector<scf::WhileOp> whileOps;
+    region.walk([&](scf::WhileOp whileOp) { whileOps.push_back(whileOp); });
+
+    for (auto whileOp : whileOps) {
+      auto info = analyzeWhileFusion(whileOp, whileBatchSize);
+      if (!info)
+        continue;
+
+      (void)batchWhileLoop(*info);
+    }
+
+    // Phase 2: Fuse scf.for loops (both original and batched inner loops).
+    // Process inner-most loops first (post-order).
     SmallVector<scf::ForOp> forOps;
     region.walk([&](scf::ForOp forOp) { forOps.push_back(forOp); });
 
