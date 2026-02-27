@@ -408,3 +408,60 @@ util.func public @multipleCarries(%init_a: !stream.resource<*>, %init_b: !stream
 
   util.return %result_a, %result_b : !stream.resource<*>, !stream.resource<*>
 }
+
+// -----
+
+// Tests fusion with i32 induction variable (from StableHLO lowering of
+// stablehlo.while). The loop body uses arith.index_castui to convert the
+// i32 IV to index for offset computation. The fused constants must preserve
+// the i32 type to avoid invalid index→index casts.
+
+stream.executable private @i32_iv_kernel {
+  stream.executable.export public @entry
+  builtin.module {
+    func.func @entry(%arg0: !stream.binding, %arg1: !stream.binding) {
+      return
+    }
+  }
+}
+
+// CHECK-LABEL: @i32InductionVariable
+util.func public @i32InductionVariable(%init: !stream.resource<*>, %buf: !stream.resource<*>) -> !stream.resource<*> {
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i32 = arith.constant 1 : i32
+  %c3_i32 = arith.constant 3 : i32
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %c9 = arith.constant 9 : index
+  %c40 = arith.constant 40 : index
+
+  // CHECK-NOT: scf.for
+  // CHECK: stream.async.execute
+  // Three dispatches (trip count = 3)
+  // CHECK: stream.async.dispatch @i32_iv_kernel::@entry
+  // CHECK: stream.async.dispatch @i32_iv_kernel::@entry
+  // CHECK: stream.async.dispatch @i32_iv_kernel::@entry
+  // CHECK: stream.yield
+  // CHECK: stream.timepoint.await
+
+  %result = scf.for %i = %c0_i32 to %c3_i32 step %c1_i32 iter_args(%carry = %init) -> !stream.resource<*> : i32 {
+    %idx = arith.index_castui %i : i32 to index
+    %offset = arith.minui %idx, %c9 : index
+    %start = arith.muli %offset, %c4 : index
+    %end = arith.addi %start, %c4 : index
+    %exec_result, %tp = stream.async.execute
+        with(%carry as %arg0: !stream.resource<*>{%c4},
+             %buf as %arg1: !stream.resource<*>{%c40})
+        -> !stream.resource<*>{%c4} {
+      %d = stream.async.dispatch @i32_iv_kernel::@entry[%c1](
+          %arg0[%c0 to %c4 for %c4],
+          %arg1[%start to %end for %c4]) : (!stream.resource<*>{%c4}, !stream.resource<*>{%c4}) -> !stream.resource<*>{%c4}
+      stream.yield %d : !stream.resource<*>{%c4}
+    } => !stream.timepoint
+    %awaited = stream.timepoint.await %tp => %exec_result : !stream.resource<*>{%c4}
+    scf.yield %awaited : !stream.resource<*>
+  }
+
+  util.return %result : !stream.resource<*>
+}

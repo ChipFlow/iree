@@ -345,9 +345,18 @@ static LogicalResult fuseForLoop(LoopFusionInfo &info) {
     builder.setInsertionPoint(fusedExec);
 
     // Create constant for this iteration's induction variable value.
+    // Must match the original induction variable type (may be i32, i64,
+    // or index depending on the frontend lowering).
     int64_t inductionVal = info.lowerBound + k * info.step;
-    Value inductionConst =
-        arith::ConstantIndexOp::create(builder, loc, inductionVal);
+    Value inductionConst;
+    Type ivType = forOp.getInductionVar().getType();
+    if (isa<IndexType>(ivType)) {
+      inductionConst =
+          arith::ConstantIndexOp::create(builder, loc, inductionVal);
+    } else {
+      inductionConst = arith::ConstantOp::create(
+          builder, loc, builder.getIntegerAttr(ivType, inductionVal));
+    }
 
     // Clone non-execute loop body ops (placed before the fused execute).
     // These compute iteration-dependent values like offsets.
