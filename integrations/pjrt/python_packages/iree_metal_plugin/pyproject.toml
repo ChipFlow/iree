@@ -36,6 +36,12 @@ iree-metal = "jax_plugins.iree_metal"
 # Note: packages and package-data are configured in setup.py
 # because they depend on the cmake build output directory
 
+[dependency-groups]
+dev = [
+    "cmake",
+    "ninja",
+]
+
 [tool.uv.sources]
 # Use patched JAX (path relative to this package)
 jax = { path = "../../../../../jax", editable = true }
