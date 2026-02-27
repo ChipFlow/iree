@@ -287,12 +287,20 @@ def FuseLoopIterationExecutionPass :
     This reduces GPU submission overhead from every iteration to every K
     iterations (default K=32).
 
+    For `scf.for` loops with trip counts exceeding the unroll threshold (128),
+    the loop is split into an outer loop (stepping by batch-size) containing an
+    inner `scf.for` of batch-size iterations. The inner loop is then fused by
+    the existing unrolling logic. Any remainder iterations form a separate
+    small loop that is also fused. This reduces GPU submission overhead from
+    every iteration to every batch-size iterations (default 32).
+
     Handles `scf.for` loops where:
     - Bounds and step are compile-time constants
-    - Trip count is within the unroll threshold (default 128)
     - All loop-carried values (iter_args) are stream resources
     - The loop body contains exactly one `stream.async.execute`
     - The execute results (after await) are the `scf.yield` operands
+    - Trip count <= 128: fully unrolled into a single execute
+    - Trip count > 128: batched into outer/inner loops, then inner is fused
 
     Handles `scf.while` loops where:
     - The "after" (body) region contains exactly one `stream.async.execute`
@@ -310,6 +318,10 @@ def FuseLoopIterationExecutionPass :
     Option<"whileBatchSize", "while-batch-size", "int64_t",
            /*default=*/"32",
            "Number of while loop iterations to batch per GPU submission">,
+    Option<"forBatchSize", "for-batch-size", "int64_t",
+           /*default=*/"32",
+           "Number of for loop iterations to batch when trip count exceeds "
+           "the unroll threshold (128). Set to 0 to disable for-loop batching.">,
   ];
 }
 

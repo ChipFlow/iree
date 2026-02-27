@@ -60,7 +60,11 @@ struct LoopFusionInfo {
 
 // Analyzes an scf.for loop to determine if it can be fused.
 // Returns std::nullopt if the loop cannot be fused.
-static std::optional<LoopFusionInfo> analyzeForFusion(scf::ForOp forOp) {
+// The maxTripCount parameter controls the maximum allowed trip count;
+// loops exceeding this are rejected. Use INT64_MAX to disable the check.
+static std::optional<LoopFusionInfo>
+analyzeForFusion(scf::ForOp forOp,
+                 int64_t maxTripCount = kMaxUnrollIterations) {
   LoopFusionInfo info;
   info.forOp = forOp;
 
@@ -84,10 +88,9 @@ static std::optional<LoopFusionInfo> analyzeForFusion(scf::ForOp forOp) {
     LLVM_DEBUG(llvm::dbgs() << "Trip count <= 1, no fusion needed\n");
     return std::nullopt;
   }
-  if (info.tripCount > kMaxUnrollIterations) {
+  if (info.tripCount > maxTripCount) {
     LLVM_DEBUG(llvm::dbgs() << "Trip count " << info.tripCount
-                            << " exceeds max unroll " << kMaxUnrollIterations
-                            << "\n");
+                            << " exceeds max " << maxTripCount << "\n");
     return std::nullopt;
   }
 
@@ -536,6 +539,188 @@ static LogicalResult fuseForLoop(LoopFusionInfo &info) {
 }
 
 //===----------------------------------------------------------------------===//
+// For-loop batching (large trip counts)
+//===----------------------------------------------------------------------===//
+
+// Batches a large for-loop by splitting it into an outer loop (stepping by
+// batchSize) containing an inner scf.for of batchSize iterations. The inner
+// loop has constant bounds and can be fused by fuseForLoop in Phase 2.
+//
+// Before:
+//   scf.for %i = lb to ub step s iter_args(%carry = %init) {
+//     <body using %i, %carry>
+//     scf.yield %new_carry
+//   }
+//
+// After (assuming tripCount = fullBatches * batchSize + remainder):
+//   %mid = scf.for %outer = lb to (lb + fullBatches*batchSize*s)
+//       step (batchSize*s) iter_args(%carry = %init) {
+//     %batched = scf.for %k = 0 to batchSize step 1
+//         iter_args(%inner_carry = %carry) {
+//       %real_iv = %outer + %k * s
+//       <cloned body using %real_iv, %inner_carry>
+//       scf.yield %cloned_new_carry
+//     }
+//     scf.yield %batched
+//   }
+//   // Remainder (if any):
+//   %final = scf.for %i = (lb + fullBatches*batchSize*s) to ub step s
+//       iter_args(%carry = %mid) {
+//     <cloned body>
+//     scf.yield %cloned_new_carry
+//   }
+static LogicalResult batchForLoop(LoopFusionInfo &info, int64_t batchSize) {
+  scf::ForOp origFor = info.forOp;
+  Block *origBody = origFor.getBody();
+  Location loc = origFor.getLoc();
+
+  // Cap batchSize at the unroll limit so the inner for can be fused.
+  batchSize = std::min(batchSize, kMaxUnrollIterations);
+  assert(batchSize >= 2 && "batchSize must be >= 2");
+  assert(info.tripCount > kMaxUnrollIterations &&
+         "only batch loops that exceed the unroll threshold");
+
+  int64_t fullBatches = info.tripCount / batchSize;
+  int64_t remainder = info.tripCount % batchSize;
+  int64_t outerStep = batchSize * info.step;
+  int64_t outerUB = info.lowerBound + fullBatches * outerStep;
+
+  OpBuilder builder(origFor);
+  Type ivType = origFor.getInductionVar().getType();
+
+  // Helper to create typed constants (matching the original IV type).
+  auto makeConst = [&](OpBuilder &b, int64_t val) -> Value {
+    if (isa<IndexType>(ivType))
+      return arith::ConstantIndexOp::create(b, loc, val);
+    return arith::ConstantOp::create(b, loc, b.getIntegerAttr(ivType, val));
+  };
+
+  // Create outer for loop: lb to outerUB step outerStep.
+  Value outerLB = makeConst(builder, info.lowerBound);
+  Value outerUBVal = makeConst(builder, outerUB);
+  Value outerStepVal = makeConst(builder, outerStep);
+
+  auto outerFor = scf::ForOp::create(
+      builder, loc, outerLB, outerUBVal, outerStepVal, origFor.getInitArgs(),
+      [&](OpBuilder &b, Location l, Value /*outerIV*/, ValueRange iterArgs) {
+        scf::YieldOp::create(b, l, iterArgs); // placeholder
+      });
+
+  Block *outerBody = outerFor.getBody();
+  Value outerIV = outerFor.getInductionVar();
+
+  // Create inner for inside outer body (before the placeholder yield).
+  OpBuilder outerBuilder = OpBuilder::atBlockTerminator(outerBody);
+  Value c0 = makeConst(outerBuilder, 0);
+  Value cBatch = makeConst(outerBuilder, batchSize);
+  Value c1 = makeConst(outerBuilder, 1);
+
+  auto innerFor = scf::ForOp::create(
+      outerBuilder, loc, c0, cBatch, c1,
+      SmallVector<Value>(outerFor.getRegionIterArgs()),
+      [&](OpBuilder &b, Location l, Value /*k*/, ValueRange iterArgs) {
+        scf::YieldOp::create(b, l, iterArgs); // placeholder
+      });
+
+  Block *innerBody = innerFor.getBody();
+  Value k = innerFor.getInductionVar();
+
+  // Compute real IV inside inner body: real_iv = outer + k * step.
+  OpBuilder innerBuilder = OpBuilder::atBlockTerminator(innerBody);
+  Value realIV;
+  if (info.step == 1) {
+    realIV = arith::AddIOp::create(innerBuilder, loc, outerIV, k);
+  } else {
+    Value stepConst = makeConst(innerBuilder, info.step);
+    Value offset = arith::MulIOp::create(innerBuilder, loc, k, stepConst);
+    realIV = arith::AddIOp::create(innerBuilder, loc, outerIV, offset);
+  }
+
+  // Clone original body ops into inner body, remapping IV and iter_args.
+  IRMapping innerMapping;
+  innerMapping.map(origFor.getInductionVar(), realIV);
+  for (auto [origArg, innerArg] :
+       llvm::zip(origFor.getRegionIterArgs(), innerFor.getRegionIterArgs()))
+    innerMapping.map(origArg, innerArg);
+
+  SmallVector<Value> innerYieldValues;
+  for (auto &op : *origBody) {
+    if (auto yieldOp = dyn_cast<scf::YieldOp>(&op)) {
+      for (auto val : yieldOp.getOperands())
+        innerYieldValues.push_back(innerMapping.lookupOrDefault(val));
+      continue;
+    }
+    innerBuilder.clone(op, innerMapping);
+  }
+
+  // Replace inner placeholder yield.
+  auto innerPlaceholderYield = cast<scf::YieldOp>(innerBody->getTerminator());
+  innerBuilder.setInsertionPoint(innerPlaceholderYield);
+  scf::YieldOp::create(innerBuilder, loc, innerYieldValues);
+  innerPlaceholderYield.erase();
+
+  // Replace outer placeholder yield with inner for results.
+  auto outerPlaceholderYield = cast<scf::YieldOp>(outerBody->getTerminator());
+  outerBuilder.setInsertionPoint(outerPlaceholderYield);
+  scf::YieldOp::create(outerBuilder, loc, innerFor.getResults());
+  outerPlaceholderYield.erase();
+
+  // Handle remainder iterations (if any).
+  if (remainder > 0) {
+    builder.setInsertionPointAfter(outerFor);
+    Value remLB = makeConst(builder, outerUB);
+    Value remUB = origFor.getUpperBound();
+    Value remStep = origFor.getStep();
+
+    auto remFor = scf::ForOp::create(
+        builder, loc, remLB, remUB, remStep,
+        SmallVector<Value>(outerFor.getResults()),
+        [&](OpBuilder &b, Location l, Value /*iv*/, ValueRange iterArgs) {
+          scf::YieldOp::create(b, l, iterArgs); // placeholder
+        });
+
+    Block *remBody = remFor.getBody();
+    OpBuilder remBuilder = OpBuilder::atBlockTerminator(remBody);
+
+    IRMapping remMapping;
+    remMapping.map(origFor.getInductionVar(), remFor.getInductionVar());
+    for (auto [origArg, remArg] :
+         llvm::zip(origFor.getRegionIterArgs(), remFor.getRegionIterArgs()))
+      remMapping.map(origArg, remArg);
+
+    SmallVector<Value> remYieldValues;
+    for (auto &op : *origBody) {
+      if (auto yieldOp = dyn_cast<scf::YieldOp>(&op)) {
+        for (auto val : yieldOp.getOperands())
+          remYieldValues.push_back(remMapping.lookupOrDefault(val));
+        continue;
+      }
+      remBuilder.clone(op, remMapping);
+    }
+
+    auto remPlaceholderYield = cast<scf::YieldOp>(remBody->getTerminator());
+    remBuilder.setInsertionPoint(remPlaceholderYield);
+    scf::YieldOp::create(remBuilder, loc, remYieldValues);
+    remPlaceholderYield.erase();
+
+    origFor.replaceAllUsesWith(remFor.getResults());
+  } else {
+    origFor.replaceAllUsesWith(outerFor.getResults());
+  }
+
+  origFor.erase();
+
+  LLVM_DEBUG(llvm::dbgs() << "Batched for loop (trip count " << info.tripCount
+                          << ") into batches of " << batchSize << " ("
+                          << fullBatches << " full batches"
+                          << (remainder > 0 ? ", remainder " +
+                                                  std::to_string(remainder)
+                                            : "")
+                          << ")\n");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // While-loop batching
 //===----------------------------------------------------------------------===//
 
@@ -876,8 +1061,29 @@ struct FuseLoopIterationExecutionPass
       (void)batchWhileLoop(*info);
     }
 
+    // Phase 1.5: Batch large scf.for loops by splitting them into
+    // outer/inner loops. This creates fusible inner for-loops that Phase 2
+    // will handle.
+    if (forBatchSize >= 2) {
+      SmallVector<scf::ForOp> largeForOps;
+      region.walk(
+          [&](scf::ForOp forOp) { largeForOps.push_back(forOp); });
+
+      for (auto forOp : largeForOps) {
+        // Analyze with no trip count limit.
+        auto info = analyzeForFusion(forOp, INT64_MAX);
+        if (!info)
+          continue;
+        // Only batch loops that exceed the unroll threshold.
+        if (info->tripCount <= kMaxUnrollIterations)
+          continue;
+
+        (void)batchForLoop(*info, forBatchSize);
+      }
+    }
+
     // Phase 2: Fuse scf.for loops (both original and batched inner loops).
-    // Process inner-most loops first (post-order).
+    // Re-walk because Phase 1.5 may have created new inner for-loops.
     SmallVector<scf::ForOp> forOps;
     region.walk([&](scf::ForOp forOp) { forOps.push_back(forOp); });
 

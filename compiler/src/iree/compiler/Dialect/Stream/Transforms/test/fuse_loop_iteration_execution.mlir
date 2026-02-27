@@ -237,16 +237,34 @@ util.func public @fusionWithExternalTimepoint(%init: !stream.resource<*>, %xs: !
 // -----
 
 // Tests that loops with trip count exceeding the max unroll threshold (128)
-// are NOT fused.
+// are batched and fully fused via cascading:
+// 1. Phase 1.5 splits 200 iters into outer (6 x 32) + remainder (8)
+// 2. Phase 2 fuses inner for (32 dispatches), then outer for (6 iters, ≤128)
+//    also gets fused, yielding a single execute with 192 dispatches
+// 3. Remainder (8 iters) fuses into a second execute with 8 dispatches
 
-// CHECK-LABEL: @largeTripCountNotFused
-util.func public @largeTripCountNotFused(%init: !stream.resource<*>) -> !stream.resource<*> {
+// CHECK-LABEL: @largeTripCountBatched
+util.func public @largeTripCountBatched(%init: !stream.resource<*>) -> !stream.resource<*> {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c4 = arith.constant 4 : index
   %c200 = arith.constant 200 : index
 
-  // CHECK: scf.for
+  // No scf.for remains (both outer and inner are cascadingly fused).
+  // CHECK-NOT: scf.for
+  // First fused execute (192 dispatches from 6 batches of 32):
+  // CHECK: stream.async.execute
+  // CHECK: stream.async.dispatch @dispatch::@entry
+  // CHECK: stream.async.dispatch @dispatch::@entry
+  // CHECK: stream.yield
+  // CHECK: stream.timepoint.await
+  // Second fused execute (8 remainder dispatches):
+  // CHECK: stream.async.execute
+  // CHECK: stream.async.dispatch @dispatch::@entry
+  // CHECK: stream.async.dispatch @dispatch::@entry
+  // CHECK: stream.yield
+  // CHECK: stream.timepoint.await
+
   %result = scf.for %i = %c0 to %c200 step %c1 iter_args(%carry = %init) -> !stream.resource<*> {
     %exec_result, %tp = stream.async.execute
         with(%carry as %arg0: !stream.resource<*>{%c4})
@@ -630,6 +648,142 @@ util.func public @outerOpUsesIterArgNotFused(%init: !stream.resource<*>) -> !str
       stream.yield %d : !stream.resource<*>{%size}
     } => !stream.timepoint
     %awaited = stream.timepoint.await %tp => %exec_result : !stream.resource<*>{%size}
+    scf.yield %awaited : !stream.resource<*>
+  }
+
+  util.return %result : !stream.resource<*>
+}
+
+// -----
+
+// Tests that for-loop batching works when trip count is an exact multiple of
+// batch size (no remainder). 256 / 32 = 8 full batches, 0 remainder.
+// 8 ≤ 128, so cascading fusion produces a single execute with 256 dispatches.
+
+// CHECK-LABEL: @largeTripCountNoRemainder
+util.func public @largeTripCountNoRemainder(%init: !stream.resource<*>) -> !stream.resource<*> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %c256 = arith.constant 256 : index
+
+  // No scf.for remains (cascading fusion).
+  // CHECK-NOT: scf.for
+  // Single fused execute with 256 dispatches, no remainder.
+  // CHECK: stream.async.execute
+  // CHECK: stream.async.dispatch @dispatch::@entry
+  // CHECK: stream.async.dispatch @dispatch::@entry
+  // CHECK: stream.yield
+  // CHECK: stream.timepoint.await
+  // No remainder execute.
+  // CHECK-NOT: stream.async.execute
+
+  %result = scf.for %i = %c0 to %c256 step %c1 iter_args(%carry = %init) -> !stream.resource<*> {
+    %exec_result, %tp = stream.async.execute
+        with(%carry as %arg0: !stream.resource<*>{%c4})
+        -> !stream.resource<*>{%c4} {
+      %d = stream.async.dispatch @dispatch::@entry[%c1](
+          %arg0[%c0 to %c4 for %c4]) : (!stream.resource<*>{%c4}) -> !stream.resource<*>{%c4}
+      stream.yield %d : !stream.resource<*>{%c4}
+    } => !stream.timepoint
+    %awaited = stream.timepoint.await %tp => %exec_result : !stream.resource<*>{%c4}
+    scf.yield %awaited : !stream.resource<*>
+  }
+
+  util.return %result : !stream.resource<*>
+}
+
+// -----
+
+// Tests for-loop batching with non-unit step. Trip count 200 (400/2),
+// batch size 32, fullBatches=6, remainder=8. Outer step = 32 * 2 = 64.
+// Cascading fusion: 6 ≤ 128, so outer also fuses. Result: 192 + 8 dispatches.
+
+// CHECK-LABEL: @largeTripCountNonUnitStep
+util.func public @largeTripCountNonUnitStep(%init: !stream.resource<*>) -> !stream.resource<*> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %c4 = arith.constant 4 : index
+  %c400 = arith.constant 400 : index
+
+  // No scf.for remains (cascading fusion).
+  // CHECK-NOT: scf.for
+  // First fused execute (192 dispatches):
+  // CHECK: stream.async.execute
+  // CHECK: stream.async.dispatch @dispatch::@entry
+  // CHECK: stream.async.dispatch @dispatch::@entry
+  // CHECK: stream.yield
+  // CHECK: stream.timepoint.await
+  // Remainder execute (8 dispatches):
+  // CHECK: stream.async.execute
+  // CHECK: stream.async.dispatch @dispatch::@entry
+  // CHECK: stream.yield
+  // CHECK: stream.timepoint.await
+
+  %result = scf.for %i = %c0 to %c400 step %c2 iter_args(%carry = %init) -> !stream.resource<*> {
+    %exec_result, %tp = stream.async.execute
+        with(%carry as %arg0: !stream.resource<*>{%c4})
+        -> !stream.resource<*>{%c4} {
+      %d = stream.async.dispatch @dispatch::@entry[%c1](
+          %arg0[%c0 to %c4 for %c4]) : (!stream.resource<*>{%c4}) -> !stream.resource<*>{%c4}
+      stream.yield %d : !stream.resource<*>{%c4}
+    } => !stream.timepoint
+    %awaited = stream.timepoint.await %tp => %exec_result : !stream.resource<*>{%c4}
+    scf.yield %awaited : !stream.resource<*>
+  }
+
+  util.return %result : !stream.resource<*>
+}
+
+// -----
+
+// Tests for-loop batching with very large trip count where the outer loop
+// has more than 128 batches and cannot be cascadingly fused. Trip count
+// 5000, batch 32: fullBatches=156 (>128), remainder=8.
+// The outer for (156 iters) remains as a loop, each iteration containing
+// a fused execute with 32 dispatches.
+
+stream.executable private @large_kernel {
+  stream.executable.export public @entry
+  builtin.module {
+    func.func @entry(%arg0: !stream.binding, %arg1: !stream.binding) {
+      return
+    }
+  }
+}
+
+// CHECK-LABEL: @veryLargeTripCountBatched
+util.func public @veryLargeTripCountBatched(%init: !stream.resource<*>) -> !stream.resource<*> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %c5000 = arith.constant 5000 : index
+
+  // Outer for loop remains (156 iters > 128, not fused).
+  // CHECK: scf.for
+  // Inside: fused execute with 32 dispatches (inner loop was fused).
+  // CHECK: stream.async.execute
+  // CHECK: stream.async.dispatch @large_kernel::@entry
+  // CHECK: stream.async.dispatch @large_kernel::@entry
+  // CHECK: stream.yield
+  // CHECK: stream.timepoint.await
+  // CHECK: scf.yield
+  // After the outer for: remainder (8 iters) fused into one execute.
+  // CHECK: stream.async.execute
+  // CHECK: stream.async.dispatch @large_kernel::@entry
+  // CHECK: stream.yield
+  // CHECK: stream.timepoint.await
+
+  %result = scf.for %i = %c0 to %c5000 step %c1 iter_args(%carry = %init) -> !stream.resource<*> {
+    %exec_result, %tp = stream.async.execute
+        with(%carry as %arg0: !stream.resource<*>{%c4})
+        -> !stream.resource<*>{%c4} {
+      %d = stream.async.dispatch @large_kernel::@entry[%c1](
+          %arg0[%c0 to %c4 for %c4]) : (!stream.resource<*>{%c4}) -> !stream.resource<*>{%c4}
+      stream.yield %d : !stream.resource<*>{%c4}
+    } => !stream.timepoint
+    %awaited = stream.timepoint.await %tp => %exec_result : !stream.resource<*>{%c4}
     scf.yield %awaited : !stream.resource<*>
   }
 
