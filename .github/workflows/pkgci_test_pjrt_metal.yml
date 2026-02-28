@@ -153,6 +153,92 @@ jobs:
             echo "Some differential tests failed (possibly due to VM GPU limitations)"
           fi
 
+      - name: Run Metal vs CPU benchmarks
+        run: |
+          cd integrations/pjrt/test
+          echo "Running Metal vs CPU performance benchmarks..."
+          JAX_PLATFORMS=cpu,iree_metal uv run python bench_metal_vs_cpu.py \
+            --num-iterations 5 --sizes small --skip-sparse --output json \
+            > /tmp/bench_results.json 2>/tmp/bench_stderr.log \
+            || echo "Benchmarks failed (see stderr log)"
+          cat /tmp/bench_stderr.log || true
+
+      - name: Generate benchmark summary
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
+          results_path = "/tmp/bench_results.json"
+
+          if not os.path.exists(results_path) or os.path.getsize(results_path) == 0:
+              with open(summary_file, "a") as f:
+                  f.write("## Metal vs CPU Benchmark\n\n")
+                  f.write("> Benchmark did not produce results (possibly VM GPU limitation)\n\n")
+              sys.exit(0)
+
+          with open(results_path) as f:
+              data = json.load(f)
+
+          results = data.get("results", [])
+          if not results:
+              with open(summary_file, "a") as f:
+                  f.write("## Metal vs CPU Benchmark\n\nNo results.\n\n")
+              sys.exit(0)
+
+          lines = []
+          lines.append("## Metal vs CPU Benchmark\n")
+          lines.append(f"**Platform:** {data.get('platform', 'unknown')} "
+                        f"| **Iterations:** {data.get('num_iterations', '?')} "
+                        f"| **Preset:** {data.get('sizes_preset', '?')}\n")
+          lines.append("| Operation | Size | CPU (ms) | Metal (ms) | Speedup |")
+          lines.append("|-----------|------|----------|------------|---------|")
+
+          metal_faster = 0
+          total = 0
+          max_speedup = 0.0
+          max_label = ""
+
+          for r in results:
+              op = r["operation"]
+              size = r["size"]
+              cpu_ms = r.get("cpu_median_ms")
+              metal_ms = r.get("metal_median_ms")
+              speedup = r.get("speedup")
+
+              cpu_str = f"{cpu_ms:.2f}" if cpu_ms is not None else "error"
+              metal_str = f"{metal_ms:.2f}" if metal_ms is not None else "error"
+
+              if speedup is not None:
+                  total += 1
+                  sp_str = f"{speedup:.1f}x"
+                  if speedup > 1.0:
+                      metal_faster += 1
+                      sp_str = f"**{sp_str}**"
+                  if speedup > max_speedup:
+                      max_speedup = speedup
+                      max_label = f"{op} {size}"
+              else:
+                  sp_str = "n/a"
+
+              lines.append(f"| {op} | {size} | {cpu_str} | {metal_str} | {sp_str} |")
+
+          lines.append("")
+          if total > 0:
+              summary = f"Metal faster in **{metal_faster}/{total}** benchmarks"
+              if max_speedup > 1.0:
+                  summary += f", max speedup **{max_speedup:.1f}x** ({max_label})"
+              lines.append(summary + "\n")
+
+          with open(summary_file, "a") as f:
+              f.write("\n".join(lines))
+
+          # Also print table to logs
+          for line in lines:
+              print(line)
+          PYEOF
+
       - name: Apply IREE Metal patches to JAX tests
         run: |
           cd ${{ github.workspace }}/../jax
@@ -193,11 +279,12 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: jax-test-results
+          name: test-and-bench-results
           path: |
             /tmp/jaxtest_output.txt
             /tmp/metal_passing.txt
             /tmp/metal_failing.txt
+            /tmp/bench_results.json
           retention-days: 7
 
       - name: Post to Discord on Failure
