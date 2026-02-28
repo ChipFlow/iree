@@ -45,8 +45,8 @@ dev = [
 [tool.uv.sources]
 # Use patched JAX (path relative to this package)
 jax = { path = "../../../../../jax", editable = true }
-# Use local IREE compiler build (includes Shardy support for JAX 0.8.2+)
-iree-base-compiler = { path = "../../../../compiler", editable = true }
+# Workspace member — resolved by root pyproject.toml
+iree-base-compiler = { workspace = true }
 
 [tool.uv]
 # Rebuild when setup.py changes (contains cmake args) or cmake env vars change

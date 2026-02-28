@@ -1,0 +1,46 @@
+[project]
+name = "iree-metal-dev"
+version = "0.0.0"
+description = "IREE Metal development workspace"
+requires-python = ">=3.11"
+# Test/dev dependencies live here; workspace members provide the actual packages
+dependencies = [
+    "iree-pjrt-plugin-metal",
+    "numpy",
+    "scipy",
+    "pytest",
+    "hypothesis",
+    "absl-py",
+]
+
+[tool.uv.workspace]
+members = [
+    "compiler",
+    "integrations/pjrt/python_packages/iree_metal_plugin",
+]
+
+[tool.uv.sources]
+iree-base-compiler = { workspace = true }
+iree-pjrt-plugin-metal = { workspace = true }
+# Use patched JAX from sibling directory
+jax = { path = "../jax", editable = true }
+
+[tool.uv.extra-build-variables.iree-base-compiler]
+# Enable ccache for the IREE compiler build (triggered by editable install)
+CMAKE_C_COMPILER_LAUNCHER = "ccache"
+CMAKE_CXX_COMPILER_LAUNCHER = "ccache"
+
+[tool.uv.extra-build-variables.iree-pjrt-plugin-metal]
+# Enable ccache for native builds of the PJRT plugin
+CMAKE_C_COMPILER_LAUNCHER = "ccache"
+CMAKE_CXX_COMPILER_LAUNCHER = "ccache"
+
+[tool.uv]
+# Rebuild when setup.py changes or cmake env vars change
+cache-keys = [
+    { file = "compiler/setup.py" },
+    { file = "integrations/pjrt/python_packages/_setup_support/iree_pjrt_setup.py" },
+    { env = "CMAKE_C_COMPILER_LAUNCHER" },
+    { env = "CMAKE_CXX_COMPILER_LAUNCHER" },
+    { env = "IREE_CMAKE_BUILD_TYPE" },
+]
