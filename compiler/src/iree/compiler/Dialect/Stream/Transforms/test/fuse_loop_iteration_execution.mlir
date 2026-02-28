@@ -753,33 +753,119 @@ stream.executable private @large_kernel {
   }
 }
 
+// 2000 iters with batch_size=32: 62 outer iterations. Inner loops are
+// fused (32 dispatches). Outer loop has 62 iterations * 32 dispatches =
+// 1984 <= 2048 limit, so cascading fusion eliminates both loops.
+
+// CHECK-LABEL: @largeTripCountCascaded
+// CHECK-NOT: scf.for
+// All 2000 dispatches in a single fused execute (cascaded).
+// CHECK: stream.async.execute
+// CHECK: stream.async.dispatch @large_kernel::@entry
+// CHECK: stream.async.dispatch @large_kernel::@entry
+// CHECK: stream.yield
+// CHECK: stream.timepoint.await
+
+util.func public @largeTripCountCascaded(%init: !stream.resource<*>) -> !stream.resource<*> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %c2000 = arith.constant 2000 : index
+
+  %result = scf.for %i = %c0 to %c2000 step %c1 iter_args(%carry = %init) -> !stream.resource<*> {
+    %exec_result, %tp = stream.async.execute
+        with(%carry as %arg0: !stream.resource<*>{%c4})
+        -> !stream.resource<*>{%c4} {
+      %d = stream.async.dispatch @large_kernel::@entry[%c1](
+          %arg0[%c0 to %c4 for %c4]) : (!stream.resource<*>{%c4}) -> !stream.resource<*>{%c4}
+      stream.yield %d : !stream.resource<*>{%c4}
+    } => !stream.timepoint
+    %awaited = stream.timepoint.await %tp => %exec_result : !stream.resource<*>{%c4}
+    scf.yield %awaited : !stream.resource<*>
+  }
+
+  util.return %result : !stream.resource<*>
+}
+
+// -----
+
+// 5000 iters with batch_size=32: 156 outer iterations, each inner loop
+// has 32 iterations. Inner loops are fused (32 dispatches <= 2048 limit).
+// Outer loop has 156 iterations * 32 dispatches = 4992 > 2048, so it's
+// NOT fused (dispatch limit prevents cascading).
+
 // CHECK-LABEL: @veryLargeTripCountBatched
+// Outer for loop remains (156*32=4992 dispatches would exceed limit).
+// CHECK: scf.for
+// Inside: fused execute with 32 dispatches (inner loop was fused).
+// CHECK: stream.async.execute
+// CHECK: stream.async.dispatch @large_kernel::@entry
+// CHECK: stream.async.dispatch @large_kernel::@entry
+// CHECK: stream.yield
+// CHECK: stream.timepoint.await
+// CHECK: scf.yield
+// After the outer for: remainder (8 iters) fused into one execute.
+// CHECK: stream.async.execute
+// CHECK: stream.async.dispatch @large_kernel::@entry
+// CHECK: stream.yield
+// CHECK: stream.timepoint.await
+
 util.func public @veryLargeTripCountBatched(%init: !stream.resource<*>) -> !stream.resource<*> {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c4 = arith.constant 4 : index
   %c5000 = arith.constant 5000 : index
 
-  // Outer for loop remains (156 iters > 128, not fused).
-  // CHECK: scf.for
-  // Inside: fused execute with 32 dispatches (inner loop was fused).
-  // CHECK: stream.async.execute
-  // CHECK: stream.async.dispatch @large_kernel::@entry
-  // CHECK: stream.async.dispatch @large_kernel::@entry
-  // CHECK: stream.yield
-  // CHECK: stream.timepoint.await
-  // CHECK: scf.yield
-  // After the outer for: remainder (8 iters) fused into one execute.
-  // CHECK: stream.async.execute
-  // CHECK: stream.async.dispatch @large_kernel::@entry
-  // CHECK: stream.yield
-  // CHECK: stream.timepoint.await
-
   %result = scf.for %i = %c0 to %c5000 step %c1 iter_args(%carry = %init) -> !stream.resource<*> {
     %exec_result, %tp = stream.async.execute
         with(%carry as %arg0: !stream.resource<*>{%c4})
         -> !stream.resource<*>{%c4} {
       %d = stream.async.dispatch @large_kernel::@entry[%c1](
+          %arg0[%c0 to %c4 for %c4]) : (!stream.resource<*>{%c4}) -> !stream.resource<*>{%c4}
+      stream.yield %d : !stream.resource<*>{%c4}
+    } => !stream.timepoint
+    %awaited = stream.timepoint.await %tp => %exec_result : !stream.resource<*>{%c4}
+    scf.yield %awaited : !stream.resource<*>
+  }
+
+  util.return %result : !stream.resource<*>
+}
+
+// -----
+
+// Trip count 20000 with batch_size=32: 625 outer iterations. Inner loops
+// are fused (32 dispatches <= 2048). Outer loop (625*32=20000 > 2048) is
+// NOT fused. Same pattern as 5000 case but larger.
+
+stream.executable private @very_large_kernel {
+  stream.executable.export public @entry
+  builtin.module {
+    func.func @entry(%arg0: !stream.binding, %arg1: !stream.binding, %arg2: !stream.binding) {
+      return
+    }
+  }
+}
+
+// CHECK-LABEL: @veryLargeTripCountNotCascaded
+// CHECK: scf.for
+// CHECK: stream.async.execute
+// CHECK: stream.async.dispatch @very_large_kernel::@entry
+// CHECK: stream.async.dispatch @very_large_kernel::@entry
+// CHECK: stream.yield
+// CHECK: stream.timepoint.await
+// CHECK: scf.yield
+
+util.func public @veryLargeTripCountNotCascaded(%init: !stream.resource<*>) -> !stream.resource<*> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %c20000 = arith.constant 20000 : index
+
+  %result = scf.for %i = %c0 to %c20000 step %c1 iter_args(%carry = %init) -> !stream.resource<*> {
+    %exec_result, %tp = stream.async.execute
+        with(%carry as %arg0: !stream.resource<*>{%c4})
+        -> !stream.resource<*>{%c4} {
+      %d = stream.async.dispatch @very_large_kernel::@entry[%c1](
           %arg0[%c0 to %c4 for %c4]) : (!stream.resource<*>{%c4}) -> !stream.resource<*>{%c4}
       stream.yield %d : !stream.resource<*>{%c4}
     } => !stream.timepoint

@@ -33,6 +33,10 @@ namespace {
 // Beyond this threshold, the IR size becomes prohibitive.
 static constexpr int64_t kMaxUnrollIterations = 128;
 
+// Default maximum number of async.dispatch ops allowed in a single fused
+// execute region. Overridable via --max-dispatches-per-execute pass option.
+static constexpr int64_t kDefaultMaxDispatchesPerExecute = 2048;
+
 // Analysis result for a fusible scf.for loop.
 struct LoopFusionInfo {
   scf::ForOp forOp;
@@ -292,11 +296,31 @@ getYieldToIterArgMapping(LoopFusionInfo &info) {
 }
 
 // Performs the loop fusion transformation.
-static LogicalResult fuseForLoop(LoopFusionInfo &info) {
+static LogicalResult fuseForLoop(LoopFusionInfo &info,
+                                 int64_t maxDispatchesPerExecute) {
   scf::ForOp forOp = info.forOp;
   IREE::Stream::AsyncExecuteOp origExec = info.executeOp;
   Block *loopBody = forOp.getBody();
   Block &origExecBody = origExec.getBody().front();
+
+  // Check that fusing wouldn't produce too many dispatches in the resulting
+  // execute region. This prevents cascading fusion from creating monster
+  // executes when the body already contains many dispatches (e.g., from a
+  // previously fused inner loop).
+  int64_t dispatchCount = 0;
+  origExec.getBody().walk(
+      [&](IREE::Stream::AsyncDispatchOp) { ++dispatchCount; });
+  if (dispatchCount == 0)
+    dispatchCount = 1; // Conservative: count the execute itself.
+  int64_t totalDispatches = info.tripCount * dispatchCount;
+  if (totalDispatches > maxDispatchesPerExecute) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "Fusing would create " << totalDispatches << " dispatches ("
+               << info.tripCount << " iterations * " << dispatchCount
+               << " dispatches/iter), exceeding limit "
+               << maxDispatchesPerExecute << "\n");
+    return failure();
+  }
 
   OpBuilder builder(forOp);
   Location loc = forOp.getLoc();
@@ -1092,7 +1116,7 @@ struct FuseLoopIterationExecutionPass
       if (!info)
         continue;
 
-      (void)fuseForLoop(*info);
+      (void)fuseForLoop(*info, maxDispatchesPerExecute);
     }
   }
 };

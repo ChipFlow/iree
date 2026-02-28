@@ -322,6 +322,11 @@ def FuseLoopIterationExecutionPass :
            /*default=*/"32",
            "Number of for loop iterations to batch when trip count exceeds "
            "the unroll threshold (128). Set to 0 to disable for-loop batching.">,
+    Option<"maxDispatchesPerExecute", "max-dispatches-per-execute", "int64_t",
+           /*default=*/"2048",
+           "Maximum number of async.dispatch ops allowed in a single fused "
+           "execute region. Prevents excessive IR growth and compilation "
+           "timeouts from cascading fusion.">,
   ];
 }
 
