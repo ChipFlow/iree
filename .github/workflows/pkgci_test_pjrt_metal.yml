@@ -70,7 +70,19 @@ jobs:
           restore-keys: |
             ccache-pjrt-metal-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build IREE compiler
+      # Install Python dependencies first (without building workspace packages).
+      # This creates the venv and installs jax, jaxlib, numpy, etc.
+      - name: Install Python dependencies
+        run: |
+          cd integrations/pjrt/test
+          uv sync --no-install-workspace -v
+
+      # Pre-build the IREE compiler with ccache to populate the cache.
+      # uv's build isolation uses a temp venv with a different Python path,
+      # which causes setup.py to nuke the cmake cache and rebuild from scratch.
+      # By building first with ccache, the rebuild inside uv sync gets fast
+      # ccache hits instead of compiling ~8000 files from scratch.
+      - name: Build IREE compiler (populate ccache)
         env:
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -82,20 +94,18 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DIREE_BUILD_COMPILER=ON \
+            -DIREE_BUILD_PYTHON_BINDINGS=ON \
             -DIREE_BUILD_TESTS=OFF \
             -DIREE_BUILD_SAMPLES=OFF
           cmake --build compiler/build/b
 
-      - name: Install compiler Python packages
-        run: |
-          cmake --install compiler/build/b \
-            --prefix compiler/build/i \
-            --component IREECompilerPythonPackages
-
-      - name: Build and sync test environment
+      # Install workspace packages (iree-base-compiler, iree-pjrt-plugin-metal).
+      # uv's build isolation triggers a cmake rebuild, but ccache is enabled
+      # via extra-build-variables so the rebuild is fast (~minutes, not hours).
+      - name: Build and install workspace packages
         run: |
           cd integrations/pjrt/test
-          uv sync -vvv
+          uv sync -v
 
       - name: ccache stats
         run: ccache -s
