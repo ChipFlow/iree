@@ -87,7 +87,12 @@ jobs:
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
-          PYTHON_EXE=$(.venv/bin/python -c "import sys; print(sys.executable)")
+          # IMPORTANT: use python3 (not python) because uv invokes setup.py
+          # via .venv/bin/python3. Since Python 3.11+, sys.executable reflects
+          # the exact symlink used, and setup.py's stamp check is an exact
+          # string match. Using 'python' here would write a stamp that doesn't
+          # match 'python3', causing setup.py to nuke the cmake cache.
+          PYTHON_EXE=$(.venv/bin/python3 -c "import sys; print(sys.executable)")
           cmake -G Ninja -B compiler/build/b -S . \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \
@@ -103,7 +108,7 @@ jobs:
           cmake --build compiler/build/b
           # Write python_stamp.txt so setup.py won't nuke the cmake cache.
           # Format must match compiler/setup.py maybe_nuke_cmake_cache().
-          .venv/bin/python -c "
+          .venv/bin/python3 -c "
           import sys
           try:
               import ninja; ninja_path = ninja.__file__
@@ -121,6 +126,9 @@ jobs:
       # Build deps (setuptools, wheel) must be pre-installed since
       # --no-build-isolation skips [build-system].requires.
       - name: Install workspace packages
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           uv pip install setuptools wheel
           uv sync --no-build-isolation --frozen -v
