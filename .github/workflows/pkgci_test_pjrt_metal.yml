@@ -96,9 +96,14 @@ jobs:
       - name: ccache stats
         run: ccache -s
 
-      - name: Verify installation
+      # Run all tests and benchmarks. Tests run in parallel (backgrounded),
+      # benchmarks run sequentially after tests complete to avoid GPU contention.
+      - name: Run tests and benchmarks
         run: |
           cd integrations/pjrt/test
+
+          # Verify installation (also warms JIT cache for subsequent tests)
+          echo "=== Verifying installation ==="
           uv run python -c "
           import jax
           print(f'JAX version: {jax.__version__}')
@@ -109,50 +114,55 @@ jobs:
           print(f'Metal devices: {jax.devices()}')
           "
 
-      - name: Run Metal PJRT tests
-        run: |
-          cd integrations/pjrt/test
+          # Run tests in parallel (they are short and GPU-safe to overlap)
+          echo "=== Running tests in parallel ==="
 
-          echo "Running Metal-specific tests..."
-          uv run python -m pytest test_metal.py -v || echo "Metal tests failed (possibly due to VM GPU limitations)"
+          (
+            echo "--- Metal PJRT tests ---"
+            uv run python -m pytest test_metal.py -v 2>&1 || echo "Metal tests failed (possibly due to VM GPU limitations)"
+            echo "--- Shardy dialect tests ---"
+            JAX_PLATFORMS=iree_metal uv run python test_shardy.py 2>&1 || echo "Shardy tests failed (possibly due to VM GPU limitations)"
+          ) > /tmp/metal_tests.log 2>&1 &
+          pid_metal=$!
 
-          echo "Running Shardy dialect tests..."
-          JAX_PLATFORMS=iree_metal uv run python test_shardy.py || echo "Shardy tests failed (possibly due to VM GPU limitations)"
+          (
+            echo "--- Comprehensive Metal tests ---"
+            JAX_PLATFORMS=iree_metal uv run python test_metal_comprehensive.py 2>&1 || echo "Some comprehensive tests failed"
+          ) > /tmp/comprehensive_tests.log 2>&1 &
+          pid_comprehensive=$!
 
-      - name: Run comprehensive Metal tests
-        run: |
-          cd integrations/pjrt/test
-          echo "Running comprehensive Metal test suite..."
-          JAX_PLATFORMS=iree_metal uv run python test_metal_comprehensive.py || echo "Some comprehensive tests failed (see summary above)"
-
-      - name: Run differential tests vs CPU
-        run: |
-          cd integrations/pjrt/test
-
-          echo "Running differential tests (Metal vs CPU)..."
-          diff_test_failed=0
-          for test in test_add.py test_simple.py; do
-            echo "Testing ${test}..."
-            expected=$(JAX_PLATFORMS=cpu uv run python ${test}) || { echo "CPU baseline failed for ${test}"; diff_test_failed=1; continue; }
-            actual=$(JAX_PLATFORMS=iree_metal uv run python ${test} 2>&1) || { echo "Metal execution failed for ${test} (possibly VM GPU limitation)"; diff_test_failed=1; continue; }
-            if [ "$expected" != "$actual" ]; then
-              echo "FAIL: Output mismatch for ${test}"
-              echo "Expected: $expected"
-              echo "Actual: $actual"
-              diff_test_failed=1
-            else
-              echo "PASS: ${test}"
+          (
+            echo "--- Differential tests (Metal vs CPU) ---"
+            diff_test_failed=0
+            for test in test_add.py test_simple.py; do
+              echo "Testing ${test}..."
+              expected=$(JAX_PLATFORMS=cpu uv run python ${test}) || { echo "CPU baseline failed for ${test}"; diff_test_failed=1; continue; }
+              actual=$(JAX_PLATFORMS=iree_metal uv run python ${test} 2>&1) || { echo "Metal execution failed for ${test}"; diff_test_failed=1; continue; }
+              if [ "$expected" != "$actual" ]; then
+                echo "FAIL: Output mismatch for ${test}"
+                echo "Expected: $expected"
+                echo "Actual: $actual"
+                diff_test_failed=1
+              else
+                echo "PASS: ${test}"
+              fi
+            done
+            if [ $diff_test_failed -eq 1 ]; then
+              echo "Some differential tests failed (possibly due to VM GPU limitations)"
             fi
-          done
+          ) > /tmp/differential_tests.log 2>&1 &
+          pid_differential=$!
 
-          if [ $diff_test_failed -eq 1 ]; then
-            echo "Some differential tests failed (possibly due to VM GPU limitations)"
-          fi
+          # Wait for all tests to complete
+          wait $pid_metal $pid_comprehensive $pid_differential || true
 
-      - name: Run Metal vs CPU benchmarks
-        run: |
-          cd integrations/pjrt/test
-          echo "Running Metal vs CPU performance benchmarks..."
+          # Print test logs
+          echo ""; echo "=== Metal PJRT Tests ==="; cat /tmp/metal_tests.log
+          echo ""; echo "=== Comprehensive Tests ==="; cat /tmp/comprehensive_tests.log
+          echo ""; echo "=== Differential Tests ==="; cat /tmp/differential_tests.log
+
+          # Benchmarks run sequentially (need exclusive GPU access for accurate timing)
+          echo ""; echo "=== Running benchmarks (sequential) ==="
           JAX_PLATFORMS=cpu,iree_metal uv run python bench_metal_vs_cpu.py \
             --num-iterations 5 --sizes small --skip-sparse --output json \
             > /tmp/bench_results.json 2>/tmp/bench_stderr.log \
