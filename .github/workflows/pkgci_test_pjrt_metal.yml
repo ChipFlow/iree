@@ -71,19 +71,23 @@ jobs:
             ccache-pjrt-metal-${{ runner.os }}-${{ runner.arch }}-
 
       # Install Python dependencies (without building workspace members).
-      # This creates the venv and installs jax, jaxlib, numpy, etc.
+      # --frozen: use committed lockfile as-is, don't re-resolve.
+      #   Without this, any JAX version drift triggers re-resolution,
+      #   which extracts metadata from iree-base-compiler, which runs
+      #   setup.py and does a full cmake build without ccache (~53 min).
       - name: Install Python dependencies
-        run: uv sync --no-install-workspace -v
+        run: uv sync --no-install-workspace --frozen -v
 
-      # Build the IREE compiler with ccache using the venv's Python.
-      # We write python_stamp.txt so setup.py's maybe_nuke_cmake_cache()
-      # recognises this build and won't delete the cache.
+      # Build the IREE compiler directly with cmake + ccache.
+      # IMPORTANT: Use .venv/bin/python NOT `uv run python` — the latter
+      # triggers uv sync which builds workspace members in a temp venv,
+      # polluting CMakeCache.txt with ephemeral ninja/python paths.
       - name: Build IREE compiler
         env:
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
-          PYTHON_EXE=$(uv run python -c "import sys; print(sys.executable)")
+          PYTHON_EXE=$(.venv/bin/python -c "import sys; print(sys.executable)")
           cmake -G Ninja -B compiler/build/b -S . \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang \
@@ -99,7 +103,7 @@ jobs:
           cmake --build compiler/build/b
           # Write python_stamp.txt so setup.py won't nuke the cmake cache.
           # Format must match compiler/setup.py maybe_nuke_cmake_cache().
-          uv run python -c "
+          .venv/bin/python -c "
           import sys
           try:
               import ninja; ninja_path = ninja.__file__
