@@ -70,62 +70,22 @@ jobs:
           restore-keys: |
             ccache-pjrt-metal-${{ runner.os }}-${{ runner.arch }}-
 
-      # Install Python dependencies (without building workspace members).
+      # Install pure-Python dependencies (without building workspace members).
       # --frozen: use committed lockfile as-is, don't re-resolve.
       #   Without this, any JAX version drift triggers re-resolution,
-      #   which extracts metadata from iree-base-compiler, which runs
-      #   setup.py and does a full cmake build without ccache (~53 min).
+      #   which extracts metadata from iree-base-compiler via setup.py,
+      #   doing a full cmake build without ccache (~53 min).
       - name: Install Python dependencies
         run: uv sync --no-install-workspace --frozen -v
 
-      # Build the IREE compiler directly with cmake + ccache.
-      # IMPORTANT: Use .venv/bin/python NOT `uv run python` — the latter
-      # triggers uv sync which builds workspace members in a temp venv,
-      # polluting CMakeCache.txt with ephemeral ninja/python paths.
-      - name: Build IREE compiler
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: ccache
-          CMAKE_CXX_COMPILER_LAUNCHER: ccache
-        run: |
-          # IMPORTANT: use python3 (not python) because uv invokes setup.py
-          # via .venv/bin/python3. Since Python 3.11+, sys.executable reflects
-          # the exact symlink used, and setup.py's stamp check is an exact
-          # string match. Using 'python' here would write a stamp that doesn't
-          # match 'python3', causing setup.py to nuke the cmake cache.
-          PYTHON_EXE=$(.venv/bin/python3 -c "import sys; print(sys.executable)")
-          cmake -G Ninja -B compiler/build/b -S . \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DIREE_BUILD_COMPILER=ON \
-            -DIREE_BUILD_PYTHON_BINDINGS=ON \
-            -DIREE_BUILD_TESTS=OFF \
-            -DIREE_BUILD_SAMPLES=OFF \
-            -DCMAKE_PLATFORM_NO_VERSIONED_SONAME=ON \
-            -DPython3_EXECUTABLE="$PYTHON_EXE"
-          cmake --build compiler/build/b
-          # Write python_stamp.txt so setup.py won't nuke the cmake cache.
-          # Format must match compiler/setup.py maybe_nuke_cmake_cache().
-          .venv/bin/python3 -c "
-          import sys
-          try:
-              import ninja; ninja_path = ninja.__file__
-          except ModuleNotFoundError:
-              ninja_path = ''
-          with open('compiler/build/b/python_stamp.txt', 'w') as f:
-              f.write(f'{sys.executable}\n{ninja_path}')
-          "
-
-      # Install workspace members as editable packages.
-      # --frozen: reuse committed lockfile (avoids JAX version mismatch
-      #   triggering re-resolution → metadata extraction → cmake rebuild).
-      # --no-build-isolation: use venv Python directly so setup.py finds
-      #   the existing cmake build and python_stamp.
+      # Build and install workspace members (compiler + PJRT plugin).
+      # --frozen: reuse committed lockfile (skip re-resolution).
+      # --no-build-isolation: use venv Python directly. setup.py manages
+      #   its own cmake configure/build/install; cmake picks up ccache
+      #   from CMAKE_{C,CXX}_COMPILER_LAUNCHER env vars automatically.
       # Build deps (setuptools, wheel) must be pre-installed since
       # --no-build-isolation skips [build-system].requires.
-      - name: Install workspace packages
+      - name: Build and install workspace packages
         env:
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
