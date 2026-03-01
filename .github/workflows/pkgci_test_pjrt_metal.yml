@@ -117,8 +117,12 @@ jobs:
       # --no-build-isolation uses the venv Python directly (no temp venv),
       # so setup.py finds the existing cmake build and python_stamp,
       # skipping reconfigure/rebuild.
+      # Build deps (setuptools, wheel) must be pre-installed since
+      # --no-build-isolation skips [build-system].requires.
       - name: Install workspace packages
-        run: uv sync --no-build-isolation -v
+        run: |
+          uv pip install setuptools wheel
+          uv sync --no-build-isolation -v
 
       - name: ccache stats
         run: ccache -s
