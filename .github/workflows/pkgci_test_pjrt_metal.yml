@@ -114,15 +114,16 @@ jobs:
           "
 
       # Install workspace members as editable packages.
-      # --no-build-isolation uses the venv Python directly (no temp venv),
-      # so setup.py finds the existing cmake build and python_stamp,
-      # skipping reconfigure/rebuild.
+      # --frozen: reuse committed lockfile (avoids JAX version mismatch
+      #   triggering re-resolution → metadata extraction → cmake rebuild).
+      # --no-build-isolation: use venv Python directly so setup.py finds
+      #   the existing cmake build and python_stamp.
       # Build deps (setuptools, wheel) must be pre-installed since
       # --no-build-isolation skips [build-system].requires.
       - name: Install workspace packages
         run: |
           uv pip install setuptools wheel
-          uv sync --no-build-isolation -v
+          uv sync --no-build-isolation --frozen -v
 
       - name: ccache stats
         run: ccache -s
