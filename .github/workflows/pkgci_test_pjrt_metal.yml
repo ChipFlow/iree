@@ -164,7 +164,7 @@ jobs:
           # Benchmarks run sequentially (need exclusive GPU access for accurate timing)
           echo ""; echo "=== Running benchmarks (sequential) ==="
           JAX_PLATFORMS=cpu,iree_metal uv run python bench_metal_vs_cpu.py \
-            --num-iterations 5 --sizes small --skip-sparse --output json \
+            --num-iterations 5 --sizes medium --skip-sparse --output json \
             > /tmp/bench_results.json 2>/tmp/bench_stderr.log \
             || echo "Benchmarks failed (see stderr log)"
           cat /tmp/bench_stderr.log || true

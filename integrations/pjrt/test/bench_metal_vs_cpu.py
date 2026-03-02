@@ -57,10 +57,10 @@ SIZE_PRESETS = {
         "elementwise": [1_000, 100_000, 1_000_000, 10_000_000],
         "reduction": [512, 2048, 4096],
         "batched_matmul": [128, 256],
-        # Note: scan >2048 fails on Metal due to HAL resource allocation
-        # limits. The FuseLoopIterationExecution pass cascades fusion up to
-        # 2048 dispatches per execute; beyond that the loop is unfused and
-        # Metal's per-iteration resource overhead causes OUT_OF_RANGE errors.
+        # Note: Metal uses --iree-scheduling-max-dispatches-per-execute=64
+        # to avoid O(n^2) compilation from cascading fusion. Scan >2048
+        # leaves outer runtime loops that are slow due to per-dispatch
+        # overhead but no longer cause compilation hangs.
         "scan": [100, 500, 1_000, 2_000],
         "sparse": [20, 50, 100, 150],
     },
