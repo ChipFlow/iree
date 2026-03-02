@@ -10,14 +10,6 @@
 #include "iree/hal/drivers/metal/api.h"
 #include "iree_pjrt/common/api_impl.h"
 
-// Forward-declare Objective-C types for the header (actual usage in .mm).
-#ifdef __OBJC__
-@protocol MTLSharedEvent;
-@class MTLSharedEventListener;
-#else
-typedef void* MTLSharedEventListener;
-#endif
-
 namespace iree::pjrt::metal {
 
 class MetalClientInstance final : public ClientInstance {
@@ -39,13 +31,10 @@ class MetalClientInstance final : public ClientInstance {
       iree::vm::ref<iree_vm_module_t>& main_module) override;
 
  private:
-#ifdef __OBJC__
-  MTLSharedEventListener* event_listener_ = nil;
-  dispatch_queue_t listener_queue_ = nil;
-#else
+  // Opaque pointers to MTLSharedEventListener* and dispatch_queue_t.
+  // Actual types used in client.mm (Objective-C++).
   void* event_listener_ = nullptr;
   void* listener_queue_ = nullptr;
-#endif
 };
 
 }  // namespace iree::pjrt::metal

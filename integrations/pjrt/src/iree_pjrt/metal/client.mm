@@ -30,20 +30,22 @@ MetalClientInstance::MetalClientInstance(std::unique_ptr<Platform> platform)
 
   // Create a dedicated dispatch queue and listener for MTLSharedEvent
   // notifications. This avoids spawning a thread per event.
-  listener_queue_ = dispatch_queue_create(
+  dispatch_queue_t queue = dispatch_queue_create(
       "com.iree.pjrt.metal.event_listener", DISPATCH_QUEUE_SERIAL);
-  event_listener_ =
-      [[MTLSharedEventListener alloc] initWithDispatchQueue:listener_queue_];
+  listener_queue_ = (void*)queue;  // +1 from create
+  MTLSharedEventListener* listener =
+      [[MTLSharedEventListener alloc] initWithDispatchQueue:queue];  // +1
+  event_listener_ = (void*)listener;
 }
 
 MetalClientInstance::~MetalClientInstance() {
   if (event_listener_) {
-    [event_listener_ release];
-    event_listener_ = nil;
+    [(MTLSharedEventListener*)event_listener_ release];  // -1
+    event_listener_ = nullptr;
   }
   if (listener_queue_) {
-    dispatch_release(listener_queue_);
-    listener_queue_ = nil;
+    dispatch_release((dispatch_queue_t)listener_queue_);  // -1
+    listener_queue_ = nullptr;
   }
 }
 
@@ -125,7 +127,8 @@ EventInstance* MetalClientInstance::CreateEvent(
     // ownership. The PJRT_Event_Destroy handler uses OnReady to ensure
     // the event isn't deleted until it's signaled, so 'event' will be
     // alive when this block fires.
-    [shared_event notifyListener:event_listener_
+    MTLSharedEventListener* listener = (MTLSharedEventListener*)event_listener_;
+    [shared_event notifyListener:listener
                          atValue:target_value
                            block:^(id<MTLSharedEvent> se, uint64_t v) {
                              if (v >= IREE_HAL_SEMAPHORE_FAILURE_VALUE) {
@@ -152,12 +155,13 @@ EventInstance* MetalClientInstance::CreateEvent(
       .event = event,
   };
 
+  MTLSharedEventListener* listener = (MTLSharedEventListener*)event_listener_;
   for (iree_host_size_t i = 0; i < sems.count; ++i) {
     id<MTLSharedEvent> shared_event =
         iree_hal_metal_shared_event_handle(sems.semaphores[i]);
     uint64_t target_value = sems.payload_values[i];
 
-    [shared_event notifyListener:event_listener_
+    [shared_event notifyListener:listener
                          atValue:target_value
                            block:^(id<MTLSharedEvent> se, uint64_t v) {
                              if (v >= IREE_HAL_SEMAPHORE_FAILURE_VALUE) {
