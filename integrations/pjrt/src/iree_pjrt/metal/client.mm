@@ -60,7 +60,17 @@ iree_status_t MetalClientInstance::CreateDriver(
 
 bool MetalClientInstance::SetDefaultCompilerFlags(CompilerJob* compiler_job) {
   // Use metal target for Apple Metal GPU
-  return compiler_job->SetFlag("--iree-hal-target-device=metal");
+  if (!compiler_job->SetFlag("--iree-hal-target-device=metal")) return false;
+
+  // Limit cascading loop fusion to avoid O(n^2) compile time for scans and
+  // while loops with many iterations. Default is 2048 which causes 120s+
+  // compilation for scan(2048). With 64, outer loops remain as runtime loops
+  // with ~64 host-GPU round-trips, but compilation drops to seconds.
+  if (!compiler_job->SetFlag(
+          "--iree-scheduling-max-dispatches-per-execute=64"))
+    return false;
+
+  return true;
 }
 
 iree_status_t MetalClientInstance::PopulateVMModules(

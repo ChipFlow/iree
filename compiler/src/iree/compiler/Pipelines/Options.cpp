@@ -293,6 +293,15 @@ void SchedulingOptions::bindOptions(OptionsBinder &binder) {
           "Enables binding fusion and dispatch site specialization."),
       llvm::cl::cat(category));
 
+  binder.opt<int64_t>(
+      "iree-scheduling-max-dispatches-per-execute", maxDispatchesPerExecute,
+      llvm::cl::desc(
+          "Maximum number of async.dispatch ops in a single fused execute "
+          "region after loop iteration fusion. 0 uses the pass default "
+          "(2048). Reducing trades more host-GPU round-trips for faster "
+          "compilation."),
+      llvm::cl::cat(category));
+
   binder.opt<DumpOutputFormat>(
       "iree-scheduling-dump-statistics-format", dumpStatisticsFormat,
       llvm::cl::desc("Dumps statistics in the specified output format."),

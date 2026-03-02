@@ -80,6 +80,16 @@ struct TransformOptions : public PassPipelineOptions<TransformOptions> {
       llvm::cl::init(true),
   };
 
+  // Maximum number of async.dispatch ops allowed in a single fused execute
+  // region. 0 means use the pass default (2048).
+  Option<int64_t> maxDispatchesPerExecute{
+      *this,
+      "max-dispatches-per-execute",
+      llvm::cl::desc("Maximum dispatches per fused execute region (0 = pass "
+                     "default)."),
+      llvm::cl::init(0),
+  };
+
   Option<DumpOutputFormat> dumpStatisticsFormat{
       *this,
       "dump-statistics-format",

@@ -200,6 +200,12 @@ struct SchedulingOptions {
   // Enables fusing bindings with the same underlying storage.
   bool optimizeBindings = true;
 
+  // Maximum number of async.dispatch ops allowed in a single fused execute
+  // region after loop iteration fusion. 0 means use the pass default (2048).
+  // Reducing this value trades more host-GPU round-trips for faster
+  // compilation and smaller execute regions.
+  int64_t maxDispatchesPerExecute = 0;
+
   // TODO(benvanik): find a way to share this with
   // Stream/Transforms/Passes.h w/o circular deps.
   // Defines the output format of a dump pass.

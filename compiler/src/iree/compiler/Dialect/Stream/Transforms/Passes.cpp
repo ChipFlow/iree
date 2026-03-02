@@ -252,7 +252,15 @@ void buildStreamAsyncPassPipeline(OpPassManager &passManager,
       .addPass(IREE::Stream::createScheduleExecutionPass)
       // Fuse loop iterations into single execution regions to reduce
       // per-iteration submission overhead (e.g., scan/while loops on GPU).
-      .addPass(IREE::Stream::createFuseLoopIterationExecutionPass)
+      .addPass([&]() {
+        if (transformOptions.maxDispatchesPerExecute > 0) {
+          FuseLoopIterationExecutionPassOptions opts;
+          opts.maxDispatchesPerExecute =
+              transformOptions.maxDispatchesPerExecute;
+          return createFuseLoopIterationExecutionPass(std::move(opts));
+        }
+        return createFuseLoopIterationExecutionPass();
+      })
       // Group concurrently executable work into waves.
       .addPass(IREE::Stream::createScheduleConcurrencyPass);
 

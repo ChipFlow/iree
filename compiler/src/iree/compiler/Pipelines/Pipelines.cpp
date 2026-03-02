@@ -298,6 +298,8 @@ void buildIREEVMTransformPassPipeline(
   streamOptions.initializationMode =
       (IREE::Stream::InitializationMode)schedulingOptions.initializationMode;
   streamOptions.optimizeBindings = schedulingOptions.optimizeBindings;
+  streamOptions.maxDispatchesPerExecute =
+      schedulingOptions.maxDispatchesPerExecute;
   streamOptions.dumpStatisticsFormat =
       (IREE::Stream::DumpOutputFormat)schedulingOptions.dumpStatisticsFormat;
   streamOptions.dumpStatisticsFile = schedulingOptions.dumpStatisticsFile;
