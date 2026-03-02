@@ -472,17 +472,31 @@ static iree_status_t iree_hal_metal_device_queue_execute(
 
   if (iree_status_is_ok(status)) {
     @autoreleasepool {
-      // First create a new command buffer and encode wait commands for all wait semaphores.
+      // First create a new command buffer and encode wait commands for wait semaphores,
+      // but only if they haven't already been satisfied. Querying signaledValue is a
+      // single memory read (no syscall), so this check is very cheap.
       if (wait_semaphore_list.count > 0) {
-        id<MTLCommandBuffer> wait_command_buffer = [device->queue
-            commandBufferWithDescriptor:device->command_buffer_descriptor];  // autoreleased
+        bool all_waits_satisfied = true;
         for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
-          id<MTLSharedEvent> handle =
-              iree_hal_metal_shared_event_handle(wait_semaphore_list.semaphores[i]);
-          [wait_command_buffer encodeWaitForEvent:handle
-                                            value:wait_semaphore_list.payload_values[i]];
+          uint64_t current_value = 0;
+          if (!iree_status_is_ok(iree_hal_semaphore_query(
+                  wait_semaphore_list.semaphores[i], &current_value)) ||
+              current_value < wait_semaphore_list.payload_values[i]) {
+            all_waits_satisfied = false;
+            break;
+          }
         }
-        [wait_command_buffer commit];
+        if (!all_waits_satisfied) {
+          id<MTLCommandBuffer> wait_command_buffer = [device->queue
+              commandBufferWithDescriptor:device->command_buffer_descriptor];  // autoreleased
+          for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
+            id<MTLSharedEvent> handle =
+                iree_hal_metal_shared_event_handle(wait_semaphore_list.semaphores[i]);
+            [wait_command_buffer encodeWaitForEvent:handle
+                                              value:wait_semaphore_list.payload_values[i]];
+          }
+          [wait_command_buffer commit];
+        }
       }
 
       // Then commit all recorded compute command buffers, except the last one, which we will patch
