@@ -2453,8 +2453,12 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
     }
 
     if (args->device_complete_events) {
+      // Per PJRT spec: "each PJRT_Event will become ready once the
+      // corresponding device execution is complete." Use signal_fence
+      // (fires when execution IS COMPLETE), not wait_fence (fires when
+      // execution CAN START).
       args->device_complete_events[dev_index] =
-          *(client_.CreateEvent(retain_ref(inv.wait_fence)));
+          *(client_.CreateEvent(retain_ref(inv.signal_fence)));
     }
   }
 
