@@ -324,7 +324,16 @@ class DeviceInstance {
 
 class EventInstance {
  public:
+  // Creates an event that spawns a thread to wait on the fence.
+  // If fence is null, the event is immediately ready.
   EventInstance(iree::vm::ref<iree_hal_fence_t> fence);
+
+  // Creates an event with optional thread-based waiting.
+  // If start_thread is false, the caller is responsible for calling
+  // SignalReady() when the fence completes (e.g. via MTLSharedEvent
+  // notifyListener).
+  EventInstance(iree::vm::ref<iree_hal_fence_t> fence, bool start_thread);
+
   ~EventInstance();
   operator PJRT_Event*() { return reinterpret_cast<PJRT_Event*>(this); }
   static void BindApi(PJRT_Api* api);
@@ -336,12 +345,25 @@ class EventInstance {
   ErrorInstance* error();
   bool is_ready();
 
- private:
+  // Blocks until the event is ready. Implements PJRT_Event_Await.
+  iree_status_t Await();
+
+  // Signals this event as ready with the given status.
+  // Called by the waiting thread or by backend-specific notification
+  // (e.g. MTLSharedEvent notifyListener).
   void SignalReady(iree_status_t status);
+
+  // Returns the fence associated with this event, or nullptr.
+  iree_hal_fence_t* fence() const { return fence_.get(); }
+
+ private:
+  void InitWithFence(iree::vm::ref<iree_hal_fence_t> fence,
+                     bool start_thread);
 
   std::mutex lock_;
   iree_status_t status_ = iree_ok_status();
   bool is_ready_;
+  iree::vm::ref<iree_hal_fence_t> fence_;
   std::vector<std::pair<PJRT_Event_OnReadyCallback, void*>> pending_callbacks_;
   std::unique_ptr<std::thread> signal_thread_;
 };
@@ -525,6 +547,13 @@ class ClientInstance {
   // and devices.
   // Returns false on failure (and sets error information on the compiler_job).
   virtual bool SetDefaultCompilerFlags(CompilerJob* compiler_job) = 0;
+
+  // Creates an EventInstance for the given fence. Backend subclasses can
+  // override this to use more efficient notification mechanisms (e.g.
+  // MTLSharedEvent notifyListener) instead of spawning a thread per event.
+  // The default implementation spawns a thread that blocks on
+  // iree_hal_fence_wait().
+  virtual EventInstance* CreateEvent(iree::vm::ref<iree_hal_fence_t> fence);
 
   // Advances the timeline, returning (current, next) time point values.
   std::tuple<uint64_t, uint64_t> AdvanceTimeline();

@@ -423,7 +423,8 @@ void BufferInstance::BindApi(PJRT_Api* api) {
     IREE_TRACE_SCOPE_NAMED("PJRT_Buffer_ReadyEvent");
     BufferInstance* buffer = BufferInstance::Unwrap(args->buffer);
     args->event = reinterpret_cast<PJRT_Event*>(
-        new EventInstance(retain_ref(buffer->ready_fence())));
+        buffer->device().client().CreateEvent(
+            retain_ref(buffer->ready_fence())));
     return nullptr;
   };
   // TODO: Rework the API to be Aliases(b1, b2) to let the plugin explicitly
@@ -585,12 +586,12 @@ iree_status_t BufferInstance::CopyToHost(void* dst, iree_host_size_t dst_size,
     delete ErrorInstance::FromError(error);
   };
 
-  auto dst_buffer_ready_event =
-      new EventInstance(retain_ref(dst_buffer_ready_fence));
+  auto dst_buffer_ready_event = device_.client().CreateEvent(
+      retain_ref(dst_buffer_ready_fence));
   dst_buffer_ready_event->OnReady(dst_buffer_callback, copy_to_host_data);
 
-  auto copy_done_event =
-      new EventInstance(retain_ref(copy_to_host_data->copy_done_fence));
+  auto copy_done_event = device_.client().CreateEvent(
+      retain_ref(copy_to_host_data->copy_done_fence));
   copy_done_event->OnReady(copy_done_callback, dst_buffer_ready_event);
 
   IREE_RETURN_IF_ERROR(IreeApi::hal_device_queue_execute(
@@ -1786,6 +1787,12 @@ iree_status_t ClientInstance::PopulateVMModules(
   return iree_ok_status();
 }
 
+EventInstance* ClientInstance::CreateEvent(
+    iree::vm::ref<iree_hal_fence_t> fence) {
+  // Default: spawn a thread to wait on the fence.
+  return new EventInstance(std::move(fence));
+}
+
 std::tuple<uint64_t, uint64_t> ClientInstance::AdvanceTimeline() {
   uint64_t current = execution_timeline_;
   uint64_t next = current + 1;
@@ -1799,12 +1806,25 @@ std::tuple<uint64_t, uint64_t> ClientInstance::AdvanceTimeline() {
 
 EventInstance::EventInstance(iree::vm::ref<iree_hal_fence_t> fence)
     : is_ready_(false) {
+  InitWithFence(std::move(fence), /*start_thread=*/true);
+}
+
+EventInstance::EventInstance(iree::vm::ref<iree_hal_fence_t> fence,
+                             bool start_thread)
+    : is_ready_(false) {
+  InitWithFence(std::move(fence), start_thread);
+}
+
+void EventInstance::InitWithFence(iree::vm::ref<iree_hal_fence_t> fence,
+                                  bool start_thread) {
   if (!fence) {
     is_ready_ = true;
     return;
   }
 
-  {
+  fence_ = std::move(fence);
+
+  if (start_thread) {
     std::lock_guard<std::mutex> guard(lock_);
     // Create a thread that waits on the fence and executes the callbacks when
     // the fence is ready.
@@ -1815,7 +1835,7 @@ EventInstance::EventInstance(iree::vm::ref<iree_hal_fence_t> fence)
               fence.get(), iree_infinite_timeout(), IREE_HAL_WAIT_FLAG_DEFAULT);
           event_instance->SignalReady(wait_status);
         },
-        this, std::move(fence));
+        this, retain_ref(fence_));
   }
 }
 
@@ -1862,8 +1882,7 @@ void EventInstance::BindApi(PJRT_Api* api) {
   };
   api->PJRT_Event_Await = +[](PJRT_Event_Await_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_Event_Await");
-    return MakeError(
-        iree_make_status(IREE_STATUS_UNIMPLEMENTED, "PJRT_Event_Await"));
+    return MakeError(EventInstance::Unwrap(args->event)->Await());
   };
   api->PJRT_Event_OnReady = +[](PJRT_Event_OnReady_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_Event_OnReady");
@@ -1880,6 +1899,35 @@ ErrorInstance* EventInstance::error() {
 bool EventInstance::is_ready() {
   std::lock_guard<std::mutex> guard(lock_);
   return is_ready_;
+}
+
+iree_status_t EventInstance::Await() {
+  // Fast path: already ready.
+  {
+    std::lock_guard<std::mutex> guard(lock_);
+    if (is_ready_) {
+      return iree_status_clone(status_);
+    }
+  }
+
+  // If we have a fence, wait on it directly. This is more efficient than
+  // spinning on is_ready_ because it uses the underlying wait mechanism.
+  if (fence_) {
+    iree_status_t wait_status = iree_hal_fence_wait(
+        fence_.get(), iree_infinite_timeout(), IREE_HAL_WAIT_FLAG_DEFAULT);
+    // SignalReady may have already been called by the notification handler
+    // or thread. That's fine — SignalReady is idempotent.
+    SignalReady(iree_status_clone(wait_status));
+    return wait_status;
+  }
+
+  // No fence and not ready — shouldn't happen, but wait for signal thread.
+  if (signal_thread_) {
+    signal_thread_->join();
+    signal_thread_.reset();
+  }
+  std::lock_guard<std::mutex> guard(lock_);
+  return iree_status_clone(status_);
 }
 
 iree_status_t EventInstance::OnReady(PJRT_Event_OnReadyCallback callback,
@@ -1912,6 +1960,7 @@ void EventInstance::SignalReady(iree_status_t status) {
   {
     std::lock_guard<std::mutex> guard(lock_);
     if (is_ready_) {
+      iree_status_ignore(status);
       return;
     }
     local_callbacks.swap(pending_callbacks_);
@@ -2405,7 +2454,7 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
 
     if (args->device_complete_events) {
       args->device_complete_events[dev_index] =
-          *(new EventInstance(retain_ref(inv.wait_fence)));
+          *(client_.CreateEvent(retain_ref(inv.wait_fence)));
     }
   }
 

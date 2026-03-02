@@ -10,6 +10,14 @@
 #include "iree/hal/drivers/metal/api.h"
 #include "iree_pjrt/common/api_impl.h"
 
+// Forward-declare Objective-C types for the header (actual usage in .mm).
+#ifdef __OBJC__
+@protocol MTLSharedEvent;
+@class MTLSharedEventListener;
+#else
+typedef void* MTLSharedEventListener;
+#endif
+
 namespace iree::pjrt::metal {
 
 class MetalClientInstance final : public ClientInstance {
@@ -19,12 +27,25 @@ class MetalClientInstance final : public ClientInstance {
   iree_status_t CreateDriver(iree_hal_driver_t** out_driver) override;
   bool SetDefaultCompilerFlags(CompilerJob* compiler_job) override;
 
+  // Uses MTLSharedEvent notifyListener for efficient GPU event notification
+  // instead of spawning a thread per event.
+  EventInstance* CreateEvent(iree::vm::ref<iree_hal_fence_t> fence) override;
+
  protected:
   // Override to add dense_blas module for GPU-accelerated BLAS operations.
   iree_status_t PopulateVMModules(
       std::vector<iree::vm::ref<iree_vm_module_t>>& modules,
       iree_hal_device_t* hal_device,
       iree::vm::ref<iree_vm_module_t>& main_module) override;
+
+ private:
+#ifdef __OBJC__
+  MTLSharedEventListener* event_listener_ = nil;
+  dispatch_queue_t listener_queue_ = nil;
+#else
+  void* event_listener_ = nullptr;
+  void* listener_queue_ = nullptr;
+#endif
 };
 
 }  // namespace iree::pjrt::metal

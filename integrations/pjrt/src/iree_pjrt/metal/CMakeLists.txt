@@ -22,7 +22,7 @@ iree_cc_library(
   HDRS
     "client.h"
   SRCS
-    "client.cc"
+    "client.mm"
   DEPS
     iree_pjrt::common
     iree::hal::drivers::metal
