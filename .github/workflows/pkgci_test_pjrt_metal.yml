@@ -94,7 +94,12 @@ jobs:
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           uv pip install setuptools wheel
-          uv sync --no-build-isolation --frozen --extra vajax -v
+          uv sync --no-build-isolation --frozen -v
+
+      # Install vajax separately WITH build isolation (vajax needs hatchling,
+      # openvaf-py needs maturin — these are auto-installed with isolation).
+      - name: Install vajax
+        run: uv sync --frozen --extra vajax -v
 
       - name: ccache stats
         run: ccache -s
