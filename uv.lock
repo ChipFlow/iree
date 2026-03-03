@@ -271,7 +271,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "pytest" },
     { name = "scipy" },
-    { name = "vajax", marker = "extra == 'vajax'", editable = "../../vajax" },
+    { name = "vajax", marker = "extra == 'vajax'", git = "https://github.com/chipflow/vajax" },
 ]
 provides-extras = ["vajax"]
 
@@ -734,18 +734,7 @@ wheels = [
 [[package]]
 name = "openvaf-py"
 version = "0.1.0"
-source = { editable = "../../vajax/openvaf_jax/openvaf_py" }
-
-[package.metadata]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "jax", specifier = ">=0.4" },
-    { name = "jaxlib", specifier = ">=0.4" },
-    { name = "maturin", specifier = ">=1.0,<2.0" },
-    { name = "numpy", specifier = ">=1.20" },
-    { name = "pytest", specifier = ">=7.0" },
-]
+source = { git = "https://github.com/chipflow/vajax?subdirectory=openvaf_jax%2Fopenvaf_py#428e6d0169b4fb159fca6ed4ce4a7fb46a3ae535" }
 
 [[package]]
 name = "opt-einsum"
@@ -1044,21 +1033,16 @@ wheels = [
 [[package]]
 name = "umfpack-jax"
 version = "0.1.0"
-source = { editable = "../../vajax/vajax/sparse" }
+source = { git = "https://github.com/chipflow/vajax?subdirectory=vajax%2Fsparse#428e6d0169b4fb159fca6ed4ce4a7fb46a3ae535" }
 dependencies = [
     { name = "jax" },
     { name = "numpy" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "jax", specifier = ">=0.4.29" },
-    { name = "numpy", specifier = ">=1.24.0" },
-]
-
 [[package]]
 name = "vajax"
-source = { editable = "../../vajax" }
+version = "0.1.dev943+g428e6d016"
+source = { git = "https://github.com/chipflow/vajax#428e6d0169b4fb159fca6ed4ce4a7fb46a3ae535" }
 dependencies = [
     { name = "jax" },
     { name = "jaxlib" },
@@ -1070,41 +1054,6 @@ dependencies = [
     { name = "simpleeval" },
     { name = "umfpack-jax" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "beartype", marker = "extra == 'dev'", specifier = ">=0.18.0" },
-    { name = "beartype", marker = "extra == 'test'", specifier = ">=0.18.0" },
-    { name = "jax", specifier = ">=0.9.0" },
-    { name = "jax-cuda12-plugin", marker = "sys_platform != 'darwin' and extra == 'cuda12'", specifier = ">=0.9.0" },
-    { name = "jaxlib", specifier = ">=0.9.0" },
-    { name = "jaxtyping", specifier = ">=0.2.0" },
-    { name = "matplotlib", specifier = ">=3.7.0" },
-    { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6,<2" },
-    { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9.5" },
-    { name = "numpy", specifier = ">=1.24.0" },
-    { name = "openvaf-py", editable = "../../vajax/openvaf_jax/openvaf_py" },
-    { name = "osdi-py", marker = "extra == 'dev'", editable = "../../vajax/openvaf_jax/osdi_py" },
-    { name = "osdi-py", marker = "extra == 'test'", editable = "../../vajax/openvaf_jax/osdi_py" },
-    { name = "pyright", marker = "extra == 'dev'" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.4.0" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=7.4.0" },
-    { name = "pytest-cov", marker = "extra == 'dev'" },
-    { name = "pytest-cov", marker = "extra == 'test'" },
-    { name = "ruff", marker = "extra == 'dev'" },
-    { name = "sax", marker = "extra == 'sax'", specifier = ">=0.13.0" },
-    { name = "scikit-umfpack", marker = "extra == 'dev'", specifier = ">=0.4.2" },
-    { name = "scikit-umfpack", marker = "extra == 'umfpack'", specifier = ">=0.4.2" },
-    { name = "scipy", specifier = ">=1.11.0" },
-    { name = "simpleeval", specifier = ">=1.0.0" },
-    { name = "spineax", marker = "extra == 'cuda12'", git = "https://github.com/robtaylor/spineax.git" },
-    { name = "umfpack-jax", editable = "../../vajax/vajax/sparse" },
-    { name = "umfpack-jax", marker = "extra == 'umfpack-ffi'", editable = "../../vajax/vajax/sparse" },
-]
-provides-extras = ["cuda12", "dev", "docs", "sax", "test", "umfpack", "umfpack-ffi"]
-
-[package.metadata.requires-dev]
-dev = [{ name = "radon", specifier = ">=6.0.1" }]
 
 [[package]]
 name = "wadler-lindig"

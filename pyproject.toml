@@ -29,7 +29,7 @@ iree-base-compiler = { workspace = true }
 iree-pjrt-plugin-metal = { workspace = true }
 # Use patched JAX from sibling directory
 jax = { path = "../jax", editable = true }
-vajax = { path = "../../vajax", editable = true }
+vajax = { git = "https://github.com/chipflow/vajax" }
 
 [tool.uv.extra-build-variables.iree-base-compiler]
 # Enable ccache for the IREE compiler build (triggered by editable install)
