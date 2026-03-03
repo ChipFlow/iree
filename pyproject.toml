@@ -13,6 +13,11 @@ dependencies = [
     "absl-py",
 ]
 
+[project.optional-dependencies]
+vajax = [
+    "vajax",
+]
+
 [tool.uv.workspace]
 members = [
     "compiler",
@@ -24,6 +29,7 @@ iree-base-compiler = { workspace = true }
 iree-pjrt-plugin-metal = { workspace = true }
 # Use patched JAX from sibling directory
 jax = { path = "../jax", editable = true }
+vajax = { path = "../../vajax", editable = true }
 
 [tool.uv.extra-build-variables.iree-base-compiler]
 # Enable ccache for the IREE compiler build (triggered by editable install)
@@ -36,6 +42,8 @@ CMAKE_C_COMPILER_LAUNCHER = "ccache"
 CMAKE_CXX_COMPILER_LAUNCHER = "ccache"
 
 [tool.uv]
+# vajax requires jax>=0.9.0 but we use a patched 0.8.x JAX
+override-dependencies = ["jax>=0.8.0", "jaxlib>=0.8.0", "jaxtyping>=0.2.0"]
 # Rebuild when setup.py changes or cmake env vars change
 cache-keys = [
     { file = "compiler/setup.py" },
