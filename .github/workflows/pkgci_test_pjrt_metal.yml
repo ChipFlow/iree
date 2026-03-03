@@ -94,7 +94,7 @@ jobs:
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: |
           uv pip install setuptools wheel
-          uv sync --no-build-isolation --frozen -v
+          uv sync --no-build-isolation --frozen --extra vajax -v
 
       - name: ccache stats
         run: ccache -s
@@ -156,13 +156,20 @@ jobs:
           ) > /tmp/differential_tests.log 2>&1 &
           pid_differential=$!
 
+          (
+            echo "--- VAJAX ring oscillator tests ---"
+            JAX_PLATFORMS=cpu,iree_metal uv run python -m pytest test_vajax_ring.py -v 2>&1 || echo "VAJAX ring tests failed"
+          ) > /tmp/vajax_ring_tests.log 2>&1 &
+          pid_vajax=$!
+
           # Wait for all tests to complete
-          wait $pid_metal $pid_comprehensive $pid_differential || true
+          wait $pid_metal $pid_comprehensive $pid_differential $pid_vajax || true
 
           # Print test logs
           echo ""; echo "=== Metal PJRT Tests ==="; cat /tmp/metal_tests.log
           echo ""; echo "=== Comprehensive Tests ==="; cat /tmp/comprehensive_tests.log
           echo ""; echo "=== Differential Tests ==="; cat /tmp/differential_tests.log
+          echo ""; echo "=== VAJAX Ring Tests ==="; cat /tmp/vajax_ring_tests.log
 
           # Benchmarks run sequentially (need exclusive GPU access for accurate timing)
           echo ""; echo "=== Running benchmarks (sequential) ==="
@@ -294,6 +301,7 @@ jobs:
             /tmp/metal_passing.txt
             /tmp/metal_failing.txt
             /tmp/bench_results.json
+            /tmp/vajax_ring_tests.log
           retention-days: 7
 
       - name: Post to Discord on Failure
