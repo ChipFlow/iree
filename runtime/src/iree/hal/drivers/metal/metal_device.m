@@ -9,6 +9,42 @@
 #include "iree/base/api.h"
 #include "iree/base/tracing.h"
 #include "iree/hal/api.h"
+
+// Inline tracing for PJRT performance analysis.
+// Enable: IREE_PJRT_TRACE=1
+#include <mach/mach_time.h>
+static inline bool _metal_trace_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char* env = getenv("IREE_PJRT_TRACE");
+    cached = (env && env[0] != '0') ? 1 : 0;
+  }
+  return cached != 0;
+}
+static inline double _metal_trace_us(void) {
+  static uint64_t base = 0;
+  static double scale = 0.0;
+  if (base == 0) {
+    base = mach_absolute_time();
+    mach_timebase_info_data_t info;
+    mach_timebase_info(&info);
+    scale = (double)info.numer / (double)info.denom / 1000.0;
+  }
+  return (double)(mach_absolute_time() - base) * scale;
+}
+#define IREE_PJRT_TRACE(label, fmt, ...)                                 \
+  do {                                                                   \
+    if (_metal_trace_enabled()) {                                        \
+      fprintf(stderr, "[PJRT %12.1fus] %-30s " fmt "\n",                \
+              _metal_trace_us(), label, ##__VA_ARGS__);                  \
+    }                                                                    \
+  } while (0)
+#define IREE_PJRT_TRACE0(label)                                          \
+  do {                                                                   \
+    if (_metal_trace_enabled()) {                                        \
+      fprintf(stderr, "[PJRT %12.1fus] %s\n", _metal_trace_us(), label);\
+    }                                                                    \
+  } while (0)
 #include "iree/hal/drivers/metal/api.h"
 #include "iree/hal/drivers/metal/builtin_executables.h"
 #include "iree/hal/drivers/metal/direct_allocator.h"
@@ -330,15 +366,41 @@ static iree_status_t iree_hal_metal_device_queue_alloca(
     const iree_hal_semaphore_list_t signal_semaphore_list, iree_hal_allocator_pool_t pool,
     iree_hal_buffer_params_t params, iree_device_size_t allocation_size,
     iree_hal_alloca_flags_t flags, iree_hal_buffer_t** IREE_RESTRICT out_buffer) {
+  IREE_PJRT_TRACE("queue_alloca", "size=%llu wait=%zu signal=%zu",
+                   (unsigned long long)allocation_size,
+                   (size_t)wait_semaphore_list.count,
+                   (size_t)signal_semaphore_list.count);
   // Metal buffer allocation ([device newBufferWithLength:options:]) is a
   // CPU-side operation that does not require prior GPU work to complete.
   // Allocate immediately without blocking on wait semaphores.
   IREE_RETURN_IF_ERROR(iree_hal_allocator_allocate_buffer(iree_hal_device_allocator(base_device),
                                                           params, allocation_size, out_buffer));
+  IREE_PJRT_TRACE0("queue_alloca.allocated");
 
-  // Propagate semaphore ordering to the GPU without blocking the CPU.
-  // queue_barrier -> queue_execute(NULL) encodes GPU-side
-  // encodeWaitForEvent/encodeSignalEvent.
+  // Check if all wait semaphores are already satisfied (cheap CPU-side query).
+  // This is the common case: alloca waits are typically empty (matmul) or
+  // satisfied after fence.await (while_loop). Same pattern as local_sync and
+  // Vulkan drivers which use iree_hal_semaphore_list_signal directly.
+  bool all_waits_satisfied = true;
+  for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
+    uint64_t current_value = 0;
+    if (!iree_status_is_ok(iree_hal_semaphore_query(
+            wait_semaphore_list.semaphores[i], &current_value)) ||
+        current_value < wait_semaphore_list.payload_values[i]) {
+      all_waits_satisfied = false;
+      break;
+    }
+  }
+
+  if (all_waits_satisfied) {
+    // Signal CPU-side — no GPU command buffer needed.
+    // iree_hal_semaphore_signal sets MTLSharedEvent.signaledValue directly.
+    IREE_PJRT_TRACE0("queue_alloca.cpu_signal");
+    return iree_hal_semaphore_list_signal(signal_semaphore_list);
+  }
+
+  // Fall back to GPU-side barrier when waits are pending.
+  IREE_PJRT_TRACE0("queue_alloca.gpu_barrier");
   return iree_hal_device_queue_barrier(base_device, queue_affinity, wait_semaphore_list,
                                        signal_semaphore_list, IREE_HAL_EXECUTE_FLAG_NONE);
 }
@@ -348,7 +410,23 @@ static iree_status_t iree_hal_metal_device_queue_dealloca(
     const iree_hal_semaphore_list_t wait_semaphore_list,
     const iree_hal_semaphore_list_t signal_semaphore_list, iree_hal_buffer_t* buffer,
     iree_hal_dealloca_flags_t flags) {
-  // TODO(benvanik): queue-ordered allocations.
+  // Check if all wait semaphores are already satisfied (cheap CPU-side query).
+  bool all_waits_satisfied = true;
+  for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
+    uint64_t current_value = 0;
+    if (!iree_status_is_ok(iree_hal_semaphore_query(
+            wait_semaphore_list.semaphores[i], &current_value)) ||
+        current_value < wait_semaphore_list.payload_values[i]) {
+      all_waits_satisfied = false;
+      break;
+    }
+  }
+
+  if (all_waits_satisfied) {
+    return iree_hal_semaphore_list_signal(signal_semaphore_list);
+  }
+
+  // Fall back to GPU-side barrier when waits are pending.
   return iree_hal_device_queue_barrier(base_device, queue_affinity, wait_semaphore_list,
                                        signal_semaphore_list, IREE_HAL_EXECUTE_FLAG_NONE);
 }
@@ -431,6 +509,10 @@ static iree_status_t iree_hal_metal_device_queue_execute(
     iree_hal_execute_flags_t flags) {
   iree_hal_metal_device_t* device = iree_hal_metal_device_cast(base_device);
   IREE_TRACE_ZONE_BEGIN(z0);
+  IREE_PJRT_TRACE("queue_execute", "wait=%zu signal=%zu has_cb=%d",
+                   (size_t)wait_semaphore_list.count,
+                   (size_t)signal_semaphore_list.count,
+                   command_buffer != NULL);
 
   iree_hal_resource_set_t* resource_set = NULL;
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
@@ -445,21 +527,80 @@ static iree_status_t iree_hal_metal_device_queue_execute(
                                           signal_semaphore_list.semaphores);
   }
 
+  // Check if any wait semaphores need GPU-side waiting (cheap CPU-side query).
+  bool needs_gpu_wait = false;
+  if (iree_status_is_ok(status) && wait_semaphore_list.count > 0) {
+    for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
+      uint64_t current_value = 0;
+      if (!iree_status_is_ok(iree_hal_semaphore_query(
+              wait_semaphore_list.semaphores[i], &current_value)) ||
+          current_value < wait_semaphore_list.payload_values[i]) {
+        needs_gpu_wait = true;
+        break;
+      }
+    }
+    if (!needs_gpu_wait) {
+      IREE_PJRT_TRACE("queue_execute.waits_satisfied", "skipped wait CB (%zu sems already done)",
+                       (size_t)wait_semaphore_list.count);
+    }
+  }
+
   // Translate deferred command buffers into real Metal command buffers.
-  // We do this prior to beginning execution so that if we fail we don't leave the system in an
-  // inconsistent state.
+  // For deferred CBs with pending waits, we encode waits on the same
+  // MTLCommandBuffer before replaying compute work — producing a single CB
+  // (waits → compute → signals) instead of two (wait CB + compute CB).
+  // Metal API allows encodeWaitForEvent before the first command encoder.
+  // NOTE: iree_hal_deferred_command_buffer_apply calls begin() → reset() on
+  // the direct CB. reset() resets segments/arena/bindings but does NOT touch
+  // the underlying MTLCommandBuffer, so waits encoded before apply() survive.
   iree_hal_command_buffer_t* direct_command_buffer = NULL;
   if (iree_status_is_ok(status) && command_buffer) {
     if (iree_hal_deferred_command_buffer_isa(command_buffer)) {
-      // Create a temporary command buffer and replay the deferred command buffer with the
-      // binding table provided. Note that any resources used will be retained by the command
-      // buffer so we only need to retain the command buffer itself instead of the binding
-      // tables provided.
-      @autoreleasepool {
-        status = iree_hal_metal_replay_command_buffer(device, command_buffer, binding_table,
-                                                      &direct_command_buffer);
+      if (needs_gpu_wait) {
+        IREE_PJRT_TRACE("queue_execute.merged_wait_replay",
+                         "encoding %zu waits + replay on single CB",
+                         (size_t)wait_semaphore_list.count);
+        // Create the direct CB (allocates an empty MTLCommandBuffer).
+        @autoreleasepool {
+          status = iree_hal_metal_direct_command_buffer_create(
+              base_device, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+              iree_hal_command_buffer_allowed_categories(command_buffer),
+              /*binding_capacity=*/0, device->command_buffer_resource_reference_mode,
+              device->queue, &device->block_pool, &device->staging_buffer,
+              device->builtin_executable, device->host_allocator, &direct_command_buffer);
+        }
+        // Encode waits on the MTLCommandBuffer before any command encoders.
+        if (iree_status_is_ok(status)) {
+          id<MTLCommandBuffer> metal_cb =
+              iree_hal_metal_direct_command_buffer_handle(direct_command_buffer);
+          for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
+            id<MTLSharedEvent> handle =
+                iree_hal_metal_shared_event_handle(wait_semaphore_list.semaphores[i]);
+            [metal_cb encodeWaitForEvent:handle
+                                   value:wait_semaphore_list.payload_values[i]];
+          }
+          // Replay the deferred CB onto the same direct CB.
+          status = iree_hal_deferred_command_buffer_apply(
+              command_buffer, direct_command_buffer, binding_table);
+        }
+        if (!iree_status_is_ok(status) && direct_command_buffer) {
+          iree_hal_command_buffer_release(direct_command_buffer);
+          direct_command_buffer = NULL;
+        }
+        // Waits are already encoded on the compute CB — don't create a separate wait CB.
+        needs_gpu_wait = false;
+        IREE_PJRT_TRACE0("queue_execute.merged_replay_done");
+      } else {
+        IREE_PJRT_TRACE0("queue_execute.replay_deferred");
+        // No waits needed: replay as before.
+        @autoreleasepool {
+          status = iree_hal_metal_replay_command_buffer(device, command_buffer, binding_table,
+                                                        &direct_command_buffer);
+        }
+        IREE_PJRT_TRACE0("queue_execute.replay_done");
       }
     } else {
+      IREE_PJRT_TRACE0("queue_execute.direct_cb");
       // Retain the command buffer until the submission has completed.
       iree_hal_command_buffer_retain(command_buffer);
       direct_command_buffer = command_buffer;
@@ -472,35 +613,25 @@ static iree_status_t iree_hal_metal_device_queue_execute(
 
   if (iree_status_is_ok(status)) {
     @autoreleasepool {
-      // First create a new command buffer and encode wait commands for wait semaphores,
-      // but only if they haven't already been satisfied. Querying signaledValue is a
-      // single memory read (no syscall), so this check is very cheap.
-      if (wait_semaphore_list.count > 0) {
-        bool all_waits_satisfied = true;
+      // Create a separate wait CB only for non-deferred command buffers with
+      // unsatisfied waits (the deferred path above merges waits into the
+      // compute CB). This also handles the barrier-only case (NULL command_buffer).
+      if (needs_gpu_wait) {
+        IREE_PJRT_TRACE("queue_execute.wait_cb", "creating wait CB for %zu sems",
+                         (size_t)wait_semaphore_list.count);
+        id<MTLCommandBuffer> wait_command_buffer = [device->queue
+            commandBufferWithDescriptor:device->command_buffer_descriptor];  // autoreleased
         for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
-          uint64_t current_value = 0;
-          if (!iree_status_is_ok(iree_hal_semaphore_query(
-                  wait_semaphore_list.semaphores[i], &current_value)) ||
-              current_value < wait_semaphore_list.payload_values[i]) {
-            all_waits_satisfied = false;
-            break;
-          }
+          id<MTLSharedEvent> handle =
+              iree_hal_metal_shared_event_handle(wait_semaphore_list.semaphores[i]);
+          [wait_command_buffer encodeWaitForEvent:handle
+                                            value:wait_semaphore_list.payload_values[i]];
         }
-        if (!all_waits_satisfied) {
-          id<MTLCommandBuffer> wait_command_buffer = [device->queue
-              commandBufferWithDescriptor:device->command_buffer_descriptor];  // autoreleased
-          for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
-            id<MTLSharedEvent> handle =
-                iree_hal_metal_shared_event_handle(wait_semaphore_list.semaphores[i]);
-            [wait_command_buffer encodeWaitForEvent:handle
-                                              value:wait_semaphore_list.payload_values[i]];
-          }
-          [wait_command_buffer commit];
-        }
+        [wait_command_buffer commit];
+        IREE_PJRT_TRACE0("queue_execute.wait_cb_committed");
       }
 
-      // Then commit all recorded compute command buffers, except the last one, which we will patch
-      // up with semaphore signaling.
+      // Get or create the command buffer for signal encoding.
       id<MTLCommandBuffer> signal_command_buffer = nil;
       if (direct_command_buffer) {
         // NOTE: translation happens above such that we always know these are direct command
@@ -518,6 +649,8 @@ static iree_status_t iree_hal_metal_device_queue_execute(
       }
 
       // Finally encode signal commands for all signal semaphores.
+      IREE_PJRT_TRACE("queue_execute.signal", "encoding %zu signal events",
+                       (size_t)signal_semaphore_list.count);
       for (iree_host_size_t i = 0; i < signal_semaphore_list.count; ++i) {
         id<MTLSharedEvent> handle =
             iree_hal_metal_shared_event_handle(signal_semaphore_list.semaphores[i]);
@@ -529,6 +662,7 @@ static iree_status_t iree_hal_metal_device_queue_execute(
       // the device to make sure the block pool behind outlives the resource set.
       iree_hal_device_retain(base_device);
       [signal_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        IREE_PJRT_TRACE0("queue_execute.gpu_completed");
         // Now we can release all retained resources.
         iree_hal_resource_set_free(resource_set);
         // And then release the device handle. Note that this must happen separately--if we put the
@@ -537,6 +671,7 @@ static iree_status_t iree_hal_metal_device_queue_execute(
         iree_hal_device_release(base_device);
       }];
       [signal_command_buffer commit];
+      IREE_PJRT_TRACE0("queue_execute.committed");
     }
   } else {
     iree_hal_resource_set_free(resource_set);
