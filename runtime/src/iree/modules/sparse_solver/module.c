@@ -725,12 +725,14 @@ static iree_status_t iree_sparse_solver_spsolve_complete_metal_impl(
     col_idx_i64[i] = col_idx_data[i];
   }
 
-  // Create BaSpaCho with AUTO backend - defaults to Metal on Apple Silicon.
-  // On unified memory systems, the CPU can access Metal buffer contents directly
-  // via [MTLBuffer contents], avoiding staging buffer copies.
-  (void)mtl_device;  // Device is used internally by BaSpaCho Metal backend.
+  // Use CPU backend for Cholesky factorization.
+  // Metal sparse elimination GPU kernels produce incorrect results for N>196
+  // (when sparse elimination ranges are needed). CPU backend works correctly
+  // for all sizes. I/O still uses direct Metal buffer access (zero-copy on
+  // unified memory).
+  (void)mtl_device;
 
-  baspacho = baspacho_create(BASPACHO_BACKEND_AUTO);
+  baspacho = baspacho_create(BASPACHO_BACKEND_CPU);
   if (!baspacho) {
     status = iree_make_status(IREE_STATUS_INTERNAL,
                               "failed to create BaSpaCho context");
@@ -745,7 +747,7 @@ static iree_status_t iree_sparse_solver_spsolve_complete_metal_impl(
     goto cleanup;
   }
 
-  // Cholesky factorization - GPU accelerated on Apple Silicon via Metal.
+  // Cholesky factorization (CPU backend, works for all sizes).
   result = baspacho_factor_f32(baspacho, values_data);
   if (result != 0) {
     status = iree_make_status(IREE_STATUS_INTERNAL,
@@ -753,7 +755,7 @@ static iree_status_t iree_sparse_solver_spsolve_complete_metal_impl(
     goto cleanup;
   }
 
-  // Triangular solve - GPU accelerated on Apple Silicon via Metal.
+  // Triangular solve.
   baspacho_solve_f32(baspacho, rhs_data, solution_data);
 
 cleanup:
@@ -771,9 +773,6 @@ cleanup:
 // Uses staging buffer transfers (d2h/h2d) for portability across different
 // GPU memory configurations. On unified memory systems like Apple Silicon,
 // these transfers are essentially just pointer operations.
-//
-// NOTE: BaSpaCho uses Cholesky factorization for SPD matrices. For general
-// matrices, LU factorization would be needed but is not yet fully supported.
 static iree_status_t iree_sparse_solver_spsolve_complete_impl(
     iree_vm_stack_t* IREE_RESTRICT stack,
     iree_sparse_solver_module_t* module,
