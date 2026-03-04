@@ -90,7 +90,8 @@ if(APPLE AND IREE_HAL_DRIVER_METAL)
   # BaSpaCho Metal integration requires buffer registration.
   list(APPEND SPARSE_SOLVER_DEFINES BASPACHO_USE_METAL=1)
   find_library(METAL_FRAMEWORK Metal REQUIRED)
-  list(APPEND SPARSE_SOLVER_DEPS ${METAL_FRAMEWORK})
+  find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
+  list(APPEND SPARSE_SOLVER_DEPS ${METAL_FRAMEWORK} ${ACCELERATE_FRAMEWORK})
   # Add Metal HAL driver dependency for direct buffer access.
   list(APPEND SPARSE_SOLVER_DEPS iree::hal::drivers::metal)
   # Add Metal helper source file (Objective-C).

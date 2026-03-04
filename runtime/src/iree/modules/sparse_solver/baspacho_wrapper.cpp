@@ -268,7 +268,7 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
 
     // Initialize upper triangle for LU factorization support
     // This prepares the skeleton to handle both lower and upper triangle storage
-    h->solver->skel().initUpperTriangle();
+    const_cast<BaSpaCho::CoalescedBlockMatrixSkel&>(h->solver->skel()).initUpperTriangle();
 
     // Check if sparse elimination ranges were created
     const auto& ranges = h->solver->sparseEliminationRanges();

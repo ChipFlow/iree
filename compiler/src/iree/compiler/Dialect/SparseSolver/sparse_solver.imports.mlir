@@ -194,6 +194,26 @@ vm.import private @spsolve_complete.f64(
 )
 
 //===----------------------------------------------------------------------===//
+// Dense Linear Solve (LAPACK)
+//===----------------------------------------------------------------------===//
+
+// Dense linear solve using LAPACK gesv (getrf + getrs).
+// Solves Ax = b for dense matrix A via LU factorization.
+// Handles row-major to column-major conversion internally.
+//
+// Args:
+//   n: Matrix dimension (n x n)
+//   matrix: Dense matrix A buffer view (n*n elements, f32, row-major)
+//   rhs: Right-hand side vector b buffer view (n elements, f32)
+//   solution: Output solution vector x buffer view (n elements, f32)
+vm.import private @dense_solve_complete(
+  %n : i64,
+  %matrix : !vm.ref<!hal.buffer_view>,
+  %rhs : !vm.ref<!hal.buffer_view>,
+  %solution : !vm.ref<!hal.buffer_view>
+)
+
+//===----------------------------------------------------------------------===//
 // Diagnostic Functions
 //===----------------------------------------------------------------------===//
 

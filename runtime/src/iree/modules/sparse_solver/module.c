@@ -1154,6 +1154,142 @@ IREE_VM_ABI_EXPORT(iree_sparse_solver_solve_lu_f64,
 }
 
 //===----------------------------------------------------------------------===//
+// Dense Linear Solve (LAPACK via Accelerate)
+//===----------------------------------------------------------------------===//
+
+// LAPACK function declarations.
+// On macOS these are provided by the Accelerate framework (linked via CMake).
+// We declare them externally to avoid including Accelerate/Accelerate.h which
+// triggers vecLib vector type errors under -Werror.
+extern int sgetrf_(int* m, int* n, float* a, int* lda, int* ipiv, int* info);
+extern int sgetrs_(char* trans, int* n, int* nrhs, float* a, int* lda,
+                   int* ipiv, float* b, int* ldb, int* info);
+
+// dense_solve_complete: Irrr -> v
+// Solves Ax = b using LAPACK sgetrf + sgetrs.
+// Row-major handling: LAPACK sees row-major A as A^T, so we use sgetrs('T',...)
+// to solve (PLU)^T x = b which equals Ax = b.
+static iree_status_t iree_sparse_solver_dense_solve_complete_impl(
+    iree_vm_stack_t* IREE_RESTRICT stack,
+    iree_sparse_solver_module_t* module,
+    iree_sparse_solver_module_state_t* state,
+    int64_t n,
+    iree_hal_buffer_view_t* matrix_bv,
+    iree_hal_buffer_view_t* rhs_bv,
+    iree_hal_buffer_view_t* solution_bv) {
+  iree_status_t status = iree_ok_status();
+
+  // Get buffers from views.
+  iree_hal_buffer_t* matrix_buffer = iree_hal_buffer_view_buffer(matrix_bv);
+  iree_hal_buffer_t* rhs_buffer = iree_hal_buffer_view_buffer(rhs_bv);
+  iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_bv);
+
+  iree_device_size_t matrix_size = n * n * sizeof(float);
+  iree_device_size_t vec_size = n * sizeof(float);
+
+  // Allocate host scratch buffers.
+  float* a_scratch = NULL;
+  int* ipiv = NULL;
+  float* host_matrix = NULL;
+  float* host_rhs = NULL;
+  float* host_solution = NULL;
+
+  status = iree_allocator_malloc(module->host_allocator, matrix_size,
+                                  (void**)&a_scratch);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_allocator_malloc(module->host_allocator, n * sizeof(int),
+                                  (void**)&ipiv);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  // Transfer matrix and rhs from device to host.
+  // On unified memory (Apple Silicon), these are essentially pointer copies.
+  status = iree_allocator_malloc(module->host_allocator, matrix_size,
+                                  (void**)&host_matrix);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_allocator_malloc(module->host_allocator, vec_size,
+                                  (void**)&host_rhs);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_allocator_malloc(module->host_allocator, vec_size,
+                                  (void**)&host_solution);
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_hal_device_transfer_d2h(
+      module->device, matrix_buffer, 0, host_matrix, matrix_size,
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  status = iree_hal_device_transfer_d2h(
+      module->device, rhs_buffer, 0, host_rhs, vec_size,
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+  if (!iree_status_is_ok(status)) goto cleanup;
+
+  // Copy A to scratch (sgetrf modifies it in-place) and b to solution
+  // (sgetrs overwrites the RHS with the solution).
+  memcpy(a_scratch, host_matrix, matrix_size);
+  memcpy(host_solution, host_rhs, vec_size);
+
+  {
+    // Factor: LAPACK sees row-major A as A^T in column-major.
+    int n_int = (int)n;
+    int info = 0;
+    sgetrf_(&n_int, &n_int, a_scratch, &n_int, ipiv, &info);
+
+    if (info != 0) {
+      status = iree_make_status(IREE_STATUS_INTERNAL,
+                                "LAPACK sgetrf failed with info=%d", info);
+      goto cleanup;
+    }
+
+    // Solve with transpose: (PLU)^T x = b → Ax = b.
+    char trans = 'T';
+    int nrhs = 1;
+    sgetrs_(&trans, &n_int, &nrhs, a_scratch, &n_int, ipiv, host_solution,
+            &n_int, &info);
+
+    if (info != 0) {
+      status = iree_make_status(IREE_STATUS_INTERNAL,
+                                "LAPACK sgetrs failed with info=%d", info);
+      goto cleanup;
+    }
+  }
+
+  // Transfer solution back to device.
+  status = iree_hal_device_transfer_h2d(
+      module->device, host_solution, solution_buffer, 0, vec_size,
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+
+cleanup:
+  if (a_scratch) iree_allocator_free(module->host_allocator, a_scratch);
+  if (ipiv) iree_allocator_free(module->host_allocator, ipiv);
+  if (host_matrix) iree_allocator_free(module->host_allocator, host_matrix);
+  if (host_rhs) iree_allocator_free(module->host_allocator, host_rhs);
+  if (host_solution) iree_allocator_free(module->host_allocator, host_solution);
+  return status;
+}
+
+IREE_VM_ABI_EXPORT(iree_sparse_solver_dense_solve_complete,
+                   iree_sparse_solver_module_state_t, Irrr, v) {
+  iree_sparse_solver_module_t* sparse_module = state->module;
+
+  int64_t n = args->i0;
+  iree_hal_buffer_view_t* matrix_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r1, &matrix_view));
+  iree_hal_buffer_view_t* rhs_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r2, &rhs_view));
+  iree_hal_buffer_view_t* solution_view = NULL;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_buffer_view_check_deref(args->r3, &solution_view));
+
+  return iree_sparse_solver_dense_solve_complete_impl(
+      stack, sparse_module, state, n, matrix_view, rhs_view, solution_view);
+}
+
+//===----------------------------------------------------------------------===//
 // VM Module Interface
 //===----------------------------------------------------------------------===//
 
@@ -1164,8 +1300,10 @@ IREE_VM_ABI_DEFINE_SHIM(rIIrr, r);   // analyze
 IREE_VM_ABI_DEFINE_SHIM(rrr, i);     // factor.lu, factor.lu.f64
 IREE_VM_ABI_DEFINE_SHIM(rrrr, v);    // solve.lu, solve.lu.f64
 IREE_VM_ABI_DEFINE_SHIM(IIrrrrr, v); // spsolve_complete, spsolve_complete.f64
+IREE_VM_ABI_DEFINE_SHIM(Irrr, v);    // dense_solve_complete
 
 // Module function table.
+// NOTE: Must be sorted alphabetically by export name (binary search lookup).
 static const iree_vm_native_function_ptr_t iree_sparse_solver_module_funcs_[] =
     {
         // analyze
@@ -1174,11 +1312,11 @@ static const iree_vm_native_function_ptr_t iree_sparse_solver_module_funcs_[] =
             .target =
                 (iree_vm_native_function_target_t)iree_sparse_solver_analyze,
         },
-        // release
+        // dense_solve_complete
         {
-            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_r_v,
-            .target =
-                (iree_vm_native_function_target_t)iree_sparse_solver_release,
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_Irrr_v,
+            .target = (iree_vm_native_function_target_t)
+                iree_sparse_solver_dense_solve_complete,
         },
         // factor
         {
@@ -1192,29 +1330,17 @@ static const iree_vm_native_function_ptr_t iree_sparse_solver_module_funcs_[] =
             .target =
                 (iree_vm_native_function_target_t)iree_sparse_solver_factor_f64,
         },
-        // solve
+        // factor.lu
         {
-            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrr_v,
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrr_i,
             .target =
-                (iree_vm_native_function_target_t)iree_sparse_solver_solve,
+                (iree_vm_native_function_target_t)iree_sparse_solver_factor_lu,
         },
-        // solve.f64
+        // factor.lu.f64
         {
-            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrr_v,
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrr_i,
             .target =
-                (iree_vm_native_function_target_t)iree_sparse_solver_solve_f64,
-        },
-        // solve.batched
-        {
-            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrrI_v,
-            .target = (iree_vm_native_function_target_t)
-                iree_sparse_solver_solve_batched,
-        },
-        // solve.batched.f64
-        {
-            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrrI_v,
-            .target = (iree_vm_native_function_target_t)
-                iree_sparse_solver_solve_batched_f64,
+                (iree_vm_native_function_target_t)iree_sparse_solver_factor_lu_f64,
         },
         // get_factor_nnz
         {
@@ -1228,17 +1354,35 @@ static const iree_vm_native_function_ptr_t iree_sparse_solver_module_funcs_[] =
             .target = (iree_vm_native_function_target_t)
                 iree_sparse_solver_get_num_supernodes,
         },
-        // factor.lu
+        // release
         {
-            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrr_i,
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_r_v,
             .target =
-                (iree_vm_native_function_target_t)iree_sparse_solver_factor_lu,
+                (iree_vm_native_function_target_t)iree_sparse_solver_release,
         },
-        // factor.lu.f64
+        // solve
         {
-            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrr_i,
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrr_v,
             .target =
-                (iree_vm_native_function_target_t)iree_sparse_solver_factor_lu_f64,
+                (iree_vm_native_function_target_t)iree_sparse_solver_solve,
+        },
+        // solve.batched
+        {
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrrI_v,
+            .target = (iree_vm_native_function_target_t)
+                iree_sparse_solver_solve_batched,
+        },
+        // solve.batched.f64
+        {
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrrI_v,
+            .target = (iree_vm_native_function_target_t)
+                iree_sparse_solver_solve_batched_f64,
+        },
+        // solve.f64
+        {
+            .shim = (iree_vm_native_function_shim_t)iree_vm_shim_rrr_v,
+            .target =
+                (iree_vm_native_function_target_t)iree_sparse_solver_solve_f64,
         },
         // solve.lu
         {
@@ -1267,6 +1411,7 @@ static const iree_vm_native_function_ptr_t iree_sparse_solver_module_funcs_[] =
 };
 
 // Module exports.
+// NOTE: Must be sorted alphabetically by local_name (binary search lookup).
 static const iree_vm_native_export_descriptor_t
     iree_sparse_solver_module_exports_[] = {
         {
@@ -1276,8 +1421,8 @@ static const iree_vm_native_export_descriptor_t
             .attrs = NULL,
         },
         {
-            .local_name = iree_string_view_literal("release"),
-            .calling_convention = iree_string_view_literal("0r_v"),
+            .local_name = iree_string_view_literal("dense_solve_complete"),
+            .calling_convention = iree_string_view_literal("0Irrr_v"),
             .attr_count = 0,
             .attrs = NULL,
         },
@@ -1294,13 +1439,37 @@ static const iree_vm_native_export_descriptor_t
             .attrs = NULL,
         },
         {
-            .local_name = iree_string_view_literal("solve"),
-            .calling_convention = iree_string_view_literal("0rrr_v"),
+            .local_name = iree_string_view_literal("factor.lu"),
+            .calling_convention = iree_string_view_literal("0rrr_i"),
             .attr_count = 0,
             .attrs = NULL,
         },
         {
-            .local_name = iree_string_view_literal("solve.f64"),
+            .local_name = iree_string_view_literal("factor.lu.f64"),
+            .calling_convention = iree_string_view_literal("0rrr_i"),
+            .attr_count = 0,
+            .attrs = NULL,
+        },
+        {
+            .local_name = iree_string_view_literal("get_factor_nnz"),
+            .calling_convention = iree_string_view_literal("0r_I"),
+            .attr_count = 0,
+            .attrs = NULL,
+        },
+        {
+            .local_name = iree_string_view_literal("get_num_supernodes"),
+            .calling_convention = iree_string_view_literal("0r_I"),
+            .attr_count = 0,
+            .attrs = NULL,
+        },
+        {
+            .local_name = iree_string_view_literal("release"),
+            .calling_convention = iree_string_view_literal("0r_v"),
+            .attr_count = 0,
+            .attrs = NULL,
+        },
+        {
+            .local_name = iree_string_view_literal("solve"),
             .calling_convention = iree_string_view_literal("0rrr_v"),
             .attr_count = 0,
             .attrs = NULL,
@@ -1318,26 +1487,8 @@ static const iree_vm_native_export_descriptor_t
             .attrs = NULL,
         },
         {
-            .local_name = iree_string_view_literal("get_factor_nnz"),
-            .calling_convention = iree_string_view_literal("0r_I"),
-            .attr_count = 0,
-            .attrs = NULL,
-        },
-        {
-            .local_name = iree_string_view_literal("get_num_supernodes"),
-            .calling_convention = iree_string_view_literal("0r_I"),
-            .attr_count = 0,
-            .attrs = NULL,
-        },
-        {
-            .local_name = iree_string_view_literal("factor.lu"),
-            .calling_convention = iree_string_view_literal("0rrr_i"),
-            .attr_count = 0,
-            .attrs = NULL,
-        },
-        {
-            .local_name = iree_string_view_literal("factor.lu.f64"),
-            .calling_convention = iree_string_view_literal("0rrr_i"),
+            .local_name = iree_string_view_literal("solve.f64"),
+            .calling_convention = iree_string_view_literal("0rrr_v"),
             .attr_count = 0,
             .attrs = NULL,
         },

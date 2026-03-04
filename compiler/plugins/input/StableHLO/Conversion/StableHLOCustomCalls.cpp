@@ -778,6 +778,49 @@ struct IreeSpsolveRewriter final
 };
 
 //===----------------------------------------------------------------------===//
+// IREE Dense Solve Custom Call
+//===----------------------------------------------------------------------===//
+// Handles JAX's dense solve custom call for IREE backends.
+//
+// Routes to the sparse_solver module which provides a LAPACK-based dense solve
+// via Accelerate on macOS. This avoids the 1.6MB HLO explosion that occurs
+// when JAX inlines LU decomposition on non-LAPACK backends.
+//
+// Integration path:
+// StableHLO custom_call("iree_dense_solve")
+//   → sparse_solver.dense_solve (tensor level, this rewriter)
+//   → sparse_solver.dense_solve (HAL level, during StreamToHAL)
+//   → vm.call @sparse_solver.dense_solve_complete (HAL→VM conversion)
+
+struct IreeDenseSolveRewriter final
+    : OpRewritePattern<mlir::stablehlo::CustomCallOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(mlir::stablehlo::CustomCallOp op,
+                                PatternRewriter &rewriter) const final {
+    if (op.getCallTargetName() != "iree_dense_solve") {
+      return rewriter.notifyMatchFailure(op, "not iree_dense_solve");
+    }
+
+    // Inputs: a (n x n matrix), b (n vector)
+    // Output: x (n vector, same type as b)
+    if (op.getNumOperands() != 2 || op.getNumResults() != 1) {
+      return rewriter.notifyMatchFailure(op, "expected 2 operands, 1 result");
+    }
+
+    Value a = op.getOperand(0);  // Matrix A
+    Value b = op.getOperand(1);  // RHS vector b
+
+    auto bTy = cast<RankedTensorType>(b.getType());
+
+    auto denseSolveOp = rewriter.create<IREE::SparseSolver::DenseSolveOp>(
+        op.getLoc(), bTy, a, b);
+    rewriter.replaceOp(op, denseSolveOp.getResult());
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // Pass Definition.
 //===----------------------------------------------------------------------===//
 
@@ -796,7 +839,7 @@ struct LegalizeStableHLOCustomCalls final
     RewritePatternSet patterns(ctx);
     patterns.add<HouseholderReflectorRewriter, ShapeAssertionDrop,
                  LapackGetrfFfiRewriter, LapackTrsmFfiRewriter,
-                 IreeSpsolveRewriter>(ctx);
+                 IreeSpsolveRewriter, IreeDenseSolveRewriter>(ctx);
     if (failed(applyPatternsGreedily(f, std::move(patterns)))) {
       signalPassFailure();
     }

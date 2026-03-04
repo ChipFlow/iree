@@ -114,6 +114,39 @@ def SparseSolver_CholeskySolveOp : SparseSolver_Op<"cholesky_solve", [Pure]> {
 // sparse_solver.spsolve_complete (HAL-level, takes buffer_views)
 //===----------------------------------------------------------------------===//
 
+//===----------------------------------------------------------------------===//
+// sparse_solver.dense_solve (dense linear solve via LAPACK)
+//===----------------------------------------------------------------------===//
+
+def SparseSolver_DenseSolveOp : SparseSolver_Op<"dense_solve", [Pure]> {
+  let summary = "Dense linear solve via LAPACK gesv";
+  let description = [{
+    Solves Ax = b where A is a dense matrix using LU factorization (LAPACK).
+    Routes to platform LAPACK (Accelerate on macOS).
+
+    Note: Operand types may be tensors (before HAL conversion) or buffer_views
+    (after HAL conversion).
+  }];
+
+  let arguments = (ins
+    AnyType:$matrix,  // Dense matrix A (n x n)
+    AnyType:$rhs      // Right-hand side vector b (n,)
+  );
+
+  let results = (outs
+    AnyType:$solution  // Solution vector x (n,)
+  );
+
+  let assemblyFormat = [{
+    $matrix `,` $rhs attr-dict
+    `:` `(` type($matrix) `,` type($rhs) `)` `->` type($solution)
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// sparse_solver.spsolve_complete (HAL-level, takes buffer_views)
+//===----------------------------------------------------------------------===//
+
 def SparseSolver_SpsolveCompleteOp : SparseSolver_Op<"spsolve_complete", []> {
   let summary = "Complete sparse LU solve with HAL buffer views";
   let description = [{

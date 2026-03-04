@@ -183,33 +183,11 @@ def _scipy_solve_iree_metal(a, b, lower=False, overwrite_a=False, overwrite_b=Fa
                                          transpose_a=True)
         return x
     else:
-        # Use LU decomposition for general matrices
-        # Broadcast leading dimensions of b to the shape of a
-        out_shape = tuple(d_a if d_b == 1 else d_b
-                          for d_a, d_b in zip(a.shape[:-1] + (1,), b.shape))
-        b = lax.broadcast_in_dim(b, out_shape, range(b.ndim))
-
-        lu_, _, permutation = lax_linalg.lu(a)
-
-        # Apply permutation to b
-        # P @ b where P is the permutation matrix
-        m = a.shape[-1]
-        row_indices = jnp.arange(m, dtype=permutation.dtype)[:, None]
-        col_indices = permutation[None, :]
-        P = jnp.where(row_indices == col_indices,
-                      jnp.ones((), dtype=a.dtype),
-                      jnp.zeros((), dtype=a.dtype))
-        pb = P @ b
-
-        # Solve L @ y = P @ b for y (forward substitution)
-        L = jnp.tril(lu_, -1) + jnp.eye(m, dtype=a.dtype)
-        y = lax_linalg.triangular_solve(L, pb, left_side=True, lower=True)
-
-        # Solve U @ x = y for x (back substitution)
-        U = jnp.triu(lu_)
-        x = lax_linalg.triangular_solve(U, y, left_side=True, lower=False)
-
-        return x.squeeze(-1) if a.ndim == b.ndim else x
+        # Use LAPACK dense solve via iree_dense_solve custom call.
+        # This produces ~1KB HLO instead of 1.6MB from inlined LU.
+        b_flat = b.ravel()
+        x = dense_solve_p.bind(a, b_flat)
+        return x.reshape(b.shape)
 
 
 def _scipy_lu_iree_metal(a, permute_l=False, overwrite_a=False, check_finite=True):
@@ -251,6 +229,57 @@ def _scipy_lu_iree_metal(a, permute_l=False, overwrite_a=False, check_finite=Tru
         return jnp.matmul(p, l, precision=lax.Precision.HIGHEST), u
     else:
         return p, l, u
+
+
+from jax._src.core import Primitive as _Primitive, ShapedArray as _ShapedArray
+
+# JAX primitive for dense linear solve via LAPACK (routed through IREE runtime).
+dense_solve_p = _Primitive('iree_dense_solve')
+
+
+def _dense_solve_impl(a, b):
+    import jax.numpy as jnp
+    return jnp.linalg.solve(a, b)
+
+
+dense_solve_p.def_impl(_dense_solve_impl)  # CPU fallback
+
+
+@dense_solve_p.def_abstract_eval
+def _dense_solve_abstract(a, b):
+    assert a.ndim == 2 and a.shape[0] == a.shape[1], (
+        f"dense_solve requires square matrix, got {a.shape}")
+    assert b.ndim == 1 and b.shape[0] == a.shape[0], (
+        f"dense_solve: b shape {b.shape} incompatible with A shape {a.shape}")
+    return _ShapedArray(b.shape, b.dtype)
+
+
+def _dense_solve_lowering(ctx, a, b):
+    """MLIR lowering for dense solve that emits mhlo.custom_call.
+
+    Routes to the sparse_solver module which provides LAPACK-based dense solve:
+    1. Emit MHLO custom_call("iree_dense_solve")
+    2. StableHLOCustomCalls converts to sparse_solver.dense_solve op
+    3. SparseSolver HAL conversion extracts matrix dimension n
+    4. SparseSolver to VM conversion generates vm.call
+    5. VM calls @sparse_solver.dense_solve_complete runtime function
+    6. LAPACK sgetrf + sgetrs executes via Accelerate
+    """
+    from jax._src.lib.mlir import ir
+    from jax._src.lib.mlir.dialects import mhlo
+    from jax._src.interpreters import mlir as jax_mlir
+
+    result_type = jax_mlir.aval_to_ir_type(ctx.avals_out[0])
+
+    result = mhlo.custom_call(
+        [result_type],
+        [a, b],
+        call_target_name=ir.StringAttr.get("iree_dense_solve"),
+        has_side_effect=ir.BoolAttr.get(False),
+        api_version=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 4),
+    )
+
+    return [result]
 
 
 def _spsolve_iree_metal_lowering(ctx, data, indices, indptr, b, *, tol, reorder):
@@ -360,6 +389,15 @@ def _register_linalg_lowerings():
         mlir.lower_fun(_qr_iree_metal, multiple_results=True),
         platform="iree_metal"
     )
+
+    # Register the lowering for dense solve (dense_solve_p)
+    # Uses LAPACK via Accelerate on macOS, routed through sparse_solver module
+    mlir.register_lowering(
+        dense_solve_p,
+        _dense_solve_lowering,
+        platform="iree_metal"
+    )
+    logger.debug("Registered IREE Metal lowering for dense solve (LAPACK)")
 
     # Register the lowering for sparse solve (spsolve)
     # Uses BaSpaCho GPU-accelerated solver via iree_spsolve custom call

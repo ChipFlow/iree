@@ -187,13 +187,67 @@ private:
   SymbolTable &importSymbols;
 };
 
+// Pattern to convert sparse_solver.dense_solve (with buffer_views) to VM calls.
+// At this point, the op has buffer_view operands from HAL conversion.
+// We convert to vm.call @sparse_solver.dense_solve_complete.
+class DenseSolveOpConversion : public OpConversionPattern<DenseSolveOp> {
+public:
+  DenseSolveOpConversion(MLIRContext *context, SymbolTable &importSymbols,
+                         TypeConverter &typeConverter)
+      : OpConversionPattern<DenseSolveOp>(typeConverter, context),
+        importSymbols(importSymbols) {
+    importOp = importSymbols.lookup<IREE::VM::ImportOp>(
+        "sparse_solver.dense_solve_complete");
+  }
+
+  LogicalResult
+  matchAndRewrite(DenseSolveOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!importOp) {
+      return rewriter.notifyMatchFailure(
+          op, "sparse_solver.dense_solve_complete import not found");
+    }
+
+    auto loc = op.getLoc();
+
+    // Read n from attribute stored during HAL conversion.
+    auto nAttr = op->getAttrOfType<IntegerAttr>("sparse_solver.n");
+    if (!nAttr) {
+      return rewriter.notifyMatchFailure(
+          op, "missing sparse_solver.n attribute - "
+              "dynamic shapes not yet supported");
+    }
+
+    Value nVal = IREE::VM::ConstI64Op::create(rewriter, loc, nAttr.getInt());
+    Value matrix = adaptor.getMatrix();
+    Value rhs = adaptor.getRhs();
+
+    // dense_solve_complete writes solution into the rhs buffer (in-place).
+    // Signature: (i64, buffer_view, buffer_view, buffer_view) -> void
+    auto callOp = IREE::VM::CallOp::create(
+        rewriter, loc, importOp.getSymNameAttr(),
+        TypeRange{},  // No return values (void)
+        ValueRange{nVal, matrix, rhs, rhs});  // solution = rhs (in-place)
+    copyImportAttrs(importOp, callOp);
+
+    // The result is the rhs buffer (now containing the solution).
+    rewriter.replaceOp(op, rhs);
+    return success();
+  }
+
+private:
+  SymbolTable &importSymbols;
+  mutable IREE::VM::ImportOp importOp;
+};
+
 void populateSparseSolverToVMPatterns(MLIRContext *context,
                                        SymbolTable &importSymbols,
                                        TypeConverter &typeConverter,
                                        RewritePatternSet &patterns) {
   // Tensor-level ops (for error reporting if they reach VM conversion).
   // These ops should be lowered to HAL-level ops before reaching VM conversion.
-  patterns.insert<SpsolveOpConversion, CholeskySolveOpConversion>(
+  patterns.insert<SpsolveOpConversion, CholeskySolveOpConversion,
+                  DenseSolveOpConversion>(
       context, importSymbols, typeConverter);
 
   // HAL-level ops → vm.call conversion via VMImportOpConversion.
@@ -278,16 +332,51 @@ public:
   }
 };
 
+class DenseSolveHALConversion : public OpConversionPattern<DenseSolveOp> {
+public:
+  using OpConversionPattern<DenseSolveOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(DenseSolveOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultType = getTypeConverter()->convertType(op.getResult().getType());
+    if (!resultType) {
+      return rewriter.notifyMatchFailure(op, "failed to convert result type");
+    }
+
+    // Extract n from the original matrix tensor type before it's converted.
+    auto matType = dyn_cast<RankedTensorType>(op.getMatrix().getType());
+    int64_t n = -1;
+    if (matType && matType.hasStaticShape()) {
+      n = matType.getShape()[0];
+    }
+
+    // Create new op with converted (buffer_view) types.
+    auto newOp = rewriter.create<DenseSolveOp>(
+        op.getLoc(), resultType, adaptor.getMatrix(), adaptor.getRhs());
+
+    // Store n as attribute for VM conversion to use.
+    if (n >= 0) {
+      newOp->setAttr("sparse_solver.n",
+                     rewriter.getIntegerAttr(rewriter.getI64Type(), n));
+    }
+
+    rewriter.replaceOp(op, newOp.getResult());
+    return success();
+  }
+};
+
 void populateStreamToSparseSolverPatterns(MLIRContext *context,
                                            ConversionTarget &target,
                                            TypeConverter &typeConverter,
                                            RewritePatternSet &patterns) {
   // Add conversion patterns for tensor→HAL type conversion
-  patterns.insert<SpsolveHALConversion, CholeskySolveHALConversion>(
+  patterns.insert<SpsolveHALConversion, CholeskySolveHALConversion,
+                  DenseSolveHALConversion>(
       typeConverter, context);
 
   // Mark ops as dynamically legal once converted to HAL types
-  target.addDynamicallyLegalOp<SpsolveOp, CholeskySolveOp>(
+  target.addDynamicallyLegalOp<SpsolveOp, CholeskySolveOp, DenseSolveOp>(
       [](Operation *op) {
         // Legal once all operands/results are NOT tensors
         for (Type type : op->getOperandTypes()) {
