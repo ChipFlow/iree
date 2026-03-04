@@ -189,6 +189,12 @@ jobs:
             || echo "Benchmarks failed (see stderr log)"
           cat /tmp/bench_stderr.log || true
 
+          echo ""; echo "=== VAJAX ring oscillator benchmark ==="
+          JAX_PLATFORMS=cpu,iree_metal uv run python "$GITHUB_WORKSPACE/../vajax/scripts/compare_vacask.py" \
+            --benchmark ring --json-output /tmp/vajax_ring_bench.json \
+            2>&1 | tee /tmp/vajax_ring_bench.log \
+            || echo "VAJAX ring benchmark failed"
+
       - name: Generate benchmark summary
         if: always()
         run: |
@@ -263,6 +269,45 @@ jobs:
           # Also print table to logs
           for line in lines:
               print(line)
+
+          # VAJAX ring oscillator benchmark summary
+          vajax_path = "/tmp/vajax_ring_bench.json"
+          if os.path.exists(vajax_path) and os.path.getsize(vajax_path) > 0:
+              with open(vajax_path) as f:
+                  vajax_data = json.load(f)
+
+              lines = []
+              lines.append("\n## VAJAX Ring Oscillator Benchmark\n")
+              lines.append("| Benchmark | Steps | VAJAX (ms/step) | VACASK ref (ms/step) | Ratio | Startup (s) |")
+              lines.append("|-----------|-------|-----------------|----------------------|-------|-------------|")
+
+              for r in vajax_data:
+                  name = r["name"]
+                  steps = r["steps"]
+                  jax_ms = r["jax_ms_per_step"]
+                  vacask_ms = r.get("vacask_ms_per_step")
+                  ratio = r.get("ratio")
+                  startup = r.get("startup_s", 0)
+                  source = r.get("vacask_source", "")
+
+                  jax_str = f"{jax_ms:.4f}"
+                  if vacask_ms is not None:
+                      marker = "*" if source == "reference" else ""
+                      vacask_str = f"{vacask_ms:.4f}{marker}"
+                      ratio_str = f"{ratio:.2f}x" if ratio else "n/a"
+                  else:
+                      vacask_str = r.get("vacask_note", "n/a")
+                      ratio_str = "n/a"
+
+                  lines.append(f"| {name} | {steps} | {jax_str} | {vacask_str} | {ratio_str} | {startup:.1f} |")
+
+              lines.append("")
+              lines.append("*VACASK reference: AMD Threadripper 7970, single-threaded, KLU solver*\n")
+
+              with open(summary_file, "a") as f:
+                  f.write("\n".join(lines))
+              for line in lines:
+                  print(line)
           PYEOF
 
       - name: Apply IREE Metal patches to JAX tests
@@ -312,6 +357,8 @@ jobs:
             /tmp/metal_failing.txt
             /tmp/bench_results.json
             /tmp/vajax_ring_tests.log
+            /tmp/vajax_ring_bench.json
+            /tmp/vajax_ring_bench.log
           retention-days: 7
 
       - name: Post to Discord on Failure
