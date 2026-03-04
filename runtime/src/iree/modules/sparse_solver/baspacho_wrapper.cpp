@@ -7,6 +7,7 @@
 #include "iree/modules/sparse_solver/baspacho_wrapper.h"
 
 #include <cstring>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -39,6 +40,11 @@ struct baspacho_context_s {
   int64_t nnz;  // Number of non-zeros (in lower triangular part)
   int64_t original_nnz;  // Number of non-zeros (in original input)
 
+  // Full original CSR structure (all entries, not just lower triangle)
+  // Preserved for LU factorization which needs both lower and upper triangles
+  std::vector<int64_t> full_csr_row_ptr;
+  std::vector<int64_t> full_csr_col_idx;
+
   // Lower triangular CSR structure (for loadFromCsr)
   // BaSpaCho expects lower triangular input for Cholesky factorization
   std::vector<int64_t> csr_row_ptr;
@@ -47,6 +53,10 @@ struct baspacho_context_s {
   // Mapping from lower triangular positions to original CSR positions
   // Used to extract lower triangular values from full matrix input
   std::vector<int64_t> lower_to_original_idx;
+
+  // Mapping from upper triangular positions to original CSR positions
+  // Used for LU factorization to extract upper triangle values
+  std::vector<int64_t> upper_to_original_idx;
 
   // Permutation for reordering
   std::vector<int64_t> permutation;
@@ -159,35 +169,39 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
     // For scalar CSR, each block is size 1
     h->block_sizes.assign(n, 1);
 
+    // Store FULL original CSR structure for both Cholesky and LU
+    // Preserve the complete sparsity pattern for LU factorization
+    h->full_csr_row_ptr.assign(row_ptr, row_ptr + n + 1);
+    h->full_csr_col_idx.assign(col_idx, col_idx + nnz);
+
     // BaSpaCho expects LOWER TRIANGULAR CSR for Cholesky factorization.
     // The input may be a full symmetric matrix, so we extract only the
     // lower triangular part (entries where col <= row).
     //
-    // We also build a mapping from lower triangular positions to original
+    // We also build mappings from triangular positions to original
     // positions so we can extract the correct values during factorization.
     h->csr_row_ptr.resize(n + 1);
     h->csr_row_ptr[0] = 0;
 
-    // First pass: count lower triangular entries per row
+    // First pass: count lower and upper triangular entries per row
+    std::vector<int64_t> upper_count(n, 0);
     for (int64_t row = 0; row < n; ++row) {
-      int64_t count = 0;
+      int64_t lower_count = 0;
       for (int64_t ptr = row_ptr[row]; ptr < row_ptr[row + 1]; ++ptr) {
         int64_t col = col_idx[ptr];
         if (col <= row) {  // Lower triangular (including diagonal)
-          ++count;
+          ++lower_count;
+        } else {  // Upper triangular (col > row)
+          ++upper_count[col];  // Count entries in row col of upper triangle
         }
       }
-      h->csr_row_ptr[row + 1] = h->csr_row_ptr[row] + count;
+      h->csr_row_ptr[row + 1] = h->csr_row_ptr[row] + lower_count;
     }
 
     int64_t lower_nnz = h->csr_row_ptr[n];
     h->nnz = lower_nnz;
     h->csr_col_idx.resize(lower_nnz);
     h->lower_to_original_idx.resize(lower_nnz);
-
-    // Debug: print extraction stats
-    fprintf(stderr, "[BaSpaCho] Lower triangular extraction: n=%lld, original_nnz=%lld, lower_nnz=%lld\n",
-            (long long)n, (long long)nnz, (long long)lower_nnz);
 
     // Second pass: extract lower triangular entries and build mapping
     int64_t lower_idx = 0;
@@ -201,6 +215,34 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
         }
       }
     }
+
+    // Build upper triangular extraction mapping for LU factorization
+    // Upper triangle: entries where col > row (stored with row indices as column indices in extraction)
+    std::vector<int64_t> upper_row_ptr(n + 1);
+    upper_row_ptr[0] = 0;
+    for (int64_t col = 1; col <= n; ++col) {
+      upper_row_ptr[col] = upper_row_ptr[col - 1] + upper_count[col - 1];
+    }
+    int64_t upper_nnz = upper_row_ptr[n];
+    h->upper_to_original_idx.resize(upper_nnz);
+
+    // Extract upper triangle mappings
+    std::vector<int64_t> upper_idx_per_col(n, 0);
+    for (int64_t row = 0; row < n; ++row) {
+      for (int64_t ptr = row_ptr[row]; ptr < row_ptr[row + 1]; ++ptr) {
+        int64_t col = col_idx[ptr];
+        if (col > row) {  // Upper triangular
+          // Store mapping indexed by (col, row_count_in_col)
+          int64_t idx = upper_row_ptr[col] + upper_idx_per_col[col];
+          h->upper_to_original_idx[idx] = ptr;
+          ++upper_idx_per_col[col];
+        }
+      }
+    }
+
+    // Debug: print extraction stats
+    fprintf(stderr, "[BaSpaCho] Triangle extraction: n=%lld, original_nnz=%lld, lower_nnz=%lld, upper_nnz=%lld\n",
+            (long long)n, (long long)nnz, (long long)lower_nnz, (long long)upper_nnz);
 
     // Create sparse structure from lower triangular CSR
     BaSpaCho::SparseStructure ss;
@@ -224,6 +266,10 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
       return -2;  // Symbolic analysis failed
     }
 
+    // Initialize upper triangle for LU factorization support
+    // This prepares the skeleton to handle both lower and upper triangle storage
+    h->solver->skel().initUpperTriangle();
+
     // Check if sparse elimination ranges were created
     const auto& ranges = h->solver->sparseEliminationRanges();
     fprintf(stderr, "[BaSpaCho] Sparse elim ranges: %zu elements: [", ranges.size());
@@ -244,7 +290,10 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
     // For Metal backend, MetalMirror is created from std::vector to match
     // BaSpaCho test pattern (ensures proper buffer initialization).
     // Pre-allocate permuted buffer for solve operations.
-    int64_t data_size = h->solver->dataSize();
+    // Use totalDataSize() which includes upper triangle storage for LU factorization
+    int64_t total_data_size = h->solver->skel().totalDataSize();
+    fprintf(stderr, "[BaSpaCho] Data sizes: dataSize=%lld, totalDataSize=%lld\n",
+            (long long)h->solver->dataSize(), (long long)total_data_size);
 
 #ifdef BASPACHO_USE_METAL
     if (h->backend == BaSpaCho::BackendMetal) {
@@ -254,8 +303,9 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
     }
 #endif
     // CPU factor storage (used for CPU backend or fallback)
-    h->factor_data_f32.resize(data_size);
-    h->factor_data_f64.resize(data_size);
+    // Allocate totalDataSize to support both Cholesky (lower only) and LU (both triangles)
+    h->factor_data_f32.resize(total_data_size);
+    h->factor_data_f64.resize(total_data_size);
 
     return 0;  // Success
   } catch (const std::exception& e) {
@@ -438,10 +488,68 @@ int baspacho_factor_lu_f32(baspacho_handle_t h, const float* values,
     h->solver->loadFromCsr(h->csr_row_ptr.data(), h->csr_col_idx.data(),
                            h->block_sizes.data(), lower_values.data(), data);
 
+    // Fill upper triangle for LU factorization
+    // Reference: LUComparisonTest.cpp lines 454-474
+    const auto& skel = h->solver->skel();
+    int64_t upperDataBase = skel.dataSize();
+    int64_t numLumps = skel.numLumps();
+
+    // Build efficient upper triangle lookup from full CSR
+    // Map (row, col) → original CSR index for col > row entries
+    std::map<std::pair<int64_t, int64_t>, int64_t> upperLookup;
+    for (int64_t row = 0; row < h->n; ++row) {
+      for (int64_t ptr = 0; ptr < (int64_t)h->full_csr_col_idx.size(); ++ptr) {
+        // Find entries in original CSR for this row
+        if (ptr >= h->full_csr_row_ptr[row] && ptr < h->full_csr_row_ptr[row + 1]) {
+          int64_t col = h->full_csr_col_idx[ptr];
+          if (col > row) {  // Upper triangle
+            upperLookup[{row, col}] = ptr;
+          }
+        }
+      }
+    }
+
+    // Iterate through upper triangle storage
+    // upperChainData contains offsets relative to upperDataBase
+    for (int64_t l = 0; l < numLumps; l++) {
+      int64_t upperRowStart = skel.upperChainRowPtr[l];
+      int64_t upperRowEnd = skel.upperChainRowPtr[l + 1];
+      int64_t lumpStartIdx = skel.lumpStart[l];
+      int64_t lumpSize = skel.lumpStart[l + 1] - lumpStartIdx;
+
+      for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+        int64_t colSpan = skel.upperChainColSpan[i];
+        int64_t colStart = skel.spanStart[colSpan];
+        int64_t colSize = skel.spanStart[colSpan + 1] - colStart;
+        int64_t upperDataOffset = upperDataBase + skel.upperChainData[i];
+
+        // Extract upper triangle values from the full CSR matrix
+        // These are entries where row < col (from lump rows to span columns)
+        for (int64_t r = 0; r < lumpSize; r++) {
+          for (int64_t c = 0; c < colSize; c++) {
+            int64_t matRow = lumpStartIdx + r;
+            int64_t matCol = colStart + c;
+            float val = 0.0f;
+
+            // Look up value in the full CSR for this (row, col) position
+            auto it = upperLookup.find({matRow, matCol});
+            if (it != upperLookup.end()) {
+              val = values[it->second];
+            }
+            data[upperDataOffset + r * colSize + c] = val;
+          }
+        }
+      }
+    }
+
+    fprintf(stderr, "[BaSpaCho] factor_lu_f32: loaded upper triangle, dataSize=%lld, totalDataSize=%lld\n",
+            (long long)skel.dataSize(), (long long)skel.totalDataSize());
+
     // Perform LU factorization with partial pivoting
     h->solver->factorLU(data, pivots);
     return 0;
-  } catch (const std::exception&) {
+  } catch (const std::exception& e) {
+    fprintf(stderr, "BaSpaCho factor_lu_f32 exception: %s\n", e.what());
     return -2;
   }
 }
@@ -464,9 +572,57 @@ int baspacho_factor_lu_f64(baspacho_handle_t h, const double* values,
     h->solver->loadFromCsr(h->csr_row_ptr.data(), h->csr_col_idx.data(),
                            h->block_sizes.data(), lower_values.data(), data);
 
+    // Fill upper triangle for LU factorization (same pattern as f32)
+    const auto& skel = h->solver->skel();
+    int64_t upperDataBase = skel.dataSize();
+    int64_t numLumps = skel.numLumps();
+
+    // Build efficient upper triangle lookup from full CSR
+    std::map<std::pair<int64_t, int64_t>, int64_t> upperLookup;
+    for (int64_t row = 0; row < h->n; ++row) {
+      for (int64_t ptr = 0; ptr < (int64_t)h->full_csr_col_idx.size(); ++ptr) {
+        if (ptr >= h->full_csr_row_ptr[row] && ptr < h->full_csr_row_ptr[row + 1]) {
+          int64_t col = h->full_csr_col_idx[ptr];
+          if (col > row) {
+            upperLookup[{row, col}] = ptr;
+          }
+        }
+      }
+    }
+
+    // Iterate through upper triangle storage
+    for (int64_t l = 0; l < numLumps; l++) {
+      int64_t upperRowStart = skel.upperChainRowPtr[l];
+      int64_t upperRowEnd = skel.upperChainRowPtr[l + 1];
+      int64_t lumpStartIdx = skel.lumpStart[l];
+      int64_t lumpSize = skel.lumpStart[l + 1] - lumpStartIdx;
+
+      for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+        int64_t colSpan = skel.upperChainColSpan[i];
+        int64_t colStart = skel.spanStart[colSpan];
+        int64_t colSize = skel.spanStart[colSpan + 1] - colStart;
+        int64_t upperDataOffset = upperDataBase + skel.upperChainData[i];
+
+        for (int64_t r = 0; r < lumpSize; r++) {
+          for (int64_t c = 0; c < colSize; c++) {
+            int64_t matRow = lumpStartIdx + r;
+            int64_t matCol = colStart + c;
+            double val = 0.0;
+
+            auto it = upperLookup.find({matRow, matCol});
+            if (it != upperLookup.end()) {
+              val = values[it->second];
+            }
+            data[upperDataOffset + r * colSize + c] = val;
+          }
+        }
+      }
+    }
+
     h->solver->factorLU(data, pivots);
     return 0;
-  } catch (const std::exception&) {
+  } catch (const std::exception& e) {
+    fprintf(stderr, "BaSpaCho factor_lu_f64 exception: %s\n", e.what());
     return -2;
   }
 }
