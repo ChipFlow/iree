@@ -98,8 +98,13 @@ jobs:
 
       # Install vajax separately WITH build isolation (vajax needs hatchling,
       # openvaf-py needs maturin — these are auto-installed with isolation).
+      # Then reinstall as editable from a local clone with submodules so that
+      # vendored model files (OpenVAF, VACASK benchmarks) are accessible.
       - name: Install vajax
-        run: uv sync --frozen --extra vajax -v
+        run: |
+          uv sync --frozen --extra vajax -v
+          git clone --recurse-submodules --depth=1 https://github.com/chipflow/vajax.git ../vajax
+          uv pip install -e ../vajax --no-deps
 
       - name: ccache stats
         run: ccache -s

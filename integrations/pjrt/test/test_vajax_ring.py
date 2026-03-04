@@ -8,7 +8,7 @@ for early collapse decisions during parsing.
 """
 
 import platform
-import sys
+from pathlib import Path
 
 import pytest
 
@@ -18,20 +18,34 @@ if platform.system() != "Darwin":
 
 try:
     from vajax.analysis import CircuitEngine
-    from vajax.benchmarks.registry import get_benchmark
 except ImportError:
     pytest.skip(
         "vajax not installed (run: uv sync --extra vajax)", allow_module_level=True
     )
 
-import jax
+# Ring benchmark parameters (from runme.sim: step=0.05n stop=1u)
+RING_DT = 5e-11
+RING_T_STOP = 1e-6
+
+# Local fixture path (bundled from VACASK benchmark suite)
+_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "ring" / "vacask"
 
 
-def _get_ring_info():
-    info = get_benchmark("ring")
-    if info is None:
-        pytest.skip("ring benchmark not found in vajax registry")
-    return info
+def _get_ring_sim_path() -> Path:
+    """Get ring benchmark sim path: try registry first, fall back to local fixture."""
+    try:
+        from vajax.benchmarks.registry import get_benchmark
+
+        info = get_benchmark("ring")
+        if info is not None:
+            return info.sim_path
+    except Exception:
+        pass
+
+    sim_path = _FIXTURE_DIR / "runme.sim"
+    if not sim_path.exists():
+        pytest.skip("ring benchmark data not found (neither registry nor fixtures)")
+    return sim_path
 
 
 class TestVajaxRing:
@@ -39,8 +53,8 @@ class TestVajaxRing:
 
     def test_ring_parse(self):
         """Verify the ring benchmark parses correctly."""
-        info = _get_ring_info()
-        engine = CircuitEngine(info.sim_path)
+        sim_path = _get_ring_sim_path()
+        engine = CircuitEngine(sim_path)
         engine.parse()
 
         assert engine.num_nodes > 0, "No nodes parsed"
@@ -50,13 +64,13 @@ class TestVajaxRing:
 
     def test_ring_transient_short(self):
         """Run a short transient (10 timesteps) to verify basic execution."""
-        info = _get_ring_info()
-        engine = CircuitEngine(info.sim_path)
+        sim_path = _get_ring_sim_path()
+        engine = CircuitEngine(sim_path)
         engine.parse()
 
         # Short run: just 10 timesteps to verify it works
-        t_stop = info.dt * 10
-        engine.prepare(t_stop=t_stop, dt=info.dt, use_sparse=False)
+        t_stop = RING_DT * 10
+        engine.prepare(t_stop=t_stop, dt=RING_DT, use_sparse=False)
         result = engine.run_transient()
 
         assert result.num_steps > 0, "No timesteps returned"
@@ -69,11 +83,11 @@ class TestVajaxRing:
         This is a more demanding test that exercises the full simulation
         loop including adaptive timestepping with while_loop.
         """
-        info = _get_ring_info()
-        engine = CircuitEngine(info.sim_path)
+        sim_path = _get_ring_sim_path()
+        engine = CircuitEngine(sim_path)
         engine.parse()
 
-        engine.prepare(t_stop=info.t_stop, dt=info.dt, use_sparse=False)
+        engine.prepare(t_stop=RING_T_STOP, dt=RING_DT, use_sparse=False)
         result = engine.run_transient()
 
         assert result.num_steps > 100, f"Too few steps: {result.num_steps}"
@@ -83,26 +97,26 @@ class TestVajaxRing:
 
 if __name__ == "__main__":
     # Allow running as a script: JAX_PLATFORMS=iree_metal uv run python test_vajax_ring.py
-    info = _get_ring_info()
-    print(f"Ring benchmark: {info.title}")
-    print(f"  dt={info.dt:.2e}, t_stop={info.t_stop:.2e}")
+    sim_path = _get_ring_sim_path()
+    print(f"Ring benchmark: {sim_path}")
+    print(f"  dt={RING_DT:.2e}, t_stop={RING_T_STOP:.2e}")
 
     print("\n=== Parse test ===")
-    engine = CircuitEngine(info.sim_path)
+    engine = CircuitEngine(sim_path)
     engine.parse()
     print(f"  {engine.num_nodes} nodes, {len(engine.devices)} devices")
 
     print("\n=== Short transient (10 steps) ===")
-    engine2 = CircuitEngine(info.sim_path)
+    engine2 = CircuitEngine(sim_path)
     engine2.parse()
-    engine2.prepare(t_stop=info.dt * 10, dt=info.dt, use_sparse=False)
+    engine2.prepare(t_stop=RING_DT * 10, dt=RING_DT, use_sparse=False)
     result = engine2.run_transient()
     print(f"  {result.num_steps} steps, convergence={result.stats.get('convergence_rate', 0):.0%}")
 
     print("\n=== Full transient ===")
-    engine3 = CircuitEngine(info.sim_path)
+    engine3 = CircuitEngine(sim_path)
     engine3.parse()
-    engine3.prepare(t_stop=info.t_stop, dt=info.dt, use_sparse=False)
+    engine3.prepare(t_stop=RING_T_STOP, dt=RING_DT, use_sparse=False)
     result = engine3.run_transient()
     print(f"  {result.num_steps} steps, convergence={result.stats.get('convergence_rate', 0):.0%}")
 
