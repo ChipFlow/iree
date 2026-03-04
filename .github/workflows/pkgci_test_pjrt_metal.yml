@@ -127,20 +127,21 @@ jobs:
           print(f'Metal devices: {jax.devices()}')
           "
 
-          # Run tests in parallel (they are short and GPU-safe to overlap)
+          # Run tests in parallel (they are short and GPU-safe to overlap).
+          # Each test script configures its own JAX_PLATFORMS internally.
           echo "=== Running tests in parallel ==="
 
           (
-            echo "--- Metal PJRT tests ---"
+            echo "--- Metal PJRT tests (Metal backend) ---"
             uv run python -m pytest test_metal.py -v 2>&1 || echo "Metal tests failed (possibly due to VM GPU limitations)"
-            echo "--- Shardy dialect tests ---"
+            echo "--- Shardy dialect tests (Metal backend) ---"
             JAX_PLATFORMS=iree_metal uv run python test_shardy.py 2>&1 || echo "Shardy tests failed (possibly due to VM GPU limitations)"
           ) > /tmp/metal_tests.log 2>&1 &
           pid_metal=$!
 
           (
-            echo "--- Comprehensive Metal tests ---"
-            JAX_PLATFORMS=iree_metal uv run python test_metal_comprehensive.py 2>&1 || echo "Some comprehensive tests failed"
+            echo "--- Comprehensive Metal tests (Metal backend) ---"
+            uv run python test_metal_comprehensive.py 2>&1 || echo "Some comprehensive tests failed"
           ) > /tmp/comprehensive_tests.log 2>&1 &
           pid_comprehensive=$!
 
@@ -167,8 +168,8 @@ jobs:
           pid_differential=$!
 
           (
-            echo "--- VAJAX ring oscillator tests ---"
-            JAX_PLATFORMS=cpu,iree_metal uv run python -m pytest test_vajax_ring.py -v 2>&1 || echo "VAJAX ring tests failed"
+            echo "--- VAJAX ring oscillator tests (CPU backend) ---"
+            uv run python -m pytest test_vajax_ring.py -v 2>&1 || echo "VAJAX ring tests failed"
           ) > /tmp/vajax_ring_tests.log 2>&1 &
           pid_vajax=$!
 

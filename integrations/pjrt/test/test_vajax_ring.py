@@ -1,20 +1,31 @@
-"""Test VAJAX ring oscillator benchmark on Metal via IREE PJRT.
+"""Test VAJAX ring oscillator simulation (CPU backend).
+
+These tests run EXCLUSIVELY on the CPU backend. vajax's transient solver
+uses jax.scipy.linalg.solve inside nested while_loops, which causes
+compilation to hang on Metal (HLO explosion from inlined LU decomposition).
+
+Once the iree_spsolve custom_call pipeline is wired into vajax, these
+tests can be extended to also run on Metal.
 
 Requires: vajax optional dependency (uv sync --extra vajax)
-Run: JAX_PLATFORMS=cpu,iree_metal uv run python -m pytest test_vajax_ring.py -v
-
-Note: cpu platform is needed because vajax uses jax.devices("cpu") internally
-for early collapse decisions during parsing.
+Run: uv run python -m pytest test_vajax_ring.py -v
 """
 
+import os
 import platform
 from pathlib import Path
 
 import pytest
 
-# Skip on non-macOS
+# Skip on non-macOS (CI only has macOS runners for this workflow)
 if platform.system() != "Darwin":
-    pytest.skip("Metal requires macOS", allow_module_level=True)
+    pytest.skip("Metal CI requires macOS", allow_module_level=True)
+
+# Configure CPU-only backend BEFORE importing JAX.
+# vajax internally calls jax.devices("cpu") for early collapse decisions,
+# so the cpu platform must be available. Metal is excluded because
+# jax.scipy.linalg.solve triggers 1.6MB+ HLO on Metal (no getrf custom_call).
+os.environ["JAX_PLATFORMS"] = "cpu"
 
 try:
     from vajax.analysis import CircuitEngine

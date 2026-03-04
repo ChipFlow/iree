@@ -7,34 +7,41 @@
 
 """Comprehensive test suite for IREE Metal PJRT plugin.
 
-This test suite covers functionality gaps in the basic tests:
-- Determinism/stability (repeated execution)
-- Identity/constant operations
-- Control flow primitives
-- Data type coverage
-- Scatter/gather operations
-- Random number generation
-- Linear algebra operations
-- Buffer donation
+These tests run EXCLUSIVELY on the IREE Metal backend.
+Run: uv run python test_metal_comprehensive.py
 
-Run with: JAX_PLATFORMS=iree_metal python test_metal_comprehensive.py
+The test configures JAX_PLATFORMS=iree_metal internally — no env var needed.
+
+Covers: determinism, identity/constant ops, control flow, data types,
+scatter/gather, random numbers, linear algebra, reductions, buffer donation.
 """
 
+import os
 import sys
 import platform
 import argparse
 from typing import List, Tuple
 import traceback
 
-# Check if we're on macOS
+# Skip on non-macOS
 if platform.system() != "Darwin":
     print(f"Skipping Metal tests on {platform.system()} (Metal requires macOS)")
     sys.exit(0)
+
+# Configure Metal backend BEFORE importing JAX
+os.environ["JAX_PLATFORMS"] = "iree_metal"
 
 import jax
 import jax.numpy as jnp
 from jax import lax
 import numpy as np
+
+# Verify Metal device is available.
+# With JAX_PLATFORMS=iree_metal, any device found IS a Metal device.
+_devices = jax.devices()
+if not _devices:
+    print("ERROR: No IREE Metal device available. Cannot run Metal-only tests.")
+    sys.exit(1)
 
 
 class TestResult:

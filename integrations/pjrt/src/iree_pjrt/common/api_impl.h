@@ -149,11 +149,15 @@ class DeviceDescription {
  public:
   DeviceDescription(int32_t client_id, iree_hal_device_info_t* info)
       : client_id_(client_id), info_(info) {
-    // Initialize debug strings.
-    user_string_ = std::string(info_->path.data, info_->path.size);
-    debug_string_ = std::string(info_->name.data, info_->name.size);
-    // Use "device" as the memory kind to match JAX/XLA expectations.
-    // The device name is used for debug_string instead.
+    // user_string (PJRT ToString): shown by repr(device) and jax.devices().
+    // Use the human-readable device name (e.g., "Apple M4 Pro").
+    user_string_ = std::string(info_->name.data, info_->name.size);
+    // debug_string (PJRT DebugString): shown by str(device).
+    // Include both name and path for debugging.
+    debug_string_ = std::string(info_->name.data, info_->name.size) + " (" +
+                    std::string(info_->path.data, info_->path.size) + ")";
+    // kind_string (PJRT Kind): shown by device.device_kind.
+    // Must be "device" to match JAX/XLA sharding memory kind expectations.
     kind_string_ = "device";
   }
   ~DeviceDescription();
