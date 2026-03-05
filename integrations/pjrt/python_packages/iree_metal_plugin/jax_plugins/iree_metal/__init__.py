@@ -155,6 +155,9 @@ def _qr_iree_metal(a, *, full_matrices, pivoting, use_magma):
     return q, r
 
 
+_original_scipy_solve = None  # Saved during _register_linalg_lowerings
+
+
 def _scipy_solve_iree_metal(a, b, lower=False, overwrite_a=False, overwrite_b=False,
                             debug=False, check_finite=True, assume_a='gen'):
     """Replacement for jax.scipy.linalg.solve that avoids nested JIT issue.
@@ -162,11 +165,25 @@ def _scipy_solve_iree_metal(a, b, lower=False, overwrite_a=False, overwrite_b=Fa
     IREE Metal has a bug where nested JIT with static arguments causes
     FlatBuffer verification errors. This implementation avoids that by
     providing a non-nested solve implementation.
+
+    When the default device is not iree_metal (e.g. cpu), delegates to the
+    original JAX implementation so dense_solve_p lowering is not needed.
     """
+    import jax
     import jax.numpy as jnp
     from jax import lax
     from jax._src.lax import linalg as lax_linalg
     from jax._src.numpy.util import promote_dtypes_inexact
+
+    # If the default backend is not Metal, use the original JAX solve
+    try:
+        default_backend = jax.default_backend()
+    except Exception:
+        default_backend = "cpu"
+    if default_backend != "iree_metal" and _original_scipy_solve is not None:
+        return _original_scipy_solve(a, b, lower=lower, overwrite_a=overwrite_a,
+                                     overwrite_b=overwrite_b, debug=debug,
+                                     check_finite=check_finite, assume_a=assume_a)
 
     del overwrite_a, overwrite_b, debug, check_finite  # unused
 
@@ -415,6 +432,8 @@ def _register_linalg_lowerings():
     # Patch jax.scipy.linalg functions to avoid nested JIT issue
     # The original functions have nested JIT decorators which cause FlatBuffer
     # verification errors when called from a JIT context on IREE Metal
+    global _original_scipy_solve
+    _original_scipy_solve = jax.scipy.linalg.solve
     jax.scipy.linalg.lu = _scipy_lu_iree_metal
     jax.scipy.linalg.solve = _scipy_solve_iree_metal
 
