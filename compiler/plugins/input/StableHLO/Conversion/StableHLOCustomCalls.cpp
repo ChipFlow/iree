@@ -12,6 +12,8 @@
 #include "compiler/plugins/input/StableHLO/Conversion/Rewriters.h"
 #include "iree/compiler/Dialect/SparseSolver/IR/SparseSolverDialect.h"
 #include "iree/compiler/Dialect/SparseSolver/IR/SparseSolverOps.h"
+#include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
+#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -786,9 +788,17 @@ struct IreeSpsolveRewriter final
 // via Accelerate on macOS. This avoids the 1.6MB HLO explosion that occurs
 // when JAX inlines LU decomposition on non-LAPACK backends.
 //
+// The dense_solve op is outlined into a separate util.func to avoid issues with
+// the ConvertToStreamPass. When an unknown op (like DenseSolveOp) appears inside
+// an scf.while loop, GenericResourcePattern wraps it with tensor import/export
+// which breaks the while loop's 1:N type conversion. By outlining to util.func,
+// the while loop body only contains util.call (which has proper Stream conversion
+// patterns with OneToNOpAdaptor support).
+//
 // Integration path:
 // StableHLO custom_call("iree_dense_solve")
-//   → sparse_solver.dense_solve (tensor level, this rewriter)
+//   → util.call @__iree_dense_solve_NxN (this rewriter, outlined)
+//     └→ sparse_solver.dense_solve (inside the util.func body)
 //   → sparse_solver.dense_solve (HAL level, during StreamToHAL)
 //   → vm.call @sparse_solver.dense_solve_complete (HAL→VM conversion)
 
@@ -811,11 +821,50 @@ struct IreeDenseSolveRewriter final
     Value a = op.getOperand(0);  // Matrix A
     Value b = op.getOperand(1);  // RHS vector b
 
+    auto aTy = cast<RankedTensorType>(a.getType());
     auto bTy = cast<RankedTensorType>(b.getType());
 
-    auto denseSolveOp = rewriter.create<IREE::SparseSolver::DenseSolveOp>(
-        op.getLoc(), bTy, a, b);
-    rewriter.replaceOp(op, denseSolveOp.getResult());
+    // Get the matrix dimension for a unique function name.
+    int64_t n = aTy.getShape()[0];
+
+    // Find or create the outlined util.func in the parent module.
+    auto moduleOp = op->getParentOfType<ModuleOp>();
+    if (!moduleOp) {
+      return rewriter.notifyMatchFailure(op, "no parent module");
+    }
+
+    std::string funcName =
+        "__iree_dense_solve_" + std::to_string(n) + "x" + std::to_string(n);
+
+    auto funcOp =
+        moduleOp.lookupSymbol<IREE::Util::FuncOp>(funcName);
+    if (!funcOp) {
+      // Create the outlined function.
+      auto funcType =
+          rewriter.getFunctionType({aTy, bTy}, {bTy});
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToEnd(moduleOp.getBody());
+      funcOp = IREE::Util::FuncOp::create(rewriter, op.getLoc(), funcName,
+                                           funcType);
+      funcOp.setVisibility(SymbolTable::Visibility::Private);
+      funcOp.setInliningPolicyAttr(
+          rewriter.getAttr<IREE::Util::InlineNeverAttr>());
+
+      // Build the function body: dense_solve + return.
+      Block *entryBlock = funcOp.addEntryBlock();
+      OpBuilder funcBuilder = OpBuilder::atBlockBegin(entryBlock);
+      auto denseSolveOp =
+          funcBuilder.create<IREE::SparseSolver::DenseSolveOp>(
+              op.getLoc(), bTy, entryBlock->getArgument(0),
+              entryBlock->getArgument(1));
+      IREE::Util::ReturnOp::create(funcBuilder, op.getLoc(),
+                                    ValueRange{denseSolveOp.getResult()});
+    }
+
+    // Replace the custom_call with util.call to the outlined function.
+    auto callOp = rewriter.create<IREE::Util::CallOp>(
+        op.getLoc(), funcOp, ValueRange{a, b});
+    rewriter.replaceOp(op, callOp.getResults());
     return success();
   }
 };
@@ -829,7 +878,8 @@ struct LegalizeStableHLOCustomCalls final
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, linalg::LinalgDialect, scf::SCFDialect,
                     mlir::stablehlo::StablehloDialect, tensor::TensorDialect,
-                    IREE::SparseSolver::SparseSolverDialect>();
+                    IREE::SparseSolver::SparseSolverDialect,
+                    IREE::Util::UtilDialect>();
   }
 
   void runOnOperation() override {

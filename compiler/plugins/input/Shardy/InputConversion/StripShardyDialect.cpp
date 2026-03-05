@@ -6,6 +6,7 @@
 
 #include "compiler/plugins/input/Shardy/InputConversion/Passes.h"
 #include "llvm/ADT/SmallVector.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -76,6 +77,23 @@ struct StripShardyDialectPass
       op->getResult(0).replaceAllUsesWith(op->getOperand(0));
       op->erase();
     }
+
+    // Strip sdy.sharding from function argument and result attributes.
+    // StripShardyAttributesPattern handles op-level attributes, but function
+    // arg/result attrs are stored in DictArrayAttr and need separate handling.
+    module.walk([&](FunctionOpInterface funcOp) {
+      for (unsigned i = 0; i < funcOp.getNumArguments(); ++i) {
+        if (funcOp.getArgAttr(i, "sdy.sharding")) {
+          funcOp.removeArgAttr(i, StringAttr::get(ctx, "sdy.sharding"));
+        }
+      }
+      for (unsigned i = 0; i < funcOp.getNumResults(); ++i) {
+        if (funcOp.getResultAttr(i, "sdy.sharding")) {
+          funcOp.removeResultAttr(
+              i, StringAttr::get(ctx, "sdy.sharding"));
+        }
+      }
+    });
 
     // Erase mesh ops
     for (Operation *op : meshOpsToErase) {

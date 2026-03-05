@@ -14,6 +14,7 @@ iree_cc_library(
     "StripShardyDialect.cpp"
   DEPS
     MLIRIR
+    MLIRFunctionInterfaces
     MLIRPass
     MLIRTransformUtils
     SdyDialect
