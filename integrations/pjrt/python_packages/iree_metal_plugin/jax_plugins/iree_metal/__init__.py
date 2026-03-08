@@ -429,6 +429,20 @@ def _register_linalg_lowerings():
     except ImportError:
         logger.debug("jax.experimental.sparse not available, skipping spsolve lowering")
 
+    # Register no-op debug_callback lowering for IREE Metal.
+    # JAX's emit_python_callback emits xla_ffi_python_cpu_callback custom calls
+    # which IREE can't handle. Debug callbacks are for progress reporting only,
+    # so dropping them is safe.
+    from jax._src.debugging import debug_callback_p
+
+    def _debug_callback_noop(ctx, *args, **kwargs):
+        return []
+
+    mlir.register_lowering(
+        debug_callback_p, _debug_callback_noop, platform="iree_metal"
+    )
+    logger.debug("Registered IREE Metal no-op lowering for debug_callback")
+
     # Patch jax.scipy.linalg functions to avoid nested JIT issue
     # The original functions have nested JIT decorators which cause FlatBuffer
     # verification errors when called from a JIT context on IREE Metal

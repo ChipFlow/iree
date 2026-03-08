@@ -11,6 +11,7 @@
 #include "iree/hal/drivers/metal/registration/driver_module.h"
 #include "iree/hal/drivers/metal/shared_event.h"
 #include "iree/modules/hal/module.h"
+#include "iree_pjrt/common/pjrt_trace.h"
 
 #if IREE_DENSE_BLAS_HAVE_METAL
 #include "iree/modules/dense_blas/module.h"
@@ -111,6 +112,7 @@ iree_status_t MetalClientInstance::PopulateVMModules(
 EventInstance* MetalClientInstance::CreateEvent(
     iree::vm::ref<iree_hal_fence_t> fence) {
   if (!fence) {
+    PJRT_TRACE0("CreateEvent(null)");
     return new EventInstance(/*fence=*/nullptr);
   }
 
@@ -119,6 +121,8 @@ EventInstance* MetalClientInstance::CreateEvent(
 
   iree_hal_semaphore_list_t sems =
       iree_hal_fence_semaphore_list(event->fence());
+
+  PJRT_TRACE("CreateEvent", "sems=%zu", (size_t)sems.count);
 
   if (sems.count == 0) {
     // No semaphores to wait on — signal immediately.
@@ -131,6 +135,7 @@ EventInstance* MetalClientInstance::CreateEvent(
     id<MTLSharedEvent> shared_event =
         iree_hal_metal_shared_event_handle(sems.semaphores[0]);
     uint64_t target_value = sems.payload_values[0];
+    PJRT_TRACE("CreateEvent.notify", "target_value=%llu", (unsigned long long)target_value);
 
     // Prevent event from being freed before the notification fires.
     // The block retains 'event' as a raw pointer; the caller retains
@@ -141,6 +146,7 @@ EventInstance* MetalClientInstance::CreateEvent(
     [shared_event notifyListener:listener
                          atValue:target_value
                            block:^(id<MTLSharedEvent> se, uint64_t v) {
+                             PJRT_TRACE("EventFired", "value=%llu", (unsigned long long)v);
                              if (v >= IREE_HAL_SEMAPHORE_FAILURE_VALUE) {
                                event->SignalReady(iree_make_status(
                                    IREE_STATUS_ABORTED,
