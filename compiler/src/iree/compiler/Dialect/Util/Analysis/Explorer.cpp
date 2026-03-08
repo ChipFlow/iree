@@ -1143,6 +1143,10 @@ TraversalResult Explorer::walkTransitiveUses(Value value, UseWalkFn fn,
     // times!).
     for (auto &use : work.getUses()) {
       auto *ownerOp = use.getOwner();
+      if (!ownerOp) {
+        LLVM_DEBUG(llvm::dbgs() << "  !! skipping use with null owner\n");
+        continue;
+      }
       if (!processedValues.insert(&use).second)
         continue;
 
@@ -1207,11 +1211,19 @@ TraversalResult Explorer::walkTransitiveUses(Value value, UseWalkFn fn,
         result |= traverseReturnOp(ownerOp, use.getOperandNumber());
       }
 
+      // Map return-like ops to parent results, but only for ops NOT already
+      // handled by RegionBranchTerminatorOpInterface (which does proper
+      // successor analysis including scf.while asymmetric operand counts).
       if (ownerOp->hasTrait<OpTrait::ReturnLike>() &&
-          !isa<CallableOpInterface>(ownerOp->getParentOp())) {
+          !isa<CallableOpInterface>(ownerOp->getParentOp()) &&
+          !isa<RegionBranchTerminatorOpInterface>(ownerOp)) {
         auto parent = ownerOp->getParentOp();
-        auto result = parent->getResult(use.getOperandNumber());
-        worklist.insert(result);
+        auto operandIdx = use.getOperandNumber();
+        // Guard against operand index exceeding parent result count.
+        if (operandIdx < parent->getNumResults()) {
+          auto result = parent->getResult(operandIdx);
+          worklist.insert(result);
+        }
       }
 
       // Step across global stores and into all of the loads across the program.

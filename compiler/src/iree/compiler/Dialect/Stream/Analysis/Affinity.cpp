@@ -538,12 +538,18 @@ TraversalResult ValueConsumerAffinityPVS::updateFromUse(Value value,
           auto &valueUsage = solver.getElementFor<ValueConsumerAffinityPVS>(
               *this, value, DFX::Resolution::REQUIRED);
           newState ^= valueUsage.getState();
-          auto &parentUsage = solver.getElementFor<ValueConsumerAffinityPVS>(
-              *this,
-              Position::forValue(
-                  whileOp->getResult(operand.getOperandNumber())),
-              DFX::Resolution::REQUIRED);
-          newState ^= parentUsage.getState();
+          // Only map to parent results for operands that correspond to
+          // while results. For asymmetric scf.while, the after-region yield
+          // can have more operands (matching before-region args) than the
+          // while op has results (matching condition args).
+          if (operand.getOperandNumber() < whileOp->getNumResults()) {
+            auto &parentUsage = solver.getElementFor<ValueConsumerAffinityPVS>(
+                *this,
+                Position::forValue(
+                    whileOp->getResult(operand.getOperandNumber())),
+                DFX::Resolution::REQUIRED);
+            newState ^= parentUsage.getState();
+          }
           return TraversalResult::COMPLETE;
         } else if (auto forOp = dyn_cast<mlir::scf::ForOp>(op->getParentOp())) {
           auto value = Position::forValue(
@@ -1291,6 +1297,7 @@ LogicalResult AffinityAnalysis::run() {
   // There's some missing logic in the element initialization, though, and by
   // initializing all values we side-step that and work with test programs that
   // may not have I/O edges that we could easily latch on to here.
+  //
   explorer.forEachFunctionLikeOp([&](FunctionOpInterface funcOp) {
     for (auto &block : funcOp.getBlocks()) {
       for (auto arg : block.getArguments()) {

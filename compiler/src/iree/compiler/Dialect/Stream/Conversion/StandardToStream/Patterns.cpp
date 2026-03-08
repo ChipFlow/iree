@@ -316,10 +316,25 @@ struct ScfWhileOpConversion
       expandedTypes.append(newTypes);
     }
 
-    TypeConverter::SignatureConversion newSignature(op.getNumOperands());
+    // Build signature conversion for the `before` (condition) region.
+    // The before region's block args match the init operands.
+    TypeConverter::SignatureConversion beforeSignature(op.getNumOperands());
     for (auto argType : llvm::enumerate(op.getOperandTypes())) {
       if (failed(typeConverter.convertSignatureArg(
-              argType.index(), argType.value(), newSignature))) {
+              argType.index(), argType.value(), beforeSignature))) {
+        return failure();
+      }
+    }
+
+    // Build signature conversion for the `after` (body) region.
+    // The after region's block args match the scf.condition args (= results),
+    // which may differ from the init operands in scf.while.
+    auto afterBlock = &op.getAfter().front();
+    TypeConverter::SignatureConversion afterSignature(
+        afterBlock->getNumArguments());
+    for (auto argType : llvm::enumerate(afterBlock->getArgumentTypes())) {
+      if (failed(typeConverter.convertSignatureArg(
+              argType.index(), argType.value(), afterSignature))) {
         return failure();
       }
     }
@@ -335,7 +350,7 @@ struct ScfWhileOpConversion
     rewriter.inlineRegionBefore(op.getBefore(), whileOp.getBefore(),
                                 whileOp.getBefore().end());
     if (failed(rewriter.convertRegionTypes(&whileOp.getBefore(), typeConverter,
-                                           &newSignature))) {
+                                           &beforeSignature))) {
       return failure();
     }
 
@@ -344,7 +359,7 @@ struct ScfWhileOpConversion
     rewriter.inlineRegionBefore(op.getAfter(), whileOp.getAfter(),
                                 whileOp.getAfter().end());
     if (failed(rewriter.convertRegionTypes(&whileOp.getAfter(), typeConverter,
-                                           &newSignature))) {
+                                           &afterSignature))) {
       return failure();
     }
 
