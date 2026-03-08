@@ -886,6 +886,11 @@ struct LegalizeStableHLOCustomCalls final
     auto f = getOperation();
     MLIRContext *ctx = f.getContext();
 
+    // Ensure SparseSolver and Util dialects are loaded in this context.
+    // getDependentDialects may not be sufficient for nested interface passes.
+    ctx->loadDialect<IREE::SparseSolver::SparseSolverDialect,
+                      IREE::Util::UtilDialect>();
+
     RewritePatternSet patterns(ctx);
     patterns.add<HouseholderReflectorRewriter, ShapeAssertionDrop,
                  LapackGetrfFfiRewriter, LapackTrsmFfiRewriter,

@@ -16,6 +16,7 @@
 
 #include "iree/hal/api.h"
 #include "iree_pjrt/common/iree_helpers.h"
+#include "iree_pjrt/common/pjrt_trace.h"
 #include "iree_pjrt/common/tensor_utils.h"
 // TODO: Excise. Uses deep XLA internals.
 // #include "xla/pjrt/transpose.h"
@@ -370,6 +371,7 @@ void BufferInstance::BindApi(PJRT_Api* api) {
       // Size query.
       return MakeError(buffer->GetHostSizeInBytes(&args->dst_size));
     } else {
+      PJRT_TRACE("ToHostBuffer", "size=%zu", (size_t)args->dst_size);
       // Initiate transfer.
       return MakeError(
           buffer->CopyToHost(args->dst, args->dst_size,
@@ -467,6 +469,7 @@ iree_status_t BufferInstance::Delete() {
 
 iree_status_t BufferInstance::CopyToHost(void* dst, iree_host_size_t dst_size,
                                          EventInstance** out_done_event) {
+  PJRT_TRACE("CopyToHost", "size=%zu", (size_t)dst_size);
   // Use a data structure to handle intermediary buffer when necessary. This
   // needs to include the destination and aligned buffer, along with the size
   // so the destination can be mem-copied if necessary.
@@ -818,6 +821,7 @@ iree_status_t DeviceInstance::CreateFence(iree_hal_fence_t** out_fence) {
 
 iree_status_t DeviceInstance::CopyDeviceBuffer(BufferInstance* source,
                                                BufferInstance** out_buffer) {
+  PJRT_TRACE_SCOPE("CopyDeviceBuffer");
   // Get source buffer info
   iree_hal_buffer_view_t* source_view = source->buffer_view();
   iree_hal_buffer_t* source_buffer = iree_hal_buffer_view_buffer(source_view);
@@ -1194,6 +1198,7 @@ iree_status_t DeviceInstance::HostBufferToDevice(
     PJRT_HostBufferSemantics host_buffer_semantics,
     EventInstance** out_done_with_host_buffer_event,
     BufferInstance** out_buffer) {
+  PJRT_TRACE_SCOPE("HostBufferToDevice");
   IREE_RETURN_IF_ERROR(OpenDevice());
 
   // Map element type.
@@ -1365,6 +1370,8 @@ iree_status_t DeviceInstance::AcquireHostStagingBuffer(
     iree_const_byte_span_t initial_contents, bool snapshot_initial_contents_now,
     bool* initial_contents_snapshotted, iree_hal_buffer_t** out_buffer) {
   IREE_TRACE_SCOPE();
+  PJRT_TRACE("AcquireHostStagingBuffer", "size=%zu snapshot=%d",
+             (size_t)initial_contents.data_length, snapshot_initial_contents_now);
   // There are multiple ways to do this that have different cost/benefits.
   // Here we do the simplest thing and snapshot into a new host allocation.
   // This could be replaced with either some form of staging ring buffer
@@ -1882,6 +1889,7 @@ void EventInstance::BindApi(PJRT_Api* api) {
   };
   api->PJRT_Event_Await = +[](PJRT_Event_Await_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_Event_Await");
+    PJRT_TRACE_SCOPE("Event_Await");
     return MakeError(EventInstance::Unwrap(args->event)->Await());
   };
   api->PJRT_Event_OnReady = +[](PJRT_Event_OnReady_Args* args) -> PJRT_Error* {
@@ -2258,6 +2266,9 @@ iree_status_t LoadedExecutableInstance::GetArgResultCount(
 
 iree_status_t LoadedExecutableInstance::BatchExecute(
     PJRT_LoadedExecutable_Execute_Args* args) {
+  PJRT_TRACE_SCOPE("BatchExecute");
+  PJRT_TRACE("BatchExecute", "num_args=%d num_devices=%d",
+             (int)args->num_args, (int)args->num_devices);
   // Early exit for unsupported features and illegal input.
   if (args->execute_device) {
     return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
@@ -2368,6 +2379,7 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
       // This prevents IREE's copy elision optimizations from corrupting
       // non-donated input buffers.
       if (!effective_donated_indices.count(i)) {
+        PJRT_TRACE("BatchExecute.copy_input", "arg[%d] not donated, copying", (int)i);
         BufferInstance* copied_buffer = nullptr;
         IREE_RETURN_IF_ERROR(
             inv.res_exe->device_instance->CopyDeviceBuffer(buffer, &copied_buffer));
@@ -2413,12 +2425,16 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
           inv.signal_fence.get(),
           IreeApi::FenceToString(inv.signal_fence.get()).c_str());
     }
+    PJRT_TRACE("BatchExecute.vm_invoke", "dev=%d ordinal=%d",
+               (int)dev_index, (int)inv.res_exe->main_function.ordinal);
     auto new_status = IreeApi::HandleStatus(
         "vm_invoke[async]",
         iree_vm_invoke(inv.res_exe->vm_context.get(),
                        inv.res_exe->main_function, IREE_VM_INVOCATION_FLAG_NONE,
                        /*policy=*/nullptr, inv.inputs.get(), inv.outputs.get(),
                        allocator));
+    PJRT_TRACE("BatchExecute.vm_invoke_done", "dev=%d ok=%d",
+               (int)dev_index, iree_status_is_ok(new_status));
     // Any invocation that fails needs a barrier so that signal fence is
     // incremented otherwise future waits will fail. We do this instead of
     // incrementing as only a subset of devices may fail.
@@ -2457,6 +2473,8 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
       // corresponding device execution is complete." Use signal_fence
       // (fires when execution IS COMPLETE), not wait_fence (fires when
       // execution CAN START).
+      PJRT_TRACE("BatchExecute.create_event", "dev=%d signal_fence=%p",
+                 (int)dev_index, inv.signal_fence.get());
       args->device_complete_events[dev_index] =
           *(client_.CreateEvent(retain_ref(inv.signal_fence)));
     }

@@ -6,6 +6,8 @@
 
 #include <functional>
 #include <iostream>  // TODO: Remove
+#include <pthread.h>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -43,7 +45,19 @@ class IREECompilerJob : public CompilerJob {
   IREECompilerJob(iree_compiler_session_t* session,
                   iree_compiler_invocation_t* inv,
                   SessionRecycler session_recycler)
-      : session_(session), inv_(inv), session_recycler_(session_recycler) {}
+      : session_(session), inv_(inv), session_recycler_(session_recycler) {
+    // Always enable crash recovery so that pass failures (including stack
+    // overflows in the DFX solver) are caught and reported as errors rather
+    // than killing the process with SIGSEGV.
+    ireeCompilerInvocationSetCrashHandler(
+        inv_, /*genLocalReproducer=*/false,
+        [](iree_compiler_output_t** outOutput,
+           void* /*userData*/) -> iree_compiler_error_t* {
+          *outOutput = nullptr;  // Don't generate a reproducer file.
+          return nullptr;
+        },
+        this);
+  }
   ~IREECompilerJob() {
     if (error_) {
       ireeCompilerErrorDestroy(error_);
@@ -161,7 +175,49 @@ class IREECompilerJob : public CompilerJob {
   }
 
   std::unique_ptr<CompilerOutput> CompileStandardPipeline() override {
-    if (!ireeCompilerInvocationPipeline(inv_, IREE_COMPILER_PIPELINE_STD)) {
+    // Run the compiler pipeline on a thread with a large stack (128MB).
+    // The DFX affinity analysis in ScheduleAllocationPass uses deep recursion
+    // (walkTransitiveUses -> updateValue -> getOrCreateElementFor -> ...) that
+    // can overflow the default 8MB stack for large programs with nested
+    // while loops and thousands of dispatches (e.g. vajax ring oscillator).
+    bool pipeline_ok = false;
+    {
+      static constexpr size_t kCompilerStackSize = 512 * 1024 * 1024;  // 512MB
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      pthread_attr_setstacksize(&attr, kCompilerStackSize);
+
+      struct PipelineArgs {
+        iree_compiler_invocation_t* inv;
+        bool result;
+      };
+      PipelineArgs args{inv_, false};
+
+      pthread_t thread;
+      int err = pthread_create(
+          &thread, &attr,
+          [](void* arg) -> void* {
+            auto* a = static_cast<PipelineArgs*>(arg);
+            a->result = ireeCompilerInvocationPipeline(
+                a->inv, IREE_COMPILER_PIPELINE_STD);
+            return nullptr;
+          },
+          &args);
+      pthread_attr_destroy(&attr);
+
+      if (err != 0) {
+        // Fallback to calling directly on the current thread.
+        std::cerr << "PJRT: pthread_create failed (err=" << err
+                  << "), falling back to default stack" << std::endl;
+        pipeline_ok =
+            ireeCompilerInvocationPipeline(inv_, IREE_COMPILER_PIPELINE_STD);
+      } else {
+        pthread_join(thread, nullptr);
+        pipeline_ok = args.result;
+      }
+    }
+
+    if (!pipeline_ok) {
       return nullptr;
     }
 
