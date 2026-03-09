@@ -66,6 +66,8 @@ setup(
         "build": iree_pjrt_setup.PjrtPluginBuild,
         "build_cmake": MetalBuildCMake,
         "bdist_wheel": iree_pjrt_setup.bdist_wheel,
+        **({"editable_wheel": iree_pjrt_setup.PjrtEditableWheel}
+           if iree_pjrt_setup.PjrtEditableWheel else {}),
     },
     zip_safe=False,
 )

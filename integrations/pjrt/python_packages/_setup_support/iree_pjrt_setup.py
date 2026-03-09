@@ -168,13 +168,28 @@ class build_cmake(Command):
         cfg = os.getenv("IREE_CMAKE_BUILD_TYPE", "Release")
 
         # Find ninja - prefer system ninja over Python wheel to avoid temp path issues
+        # with uv build isolation (temp dirs that get cleaned up between builds)
         ninja_path = None
-        try:
-            result = subprocess.run(["which", "ninja"], capture_output=True, text=True)
-            if result.returncode == 0:
-                ninja_path = result.stdout.strip()
-        except Exception:
-            pass
+        for candidate in ["/opt/homebrew/bin/ninja", "/usr/local/bin/ninja", "/usr/bin/ninja"]:
+            if Path(candidate).exists():
+                ninja_path = candidate
+                break
+        if not ninja_path:
+            try:
+                result = subprocess.run(
+                    ["which", "-a", "ninja"], capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    # Pick the first non-temp-dir ninja
+                    for line in result.stdout.strip().splitlines():
+                        if "/tmp" not in line and "/.cache/uv/" not in line:
+                            ninja_path = line
+                            break
+                    if not ninja_path:
+                        # Fall back to any ninja
+                        ninja_path = result.stdout.strip().splitlines()[0]
+            except Exception:
+                pass
 
         cmake_args = [
             "-GNinja",
@@ -350,6 +365,20 @@ class PjrtPluginBuild(_build):
     def run(self):
         # sub_commands handles calling build_cmake, just run parent
         super().run()
+
+
+try:
+    from setuptools.command.editable_wheel import editable_wheel as _editable_wheel
+
+    class PjrtEditableWheel(_editable_wheel):
+        """Editable wheel that also runs the cmake build."""
+
+        def run(self):
+            self.run_command("build_cmake")
+            super().run()
+
+except ImportError:
+    PjrtEditableWheel = None
 
 
 def populate_built_package(abs_dir: str):
