@@ -314,6 +314,26 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
   }
 }
 
+int baspacho_dense_analyze(baspacho_handle_t h, int64_t n) {
+  if (!h || n <= 0) return -1;
+
+  // Build fully-dense CSR pattern: every row has N entries (all columns).
+  // This is the trivial case where nnz = N*N.
+  std::vector<int64_t> row_ptr(n + 1);
+  std::vector<int64_t> col_idx(n * n);
+
+  for (int64_t i = 0; i <= n; ++i) {
+    row_ptr[i] = i * n;
+  }
+  for (int64_t i = 0; i < n; ++i) {
+    for (int64_t j = 0; j < n; ++j) {
+      col_idx[i * n + j] = j;
+    }
+  }
+
+  return baspacho_analyze(h, n, n * n, row_ptr.data(), col_idx.data());
+}
+
 int64_t baspacho_get_factor_nnz(baspacho_handle_t h) {
   if (!h || !h->solver) return 0;
   return h->solver->dataSize();

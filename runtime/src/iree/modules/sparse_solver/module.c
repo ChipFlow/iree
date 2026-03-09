@@ -6,6 +6,7 @@
 
 #include "iree/modules/sparse_solver/module.h"
 
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
@@ -69,6 +70,13 @@ typedef struct iree_sparse_solver_module_t {
 typedef struct iree_sparse_solver_module_state_t {
   iree_allocator_t host_allocator;
   iree_sparse_solver_module_t* module;
+
+  // Cached scratch buffers for dense LU solve on Metal (reused across calls).
+  // Avoids repeated allocation in NR iteration loops where the matrix size
+  // is constant. LAPACK sgetrf modifies A in-place, so we always need a copy.
+  int64_t cached_dense_n;       // Matrix dimension (0 = not cached)
+  float* cached_dense_scratch;  // n*n scratch for sgetrf (in-place LU)
+  int* cached_dense_ipiv;       // n pivot indices for sgetrf/sgetrs
 } iree_sparse_solver_module_state_t;
 
 static void IREE_API_PTR iree_sparse_solver_module_destroy(void* self) {
@@ -99,6 +107,12 @@ static void IREE_API_PTR iree_sparse_solver_module_free_state(
     void* self, iree_vm_module_state_t* module_state) {
   iree_sparse_solver_module_state_t* state =
       (iree_sparse_solver_module_state_t*)module_state;
+  if (state->cached_dense_scratch) {
+    iree_allocator_free(state->host_allocator, state->cached_dense_scratch);
+  }
+  if (state->cached_dense_ipiv) {
+    iree_allocator_free(state->host_allocator, state->cached_dense_ipiv);
+  }
   iree_allocator_free(state->host_allocator, state);
 }
 
@@ -1154,7 +1168,7 @@ IREE_VM_ABI_EXPORT(iree_sparse_solver_solve_lu_f64,
 }
 
 //===----------------------------------------------------------------------===//
-// Dense Linear Solve (LAPACK via Accelerate)
+// Dense Linear Solve (zero-copy LAPACK on Metal / staging LAPACK otherwise)
 //===----------------------------------------------------------------------===//
 
 // LAPACK function declarations.
@@ -1165,8 +1179,98 @@ extern int sgetrf_(int* m, int* n, float* a, int* lda, int* ipiv, int* info);
 extern int sgetrs_(char* trans, int* n, int* nrhs, float* a, int* lda,
                    int* ipiv, float* b, int* ldb, int* info);
 
+#if defined(IREE_HAL_HAVE_METAL_DRIVER)
+// Metal-optimized dense solve using LAPACK with zero-copy buffer access.
+// On Apple Silicon unified memory, Metal buffer contents are directly
+// accessible by CPU. This avoids the expensive iree_hal_device_transfer_d2h
+// and iree_hal_device_transfer_h2d calls that block on GPU command completion.
+// Scratch buffers for LU factorization are cached to avoid repeated allocation
+// in NR iteration loops.
+static iree_status_t iree_sparse_solver_dense_solve_complete_metal_impl(
+    iree_vm_stack_t* IREE_RESTRICT stack,
+    iree_sparse_solver_module_t* module,
+    iree_sparse_solver_module_state_t* state,
+    int64_t n,
+    iree_hal_buffer_view_t* matrix_bv,
+    iree_hal_buffer_view_t* rhs_bv,
+    iree_hal_buffer_view_t* solution_bv) {
+  // Get buffers from views.
+  iree_hal_buffer_t* matrix_buffer = iree_hal_buffer_view_buffer(matrix_bv);
+  iree_hal_buffer_t* rhs_buffer = iree_hal_buffer_view_buffer(rhs_bv);
+  iree_hal_buffer_t* solution_buffer = iree_hal_buffer_view_buffer(solution_bv);
+
+  // Get direct buffer pointers (zero-copy on unified memory).
+  float* matrix_data =
+      (float*)iree_sparse_solver_metal_buffer_contents(matrix_buffer);
+  float* rhs_data =
+      (float*)iree_sparse_solver_metal_buffer_contents(rhs_buffer);
+  float* solution_data =
+      (float*)iree_sparse_solver_metal_buffer_contents(solution_buffer);
+
+  if (!matrix_data || !rhs_data || !solution_data) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "failed to get Metal buffer contents for dense "
+                            "solve (n=%" PRId64 ")", n);
+  }
+
+  // Ensure cached scratch buffers exist for this matrix size.
+  // LAPACK modifies A in-place (sgetrf), so we need a scratch copy.
+  // Pivots array is also reused across iterations.
+  if (state->cached_dense_n != n) {
+    // Clean up old cache if size changed.
+    if (state->cached_dense_scratch) {
+      iree_allocator_free(state->host_allocator, state->cached_dense_scratch);
+      state->cached_dense_scratch = NULL;
+    }
+    if (state->cached_dense_ipiv) {
+      iree_allocator_free(state->host_allocator, state->cached_dense_ipiv);
+      state->cached_dense_ipiv = NULL;
+    }
+
+    IREE_RETURN_IF_ERROR(iree_allocator_malloc(
+        state->host_allocator, n * n * sizeof(float),
+        (void**)&state->cached_dense_scratch));
+    IREE_RETURN_IF_ERROR(iree_allocator_malloc(
+        state->host_allocator, n * sizeof(int),
+        (void**)&state->cached_dense_ipiv));
+
+    state->cached_dense_n = n;
+  }
+
+  // Copy matrix to scratch (sgetrf modifies in-place).
+  // Copy rhs directly to solution buffer (sgetrs overwrites with solution).
+  memcpy(state->cached_dense_scratch, matrix_data, n * n * sizeof(float));
+  memcpy(solution_data, rhs_data, n * sizeof(float));
+
+  // LAPACK LU factorization + solve.
+  // Row-major handling: LAPACK sees row-major A as A^T, so we use 'T' transpose.
+  int n_int = (int)n;
+  int info = 0;
+  sgetrf_(&n_int, &n_int, state->cached_dense_scratch, &n_int,
+          state->cached_dense_ipiv, &info);
+  if (info != 0) {
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                            "LAPACK sgetrf failed with info=%d (n=%" PRId64
+                            ")", info, n);
+  }
+
+  char trans = 'T';
+  int nrhs = 1;
+  sgetrs_(&trans, &n_int, &nrhs, state->cached_dense_scratch, &n_int,
+          state->cached_dense_ipiv, solution_data, &n_int, &info);
+  if (info != 0) {
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                            "LAPACK sgetrs failed with info=%d (n=%" PRId64
+                            ")", info, n);
+  }
+
+  return iree_ok_status();
+}
+#endif  // IREE_HAL_HAVE_METAL_DRIVER
+
 // dense_solve_complete: Irrr -> v
-// Solves Ax = b using LAPACK sgetrf + sgetrs.
+// Fallback implementation using staging buffer transfers (d2h/h2d).
+// Used on non-Metal or discrete GPU systems.
 // Row-major handling: LAPACK sees row-major A as A^T, so we use sgetrs('T',...)
 // to solve (PLU)^T x = b which equals Ax = b.
 static iree_status_t iree_sparse_solver_dense_solve_complete_impl(
@@ -1284,6 +1388,16 @@ IREE_VM_ABI_EXPORT(iree_sparse_solver_dense_solve_complete,
   iree_hal_buffer_view_t* solution_view = NULL;
   IREE_RETURN_IF_ERROR(
       iree_hal_buffer_view_check_deref(args->r3, &solution_view));
+
+#if defined(IREE_HAL_HAVE_METAL_DRIVER)
+  // Use BaSpaCho LU path with zero-copy buffer access on unified memory.
+  // This avoids the d2h/h2d transfers that dominate the LAPACK path latency.
+  if (sparse_module->backend == BASPACHO_BACKEND_METAL &&
+      iree_sparse_solver_metal_is_unified_memory(sparse_module->device)) {
+    return iree_sparse_solver_dense_solve_complete_metal_impl(
+        stack, sparse_module, state, n, matrix_view, rhs_view, solution_view);
+  }
+#endif
 
   return iree_sparse_solver_dense_solve_complete_impl(
       stack, sparse_module, state, n, matrix_view, rhs_view, solution_view);

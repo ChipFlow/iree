@@ -83,6 +83,12 @@ int64_t baspacho_get_factor_nnz(baspacho_handle_t h);
 // Get the number of supernodes after analysis.
 int64_t baspacho_get_num_supernodes(baspacho_handle_t h);
 
+// Convenience: perform symbolic analysis for a fully-dense NxN matrix.
+// Builds a dense CSR pattern (every row has N entries) and calls
+// baspacho_analyze(). Use with baspacho_factor_lu_f32()/baspacho_solve_lu_f32()
+// for dense LU solve without explicit CSR construction.
+int baspacho_dense_analyze(baspacho_handle_t h, int64_t n);
+
 //===----------------------------------------------------------------------===//
 // Numeric Factorization
 //===----------------------------------------------------------------------===//
