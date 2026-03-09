@@ -739,14 +739,10 @@ static iree_status_t iree_sparse_solver_spsolve_complete_metal_impl(
     col_idx_i64[i] = col_idx_data[i];
   }
 
-  // Use CPU backend for Cholesky factorization.
-  // Metal sparse elimination GPU kernels produce incorrect results for N>196
-  // (when sparse elimination ranges are needed). CPU backend works correctly
-  // for all sizes. I/O still uses direct Metal buffer access (zero-copy on
-  // unified memory).
+  // Use Metal backend for GPU-accelerated Cholesky factorization.
   (void)mtl_device;
 
-  baspacho = baspacho_create(BASPACHO_BACKEND_CPU);
+  baspacho = baspacho_create(BASPACHO_BACKEND_METAL);
   if (!baspacho) {
     status = iree_make_status(IREE_STATUS_INTERNAL,
                               "failed to create BaSpaCho context");
