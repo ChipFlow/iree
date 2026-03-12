@@ -57,6 +57,14 @@ bool iree_hal_metal_direct_command_buffer_isa(
 id<MTLCommandBuffer> iree_hal_metal_direct_command_buffer_handle(
     const iree_hal_command_buffer_t* command_buffer);
 
+// Ends the current compute command encoder, if any.
+// This must be called before external code (e.g., BaSpaCho) creates its own
+// compute encoder on the same MTLCommandBuffer. After external encoding is
+// complete, IREE will lazily create a new encoder on its next dispatch via
+// iree_hal_metal_get_or_begin_compute_encoder (internal).
+void iree_hal_metal_direct_command_buffer_end_compute_encoder(
+    iree_hal_command_buffer_t* command_buffer);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

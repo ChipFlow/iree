@@ -243,6 +243,32 @@ void baspacho_register_metal_buffer(void* host_ptr, void* mtl_buffer,
 // Unregister a previously registered Metal buffer.
 void baspacho_unregister_metal_buffer(void* host_ptr);
 
+//===----------------------------------------------------------------------===//
+// External Encoder (for recording into IREE's command buffer)
+//===----------------------------------------------------------------------===//
+
+// Set an external Metal command buffer and compute encoder for dispatch
+// recording. When set, BaSpaCho's factor/solve operations record their
+// compute dispatches into this encoder instead of creating their own
+// command buffers. commitPending() and waitForGpu() become no-ops.
+//
+// The caller is responsible for:
+//   1. Creating the compute encoder from the command buffer
+//   2. Ending the encoder after BaSpaCho operations complete
+//   3. Managing the command buffer lifecycle (commit/wait)
+//
+// Parameters:
+//   h              - BaSpaCho context (must have Metal backend)
+//   mtl_cmd_buffer - MTLCommandBuffer handle (as void*)
+//   mtl_encoder    - MTLComputeCommandEncoder handle (as void*)
+void baspacho_set_external_metal_encoder(baspacho_handle_t h,
+                                          void* mtl_cmd_buffer,
+                                          void* mtl_encoder);
+
+// Clear external encoder mode, returning to normal self-managed mode.
+// After calling this, BaSpaCho will create its own command buffers again.
+void baspacho_clear_external_encoder(baspacho_handle_t h);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

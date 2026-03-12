@@ -247,6 +247,13 @@ static void iree_hal_metal_end_compute_encoder(iree_hal_metal_command_buffer_t* 
   }
 }
 
+void iree_hal_metal_direct_command_buffer_end_compute_encoder(
+    iree_hal_command_buffer_t* base_command_buffer) {
+  iree_hal_metal_command_buffer_t* command_buffer =
+      iree_hal_metal_command_buffer_cast(base_command_buffer);
+  iree_hal_metal_end_compute_encoder(command_buffer);
+}
+
 static void iree_hal_metal_end_blit_encoder(iree_hal_metal_command_buffer_t* command_buffer) {
   if (command_buffer->state.blit_encoder) {
     [command_buffer->state.blit_encoder endEncoding];

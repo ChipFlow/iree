@@ -486,6 +486,51 @@ IREE_VM_ABI_FIXED_STRUCT(rrrI, {
   int64_t i3;
 });
 
+// sparse_solver: spsolve_gpu(cmd_buf, data{idx,buf,off,len},
+//   indices{idx,buf,off,len}, indptr{idx,buf,off,len},
+//   rhs{idx,buf,off,len}, solution{idx,buf,off,len})
+IREE_VM_ABI_FIXED_STRUCT(rIrIIIrIIIrIIIrIIIrII, {
+  iree_vm_ref_t r0;   // command_buffer
+  int64_t i1;          // data binding idx
+  iree_vm_ref_t r2;   // data buffer
+  int64_t i3;          // data offset
+  int64_t i4;          // data length
+  int64_t i5;          // indices binding idx
+  iree_vm_ref_t r6;   // indices buffer
+  int64_t i7;          // indices offset
+  int64_t i8;          // indices length
+  int64_t i9;          // indptr binding idx
+  iree_vm_ref_t r10;  // indptr buffer
+  int64_t i11;         // indptr offset
+  int64_t i12;         // indptr length
+  int64_t i13;         // rhs binding idx
+  iree_vm_ref_t r14;  // rhs buffer
+  int64_t i15;         // rhs offset
+  int64_t i16;         // rhs length
+  int64_t i17;         // solution binding idx
+  iree_vm_ref_t r18;  // solution buffer
+  int64_t i19;         // solution offset
+  int64_t i20;         // solution length
+});
+
+// sparse_solver: dense_solve_gpu(cmd_buf, matrix{idx,buf,off,len},
+//   rhs{idx,buf,off,len}, solution{idx,buf,off,len})
+IREE_VM_ABI_FIXED_STRUCT(rIrIIIrIIIrII, {
+  iree_vm_ref_t r0;   // command_buffer
+  int64_t i1;          // matrix binding idx
+  iree_vm_ref_t r2;   // matrix buffer
+  int64_t i3;          // matrix offset
+  int64_t i4;          // matrix length
+  int64_t i5;          // rhs binding idx
+  iree_vm_ref_t r6;   // rhs buffer
+  int64_t i7;          // rhs offset
+  int64_t i8;          // rhs length
+  int64_t i9;          // solution binding idx
+  iree_vm_ref_t r10;  // solution buffer
+  int64_t i11;         // solution offset
+  int64_t i12;         // solution length
+});
+
 // dense_blas: getrf(m, n, lda, a, ipiv) -> info
 IREE_VM_ABI_FIXED_STRUCT(IIIrr, {
   int64_t i0;
@@ -881,6 +926,8 @@ IREE_VM_ABI_DECLARE_SHIM(ICrD, r);
 IREE_VM_ABI_DECLARE_SHIM(iI, rr);
 IREE_VM_ABI_DECLARE_SHIM(irII, rr);
 IREE_VM_ABI_DECLARE_SHIM(iiICrID, rI);
+IREE_VM_ABI_DECLARE_SHIM(rIrIIIrIIIrII, v);
+IREE_VM_ABI_DECLARE_SHIM(rIrIIIrIIIrIIIrIIIrII, v);
 IREE_VM_ABI_DECLARE_SHIM(v, i);
 IREE_VM_ABI_DECLARE_SHIM(v, r);
 IREE_VM_ABI_DECLARE_SHIM(v, v);

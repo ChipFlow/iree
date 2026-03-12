@@ -1089,16 +1089,6 @@ struct CmdCallOpPattern
       }
       return zeroIndex;
     };
-    Value nullBuffer;
-    auto getNullBuffer = [&]() {
-      if (!nullBuffer) {
-        nullBuffer = IREE::Util::NullOp::create(
-            rewriter, callOp.getLoc(),
-            rewriter.getType<IREE::HAL::BufferType>());
-      }
-      return nullBuffer;
-    };
-
     // Always pass the command buffer as the first arg.
     SmallVector<Value> operands;
     operands.push_back(commandBufferMapping.getHandle());
@@ -1106,18 +1096,18 @@ struct CmdCallOpPattern
     for (auto [originalOperand, convertedOperand] : llvm::zip_equal(
              callOp.getResourceOperands(), adaptor.getResourceOperands())) {
       if (isa<IREE::Stream::ResourceType>(originalOperand.getType())) {
-        // Resource type, pass binding index or buffer and offset/length.
+        // Resource type: always pass direct buffer references for external
+        // function calls. Unlike dispatches (which can use binding table
+        // ordinals resolved at execution time), external functions need
+        // actual buffer handles to perform work like Metal compute encoding.
         auto binding = commandBufferMapping.resolveBinding(
             callOp.getLoc(), originalOperand, convertedOperand,
             adaptor.getResourceOperandOffsets()[resourceIndex],
             adaptor.getResourceOperandLengths()[resourceIndex], rewriter);
-        if (binding.buffer.getType().isIndex()) {
-          operands.push_back(binding.buffer);
-          operands.push_back(getNullBuffer());
-        } else {
-          operands.push_back(getZeroIndex());
-          operands.push_back(binding.buffer);
-        }
+        // Always pass (zero, direct_buffer) — external functions need real
+        // buffer handles, not binding table ordinals.
+        operands.push_back(getZeroIndex());
+        operands.push_back(convertedOperand);
         operands.push_back(binding.byteOffset);
         operands.push_back(binding.byteLength);
         ++resourceIndex;
@@ -1321,14 +1311,23 @@ struct CmdExecuteOpPattern
             ? false
             : regionCapturesDynamicUniformValues(executeOp);
 
+    // Check if the execute region contains a stream.cmd.call. External calls
+    // need a direct (ONE_SHOT) command buffer to access the underlying Metal
+    // command buffer for encoding GPU dispatches. Indirect/deferred command
+    // buffers don't have a real Metal command buffer during recording.
+    bool containsCmdCall = false;
+    executeOp.getBody().walk(
+        [&](IREE::Stream::CmdCallOp) { containsCmdCall = true; });
+
     // Calculate the indirect buffer references used within the command buffer
     // by analyzing captured resources. This analysis will be used by subsequent
     // conversion to decide between embedding the direct buffer references or
     // indirect ones. We only do this if the execution region is reused.
+    // Skip binding table for regions with external calls (forces direct CB).
     IndexSet indexSet(loc, rewriter);
     BindingTable bindingTable;
-    if (!executeOp.getOnce() && !capturesDynamicUniformValues &&
-        clIndirectCommandBuffers) {
+    if (!containsCmdCall && !executeOp.getOnce() &&
+        !capturesDynamicUniformValues && clIndirectCommandBuffers) {
       bindingTable = BindingTable(executeOp, adaptor.getResourceOperands(),
                                   adaptor.getResourceOperandSizes(), indexSet);
     }

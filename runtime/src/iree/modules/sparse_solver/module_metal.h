@@ -34,6 +34,40 @@ void* iree_sparse_solver_metal_buffer_handle(iree_hal_buffer_t* buffer);
 // Synchronize Metal operations (wait for GPU to finish).
 void iree_sparse_solver_metal_synchronize(iree_hal_device_t* device);
 
+// Register an IREE Metal buffer with BaSpaCho's buffer registry.
+// Uses the allocated (root) buffer to get the MTLBuffer base pointer.
+void iree_sparse_solver_metal_register_iree_buffer(iree_hal_buffer_t* buffer);
+
+// Unregister an IREE Metal buffer from BaSpaCho's buffer registry.
+void iree_sparse_solver_metal_unregister_iree_buffer(iree_hal_buffer_t* buffer);
+
+// Streamable sparse solve: records BaSpaCho dispatches into IREE's
+// command buffer encoder. This enables the solve to live inside a
+// stream.cmd.execute region alongside other GPU dispatches.
+//
+// The function:
+// 1. Ends IREE's current compute encoder
+// 2. Creates a new encoder for BaSpaCho
+// 3. Records LU factor + solve into the encoder
+// 4. Ends the encoder (IREE lazily creates a new one for subsequent dispatches)
+iree_status_t iree_sparse_solver_metal_spsolve_gpu(
+    iree_hal_command_buffer_t* cmd_buf,
+    iree_hal_buffer_t* data_buf, int64_t data_off, int64_t data_len,
+    iree_hal_buffer_t* indices_buf, int64_t indices_off, int64_t indices_len,
+    iree_hal_buffer_t* indptr_buf, int64_t indptr_off, int64_t indptr_len,
+    iree_hal_buffer_t* rhs_buf, int64_t rhs_off, int64_t rhs_len,
+    iree_hal_buffer_t* solution_buf, int64_t solution_off,
+    int64_t solution_len, iree_allocator_t host_allocator);
+
+// Streamable dense solve: records BaSpaCho dispatches into IREE's
+// command buffer encoder. Uses BaSpaCho's dense LU path (fully on GPU).
+iree_status_t iree_sparse_solver_metal_dense_solve_gpu(
+    iree_hal_command_buffer_t* cmd_buf,
+    iree_hal_buffer_t* matrix_buf, int64_t matrix_off, int64_t matrix_len,
+    iree_hal_buffer_t* rhs_buf, int64_t rhs_off, int64_t rhs_len,
+    iree_hal_buffer_t* solution_buf, int64_t solution_off,
+    int64_t solution_len, iree_allocator_t host_allocator);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
