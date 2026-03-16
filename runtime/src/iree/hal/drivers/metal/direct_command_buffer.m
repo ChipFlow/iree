@@ -249,6 +249,81 @@ void iree_hal_metal_direct_command_buffer_end_encoder(
   iree_hal_metal_end_encoder(command_buffer);
 }
 
+// Forward declaration for flush_and_wait (defined after segment recording).
+static iree_status_t iree_hal_metal_command_segment_record(
+    iree_hal_metal_command_buffer_t* command_buffer);
+
+iree_status_t iree_hal_metal_direct_command_buffer_flush_and_wait(
+    iree_hal_command_buffer_t* base_command_buffer) {
+  iree_hal_metal_command_buffer_t* command_buffer =
+      iree_hal_metal_command_buffer_cast(base_command_buffer);
+  IREE_TRACE_ZONE_BEGIN(z0);
+
+  // End any open encoder before recording.
+  iree_hal_metal_end_encoder(command_buffer);
+
+  // Only submit if there are pending segments to record.
+  if (command_buffer->segments.head != NULL) {
+    @autoreleasepool {
+      // Record all pending segments into the command buffer.
+      [command_buffer->command_buffer
+          beginCommandBufferWithAllocator:command_buffer->command_allocator];
+      iree_status_t status =
+          iree_hal_metal_command_segment_record(command_buffer);
+      iree_hal_metal_end_encoder(command_buffer);
+      [command_buffer->command_buffer endCommandBuffer];
+
+      if (!iree_status_is_ok(status)) {
+        IREE_TRACE_ZONE_END(z0);
+        return status;
+      }
+
+      // Submit and wait synchronously using a dispatch semaphore.
+      dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+      id<MTL4CommandBuffer> submit_cb = command_buffer->command_buffer;
+
+      MTL4CommitOptions* commit_options =
+          [[MTL4CommitOptions alloc] init];  // +1
+      [commit_options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        if (feedback.error) {
+          NSLog(@"flush_and_wait GPU error: %@",
+                feedback.error.localizedDescription);
+        }
+        dispatch_semaphore_signal(sema);
+      }];
+
+      [command_buffer->queue commit:&submit_cb
+                              count:1
+                            options:commit_options];
+      [commit_options release];  // -1
+
+      // Block until GPU completes.
+      dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+
+      // Release the consumed command buffer and create a fresh one.
+      [command_buffer->command_buffer release];  // -1
+      command_buffer->command_buffer =
+          [command_buffer->queue.device newCommandBuffer];  // +1
+    }
+
+    // Reset segments and arena for the next recording phase.
+    iree_hal_metal_command_segment_list_reset(&command_buffer->segments);
+    iree_arena_reset(&command_buffer->arena);
+
+    // Release the indirect bindings buffer — it was consumed by the
+    // submitted command buffer. A fresh one will be allocated lazily.
+    if (command_buffer->indirect_bindings_buffer != nil) {
+      [command_buffer->indirect_bindings_buffer release];  // -1
+      command_buffer->indirect_bindings_buffer = nil;
+      command_buffer->indirect_bindings_capacity = 0;
+    }
+    command_buffer->indirect_bindings_offset = 0;
+  }
+
+  IREE_TRACE_ZONE_END(z0);
+  return iree_ok_status();
+}
+
 static void iree_hal_metal_command_buffer_reset(iree_hal_metal_command_buffer_t* command_buffer) {
   IREE_TRACE_ZONE_BEGIN(z0);
   iree_hal_metal_end_encoder(command_buffer);

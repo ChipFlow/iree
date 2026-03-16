@@ -12,7 +12,16 @@
 #include "iree/hal/drivers/metal/metal_buffer.h"
 #include "iree/hal/drivers/metal/metal_device.h"
 #include "iree/modules/sparse_solver/baspacho_wrapper.h"
-#include "iree/modules/sparse_solver/module_metal_mps.h"
+
+// LAPACK function declarations for dense solve.
+// On macOS these are provided by the Accelerate framework (linked via CMake).
+extern int sgetrf_(int* m, int* n, float* a, int* lda, int* ipiv, int* info);
+extern int sgetrs_(char* trans, int* n, int* nrhs, float* a, int* lda,
+                   int* ipiv, float* b, int* ldb, int* info);
+
+// BaSpaCho manages its own Metal command buffers internally.
+// We use flush_and_wait to ensure IREE's pending GPU work is complete
+// before BaSpaCho operates, then BaSpaCho runs independently.
 
 bool iree_sparse_solver_metal_is_unified_memory(iree_hal_device_t* device) {
   if (!device) return false;
@@ -180,48 +189,29 @@ iree_status_t iree_sparse_solver_metal_spsolve_gpu(
   iree_sparse_solver_metal_register_iree_buffer(rhs_buf);
   iree_sparse_solver_metal_register_iree_buffer(solution_buf);
 
-  // End IREE's current compute encoder before creating ours.
-  iree_hal_metal_direct_command_buffer_end_compute_encoder(cmd_buf);
+  // Flush IREE's pending GPU work so buffer contents are available,
+  // then BaSpaCho operates independently with its own command buffers.
+  status = iree_hal_metal_direct_command_buffer_flush_and_wait(cmd_buf);
+  if (!iree_status_is_ok(status)) goto cleanup;
 
-  // Get the underlying MTLCommandBuffer and create encoder for BaSpaCho.
   {
-    id<MTLCommandBuffer> mtl_cmd_buf =
-        iree_hal_metal_direct_command_buffer_handle(cmd_buf);
-    id<MTLComputeCommandEncoder> encoder =
-        [mtl_cmd_buf computeCommandEncoder];
-
-    // Set BaSpaCho to use this encoder for all dispatches.
-    baspacho_set_external_metal_encoder(
-        baspacho, (__bridge void*)mtl_cmd_buf, (__bridge void*)encoder);
-
     // Allocate pivots for LU factorization.
     status = iree_allocator_malloc(host_allocator,
                                    n * sizeof(int64_t),
                                    (void**)&pivots);
-    if (!iree_status_is_ok(status)) {
-      [encoder endEncoding];
-      baspacho_clear_external_encoder(baspacho);
-      goto cleanup;
-    }
+    if (!iree_status_is_ok(status)) goto cleanup;
 
-    // LU factorization — records dispatches into the encoder.
+    // LU factorization — BaSpaCho uses its own Metal command queue.
     int result = baspacho_factor_lu_f32_device(baspacho, data_ptr, pivots);
     if (result != 0) {
-      [encoder endEncoding];
-      baspacho_clear_external_encoder(baspacho);
       status = iree_make_status(IREE_STATUS_INTERNAL,
                                 "BaSpaCho LU factorization failed: %d",
                                 result);
       goto cleanup;
     }
 
-    // Solve — records dispatches into the encoder.
-    baspacho_solve_lu_f32_device(baspacho, pivots, rhs_ptr, solution_ptr);
-
-    // End the encoder. IREE will lazily create a new one for subsequent
-    // dispatches via iree_hal_metal_get_or_begin_compute_encoder.
-    [encoder endEncoding];
-    baspacho_clear_external_encoder(baspacho);
+    // Solve — BaSpaCho manages its own command buffer lifecycle.
+    baspacho_solve_lu_f32_device(baspacho, data_ptr, pivots, rhs_ptr, solution_ptr);
   }
 
 cleanup:
@@ -243,12 +233,14 @@ iree_status_t iree_sparse_solver_metal_dense_solve_gpu(
     iree_hal_buffer_t* rhs_buf, int64_t rhs_off, int64_t rhs_len,
     iree_hal_buffer_t* solution_buf, int64_t solution_off,
     int64_t solution_len, iree_allocator_t host_allocator) {
-  (void)host_allocator;
+  iree_status_t status = iree_ok_status();
+  float* scratch = NULL;
+  int* ipiv = NULL;
 
-  // Dense solve using MPS directly (no BaSpaCho).
-  // MPS operations encode GPU commands without reading buffer data, making
-  // this compatible with IREE's streamable recording pipeline where buffer
-  // contents aren't yet populated at encoding time.
+  // Dense solve via Accelerate LAPACK on unified memory.
+  // 1. Flush IREE's pending GPU work (ensures buffer data is available).
+  // 2. LAPACK sgetrf/sgetrs on CPU pointers (zero-copy on Apple Silicon).
+  // This is optimal for small-to-medium dense systems in NR iterations.
 
   int64_t n = rhs_len / (int64_t)sizeof(float);
   if (n <= 0) {
@@ -256,37 +248,63 @@ iree_status_t iree_sparse_solver_metal_dense_solve_gpu(
                             "dense_solve_gpu: invalid rhs length");
   }
 
-  // End IREE's current compute encoder before encoding MPS operations.
-  iree_hal_metal_direct_command_buffer_end_compute_encoder(cmd_buf);
+  // Get buffer content pointers (unified memory, offset-adjusted).
+  float* matrix_ptr = (float*)((uint8_t*)iree_sparse_solver_metal_buffer_contents(
+                                    matrix_buf) + matrix_off);
+  float* rhs_ptr = (float*)((uint8_t*)iree_sparse_solver_metal_buffer_contents(
+                                 rhs_buf) + rhs_off);
+  float* solution_ptr = (float*)((uint8_t*)iree_sparse_solver_metal_buffer_contents(
+                                      solution_buf) + solution_off);
 
-  // Get the underlying MTLCommandBuffer.
-  id<MTLCommandBuffer> mtl_cmd_buf =
-      iree_hal_metal_direct_command_buffer_handle(cmd_buf);
-  id<MTLDevice> device = [mtl_cmd_buf device];
+  if (!matrix_ptr || !rhs_ptr || !solution_ptr) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "failed to get Metal buffer contents for dense_solve");
+  }
 
-  // Get Metal buffer handles and compute byte offsets.
-  iree_hal_buffer_t* matrix_alloc =
-      iree_hal_buffer_allocated_buffer(matrix_buf);
-  iree_hal_buffer_t* rhs_alloc = iree_hal_buffer_allocated_buffer(rhs_buf);
-  iree_hal_buffer_t* sol_alloc =
-      iree_hal_buffer_allocated_buffer(solution_buf);
+  // Flush IREE's pending GPU work so buffer contents are available on CPU.
+  status = iree_hal_metal_direct_command_buffer_flush_and_wait(cmd_buf);
+  if (!iree_status_is_ok(status)) return status;
 
-  id<MTLBuffer> mtl_matrix = iree_hal_metal_buffer_handle(matrix_alloc);
-  id<MTLBuffer> mtl_rhs = iree_hal_metal_buffer_handle(rhs_alloc);
-  id<MTLBuffer> mtl_sol = iree_hal_metal_buffer_handle(sol_alloc);
+  // Allocate scratch for LAPACK (modifies matrix in-place).
+  status = iree_allocator_malloc(host_allocator,
+                                 n * n * sizeof(float), (void**)&scratch);
+  if (!iree_status_is_ok(status)) return status;
 
-  NSUInteger matrix_byte_off =
-      iree_hal_buffer_byte_offset(matrix_buf) + matrix_off;
-  NSUInteger rhs_byte_off =
-      iree_hal_buffer_byte_offset(rhs_buf) + rhs_off;
-  NSUInteger sol_byte_off =
-      iree_hal_buffer_byte_offset(solution_buf) + solution_off;
+  status = iree_allocator_malloc(host_allocator,
+                                 n * sizeof(int), (void**)&ipiv);
+  if (!iree_status_is_ok(status)) goto dense_cleanup;
 
-  // Delegate to the MPS helper (separate compilation unit).
-  return iree_sparse_solver_metal_mps_dense_solve(
-      (__bridge void*)mtl_cmd_buf, (__bridge void*)device,
-      (__bridge void*)mtl_matrix, matrix_byte_off,
-      (__bridge void*)mtl_rhs, rhs_byte_off,
-      (__bridge void*)mtl_sol, sol_byte_off,
-      n);
+  // Copy matrix to scratch (sgetrf modifies in-place).
+  // Copy RHS to solution buffer (sgetrs overwrites with solution).
+  memcpy(scratch, matrix_ptr, n * n * sizeof(float));
+  memcpy(solution_ptr, rhs_ptr, n * sizeof(float));
+
+  {
+    // LAPACK LU factorization + solve.
+    // Row-major: LAPACK sees row-major A as A^T, use 'T' transpose.
+    int n_int = (int)n;
+    int info = 0;
+    int nrhs = 1;
+    char trans = 'T';
+
+    sgetrf_(&n_int, &n_int, scratch, &n_int, ipiv, &info);
+    if (info != 0) {
+      status = iree_make_status(IREE_STATUS_INTERNAL,
+                                "LAPACK sgetrf failed: info=%d", info);
+      goto dense_cleanup;
+    }
+
+    sgetrs_(&trans, &n_int, &nrhs, scratch, &n_int, ipiv,
+            solution_ptr, &n_int, &info);
+    if (info != 0) {
+      status = iree_make_status(IREE_STATUS_INTERNAL,
+                                "LAPACK sgetrs failed: info=%d", info);
+      goto dense_cleanup;
+    }
+  }
+
+dense_cleanup:
+  if (ipiv) iree_allocator_free(host_allocator, ipiv);
+  if (scratch) iree_allocator_free(host_allocator, scratch);
+  return status;
 }

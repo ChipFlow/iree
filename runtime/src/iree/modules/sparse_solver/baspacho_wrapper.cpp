@@ -804,40 +804,45 @@ void baspacho_solve_lu_f64(baspacho_handle_t h, const int64_t* pivots,
   }
 }
 
-void baspacho_solve_lu_f32_device(baspacho_handle_t h, const int64_t* pivots,
+void baspacho_solve_lu_f32_device(baspacho_handle_t h, void* data_device,
+                                   const int64_t* pivots,
                                    void* rhs_device, void* solution_device) {
-  if (!h || !h->solver || !pivots || !rhs_device || !solution_device) return;
+  if (!h || !h->solver || !data_device || !pivots || !rhs_device || !solution_device) return;
 
   try {
+    float* data = static_cast<float*>(data_device);
     float* rhs = static_cast<float*>(rhs_device);
     float* sol = static_cast<float*>(solution_device);
 
+    // solveLU is in-place: copy RHS to solution buffer first.
+    // On unified memory this is a simple memcpy.
     if (rhs != sol) {
-      // Copy RHS to solution for in-place solve
-      // For GPU backends, would need appropriate copy mechanism
+      memcpy(sol, rhs, h->n * sizeof(float));
     }
 
-    h->solver->solveLU(h->factor_data_f32.data(), pivots, sol, h->n, 1);
-  } catch (const std::exception&) {
-    // Silently fail
+    h->solver->solveLU(data, pivots, sol, h->n, 1);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[BaSpaCho] solve_lu_f32_device EXCEPTION: %s\n", e.what());
   }
 }
 
-void baspacho_solve_lu_f64_device(baspacho_handle_t h, const int64_t* pivots,
+void baspacho_solve_lu_f64_device(baspacho_handle_t h, void* data_device,
+                                   const int64_t* pivots,
                                    void* rhs_device, void* solution_device) {
-  if (!h || !h->solver || !pivots || !rhs_device || !solution_device) return;
+  if (!h || !h->solver || !data_device || !pivots || !rhs_device || !solution_device) return;
 
   try {
+    double* data = static_cast<double*>(data_device);
     double* rhs = static_cast<double*>(rhs_device);
     double* sol = static_cast<double*>(solution_device);
 
     if (rhs != sol) {
-      // Copy RHS to solution for in-place solve
+      memcpy(sol, rhs, h->n * sizeof(double));
     }
 
-    h->solver->solveLU(h->factor_data_f64.data(), pivots, sol, h->n, 1);
-  } catch (const std::exception&) {
-    // Silently fail
+    h->solver->solveLU(data, pivots, sol, h->n, 1);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[BaSpaCho] solve_lu_f64_device EXCEPTION: %s\n", e.what());
   }
 }
 

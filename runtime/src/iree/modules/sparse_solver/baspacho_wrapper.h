@@ -181,9 +181,12 @@ void baspacho_solve_lu_f64(baspacho_handle_t h, const int64_t* pivots,
                             const double* rhs, double* solution);
 
 // GPU variants for LU solve.
-void baspacho_solve_lu_f32_device(baspacho_handle_t h, const int64_t* pivots,
+// data_device: the factored matrix data on device (same pointer passed to factor_lu).
+void baspacho_solve_lu_f32_device(baspacho_handle_t h, void* data_device,
+                                   const int64_t* pivots,
                                    void* rhs_device, void* solution_device);
-void baspacho_solve_lu_f64_device(baspacho_handle_t h, const int64_t* pivots,
+void baspacho_solve_lu_f64_device(baspacho_handle_t h, void* data_device,
+                                   const int64_t* pivots,
                                    void* rhs_device, void* solution_device);
 
 // Batched solve: solve for multiple right-hand sides simultaneously.

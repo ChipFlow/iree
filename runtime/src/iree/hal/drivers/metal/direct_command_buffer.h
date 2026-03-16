@@ -71,6 +71,20 @@ id<MTL4CommandBuffer> iree_hal_metal_direct_command_buffer_handle(
 void iree_hal_metal_direct_command_buffer_end_encoder(
     iree_hal_command_buffer_t* command_buffer);
 
+// Flushes all pending command segments by recording them into the current
+// Metal 4 command buffer, submitting it to the GPU, and waiting for
+// completion. After this call, a fresh command buffer is ready for new work.
+//
+// This is used before external GPU libraries (e.g., BaSpaCho) that manage
+// their own command buffers. The flush ensures all IREE dispatches have
+// completed so their buffer outputs are available, and the fresh command
+// buffer is ready for IREE to continue recording after the library returns.
+//
+// The call is synchronous — it blocks until the GPU has finished executing
+// all flushed work.
+iree_status_t iree_hal_metal_direct_command_buffer_flush_and_wait(
+    iree_hal_command_buffer_t* command_buffer);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
