@@ -91,12 +91,15 @@ if(APPLE AND IREE_HAL_DRIVER_METAL)
   list(APPEND SPARSE_SOLVER_DEFINES BASPACHO_USE_METAL=1)
   find_library(METAL_FRAMEWORK Metal REQUIRED)
   find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
-  list(APPEND SPARSE_SOLVER_DEPS ${METAL_FRAMEWORK} ${ACCELERATE_FRAMEWORK})
+  find_library(MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
+  list(APPEND SPARSE_SOLVER_DEPS ${METAL_FRAMEWORK} ${ACCELERATE_FRAMEWORK} ${MPS_FRAMEWORK})
   # Add Metal HAL driver dependency for direct buffer access.
   list(APPEND SPARSE_SOLVER_DEPS iree::hal::drivers::metal)
-  # Add Metal helper source file (Objective-C).
+  # Add Metal helper source files (Objective-C).
   list(APPEND SPARSE_SOLVER_SOURCES module_metal.m)
   list(APPEND SPARSE_SOLVER_SOURCES module_metal.h)
+  list(APPEND SPARSE_SOLVER_SOURCES module_metal_mps.m)
+  list(APPEND SPARSE_SOLVER_SOURCES module_metal_mps.h)
   message(STATUS "sparse_solver: Metal backend enabled with direct buffer access")
 endif()
 
@@ -142,6 +145,16 @@ set_source_files_properties(${BASPACHO_WRAPPER_SOURCE}
   PROPERTIES
     COMPILE_OPTIONS "-fexceptions;-frtti"
 )
+
+# module_metal_mps.m includes MetalPerformanceShaders which uses simd types
+# that trigger errors with IREE's -fno-lax-vector-conversions flag.
+if(APPLE AND IREE_HAL_DRIVER_METAL)
+  set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/module_metal_mps.m"
+    PROPERTIES
+      COMPILE_OPTIONS "-flax-vector-conversions=all"
+  )
+endif()
 
 #-------------------------------------------------------------------------------
 # Module library

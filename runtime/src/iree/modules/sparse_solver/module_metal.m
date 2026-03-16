@@ -12,6 +12,7 @@
 #include "iree/hal/drivers/metal/metal_buffer.h"
 #include "iree/hal/drivers/metal/metal_device.h"
 #include "iree/modules/sparse_solver/baspacho_wrapper.h"
+#include "iree/modules/sparse_solver/module_metal_mps.h"
 
 bool iree_sparse_solver_metal_is_unified_memory(iree_hal_device_t* device) {
   if (!device) return false;
@@ -242,112 +243,50 @@ iree_status_t iree_sparse_solver_metal_dense_solve_gpu(
     iree_hal_buffer_t* rhs_buf, int64_t rhs_off, int64_t rhs_len,
     iree_hal_buffer_t* solution_buf, int64_t solution_off,
     int64_t solution_len, iree_allocator_t host_allocator) {
-  iree_status_t status = iree_ok_status();
-  baspacho_handle_t baspacho = NULL;
-  int64_t* pivots = NULL;
+  (void)host_allocator;
 
-  // Get buffer content pointers (unified memory, offset-adjusted).
-  float* matrix_ptr =
-      (float*)((uint8_t*)iree_sparse_solver_metal_buffer_contents(
-                   matrix_buf) +
-               matrix_off);
-  float* rhs_ptr = (float*)((uint8_t*)iree_sparse_solver_metal_buffer_contents(
-                                rhs_buf) +
-                            rhs_off);
-  float* solution_ptr =
-      (float*)((uint8_t*)iree_sparse_solver_metal_buffer_contents(
-                   solution_buf) +
-               solution_off);
+  // Dense solve using MPS directly (no BaSpaCho).
+  // MPS operations encode GPU commands without reading buffer data, making
+  // this compatible with IREE's streamable recording pipeline where buffer
+  // contents aren't yet populated at encoding time.
 
-  if (!matrix_ptr || !rhs_ptr || !solution_ptr) {
-    return iree_make_status(
-        IREE_STATUS_INVALID_ARGUMENT,
-        "failed to get Metal buffer contents for dense solve");
-  }
-
-  // Dense solve via BaSpaCho GPU LU on Metal.
-  // Uses a fully-dense CSR pattern so BaSpaCho processes it as a single
-  // supernode — MPS MPSMatrixDecompositionLU for factorization, GPU kernels
-  // for forward/backward substitution. All dispatches are recorded into
-  // IREE's command buffer via the external encoder API.
   int64_t n = rhs_len / (int64_t)sizeof(float);
-
-  // Create BaSpaCho context with Metal backend.
-  baspacho = baspacho_create(BASPACHO_BACKEND_METAL);
-  if (!baspacho) {
-    return iree_make_status(IREE_STATUS_INTERNAL,
-                            "failed to create BaSpaCho Metal context");
+  if (n <= 0) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "dense_solve_gpu: invalid rhs length");
   }
 
-  // Dense symbolic analysis (CPU work, builds fully-dense CSR pattern).
-  {
-    int result = baspacho_dense_analyze(baspacho, n);
-    if (result != 0) {
-      status = iree_make_status(IREE_STATUS_INTERNAL,
-                                "BaSpaCho dense analysis failed: %d", result);
-      goto cleanup;
-    }
-  }
-
-  // Register IREE buffers with BaSpaCho's buffer registry for zero-copy.
-  iree_sparse_solver_metal_register_iree_buffer(matrix_buf);
-  iree_sparse_solver_metal_register_iree_buffer(rhs_buf);
-  iree_sparse_solver_metal_register_iree_buffer(solution_buf);
-
-  // End IREE's current compute encoder before creating ours.
+  // End IREE's current compute encoder before encoding MPS operations.
   iree_hal_metal_direct_command_buffer_end_compute_encoder(cmd_buf);
 
-  // Get the underlying MTLCommandBuffer and create encoder for BaSpaCho.
-  {
-    id<MTLCommandBuffer> mtl_cmd_buf =
-        iree_hal_metal_direct_command_buffer_handle(cmd_buf);
-    id<MTLComputeCommandEncoder> encoder =
-        [mtl_cmd_buf computeCommandEncoder];
+  // Get the underlying MTLCommandBuffer.
+  id<MTLCommandBuffer> mtl_cmd_buf =
+      iree_hal_metal_direct_command_buffer_handle(cmd_buf);
+  id<MTLDevice> device = [mtl_cmd_buf device];
 
-    // Set BaSpaCho to use this encoder for all dispatches.
-    baspacho_set_external_metal_encoder(
-        baspacho, (__bridge void*)mtl_cmd_buf, (__bridge void*)encoder);
+  // Get Metal buffer handles and compute byte offsets.
+  iree_hal_buffer_t* matrix_alloc =
+      iree_hal_buffer_allocated_buffer(matrix_buf);
+  iree_hal_buffer_t* rhs_alloc = iree_hal_buffer_allocated_buffer(rhs_buf);
+  iree_hal_buffer_t* sol_alloc =
+      iree_hal_buffer_allocated_buffer(solution_buf);
 
-    // Allocate pivots for LU factorization.
-    status = iree_allocator_malloc(host_allocator,
-                                   n * sizeof(int64_t),
-                                   (void**)&pivots);
-    if (!iree_status_is_ok(status)) {
-      [encoder endEncoding];
-      baspacho_clear_external_encoder(baspacho);
-      goto cleanup_buffers;
-    }
+  id<MTLBuffer> mtl_matrix = iree_hal_metal_buffer_handle(matrix_alloc);
+  id<MTLBuffer> mtl_rhs = iree_hal_metal_buffer_handle(rhs_alloc);
+  id<MTLBuffer> mtl_sol = iree_hal_metal_buffer_handle(sol_alloc);
 
-    // LU factorization — records dispatches into the encoder.
-    // BaSpaCho's dense path uses MPS MPSMatrixDecompositionLU for the
-    // single NxN block, which records into the provided encoder.
-    int result = baspacho_factor_lu_f32_device(baspacho, matrix_ptr, pivots);
-    if (result != 0) {
-      [encoder endEncoding];
-      baspacho_clear_external_encoder(baspacho);
-      status = iree_make_status(IREE_STATUS_INTERNAL,
-                                "BaSpaCho dense LU factorization failed: %d",
-                                result);
-      goto cleanup_buffers;
-    }
+  NSUInteger matrix_byte_off =
+      iree_hal_buffer_byte_offset(matrix_buf) + matrix_off;
+  NSUInteger rhs_byte_off =
+      iree_hal_buffer_byte_offset(rhs_buf) + rhs_off;
+  NSUInteger sol_byte_off =
+      iree_hal_buffer_byte_offset(solution_buf) + solution_off;
 
-    // Solve — records dispatches into the encoder.
-    baspacho_solve_lu_f32_device(baspacho, pivots, rhs_ptr, solution_ptr);
-
-    // End the encoder. IREE will lazily create a new one for subsequent
-    // dispatches via iree_hal_metal_get_or_begin_compute_encoder.
-    [encoder endEncoding];
-    baspacho_clear_external_encoder(baspacho);
-  }
-
-cleanup_buffers:
-  // Unregister buffers.
-  iree_sparse_solver_metal_unregister_iree_buffer(matrix_buf);
-  iree_sparse_solver_metal_unregister_iree_buffer(rhs_buf);
-  iree_sparse_solver_metal_unregister_iree_buffer(solution_buf);
-
-cleanup:
-  if (pivots) iree_allocator_free(host_allocator, pivots);
-  if (baspacho) baspacho_destroy(baspacho);
-  return status;
+  // Delegate to the MPS helper (separate compilation unit).
+  return iree_sparse_solver_metal_mps_dense_solve(
+      (__bridge void*)mtl_cmd_buf, (__bridge void*)device,
+      (__bridge void*)mtl_matrix, matrix_byte_off,
+      (__bridge void*)mtl_rhs, rhs_byte_off,
+      (__bridge void*)mtl_sol, sol_byte_off,
+      n);
 }
