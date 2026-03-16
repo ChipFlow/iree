@@ -8,6 +8,11 @@
 #define IREE_HAL_DRIVERS_METAL_METAL_COMMAND_BUFFER_H_
 
 #import <Metal/Metal.h>
+#import <Metal/MTL4CommandBuffer.h>
+#import <Metal/MTL4ComputeCommandEncoder.h>
+#import <Metal/MTL4CommandAllocator.h>
+#import <Metal/MTL4ArgumentTable.h>
+#import <Metal/MTL4CommandQueue.h>
 
 #include "iree/base/internal/arena.h"
 #include "iree/hal/api.h"
@@ -19,8 +24,9 @@
 extern "C" {
 #endif  // __cplusplus
 
-// Creates a Metal command buffer that directly records into a MTLCommandBuffer.
-// Such command buffers are one shot--they can only be submitted once.
+// Creates a Metal 4 command buffer that directly records into a
+// MTL4CommandBuffer. Such command buffers are one shot--they can only be
+// submitted once.
 //
 // The command buffer would have the given |mode| and be recorded and submitted
 // to the given |queue|.
@@ -42,7 +48,7 @@ iree_status_t iree_hal_metal_direct_command_buffer_create(
     iree_host_size_t binding_capacity,
     iree_hal_metal_command_buffer_resource_reference_mode_t
         resource_reference_mode,
-    id<MTLCommandQueue> queue, iree_arena_block_pool_t* block_pool,
+    id<MTL4CommandQueue> queue, iree_arena_block_pool_t* block_pool,
     iree_hal_metal_staging_buffer_t* staging_buffer,
     iree_hal_metal_builtin_executable_t* builtin_executable,
     iree_allocator_t host_allocator,
@@ -52,17 +58,17 @@ iree_status_t iree_hal_metal_direct_command_buffer_create(
 bool iree_hal_metal_direct_command_buffer_isa(
     iree_hal_command_buffer_t* command_buffer);
 
-// Returns the underlying Metal command buffer handle for the given
+// Returns the underlying MTL4CommandBuffer handle for the given
 // |command_buffer|.
-id<MTLCommandBuffer> iree_hal_metal_direct_command_buffer_handle(
+id<MTL4CommandBuffer> iree_hal_metal_direct_command_buffer_handle(
     const iree_hal_command_buffer_t* command_buffer);
 
-// Ends the current compute command encoder, if any.
+// Ends the current unified encoder, if any.
 // This must be called before external code (e.g., BaSpaCho) creates its own
-// compute encoder on the same MTLCommandBuffer. After external encoding is
-// complete, IREE will lazily create a new encoder on its next dispatch via
-// iree_hal_metal_get_or_begin_compute_encoder (internal).
-void iree_hal_metal_direct_command_buffer_end_compute_encoder(
+// encoder on the same MTL4CommandBuffer. After external encoding is complete,
+// IREE will lazily create a new encoder on its next dispatch via
+// iree_hal_metal_get_or_begin_encoder (internal).
+void iree_hal_metal_direct_command_buffer_end_encoder(
     iree_hal_command_buffer_t* command_buffer);
 
 #ifdef __cplusplus

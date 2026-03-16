@@ -7,6 +7,11 @@
 #include "iree/hal/drivers/metal/direct_command_buffer.h"
 
 #import <Metal/Metal.h>
+#import <Metal/MTL4CommandBuffer.h>
+#import <Metal/MTL4ComputeCommandEncoder.h>
+#import <Metal/MTL4CommandAllocator.h>
+#import <Metal/MTL4CommandQueue.h>
+#import <Metal/MTL4ArgumentTable.h>
 
 #include "iree/base/api.h"
 #include "iree/base/target_platform.h"
@@ -23,26 +28,18 @@
 // Segmented submission management
 //===------------------------------------------------------------------------------------------===//
 
-// Unlike Vulkan, Metal adopts a multi-level command recording model--memory/dispatch commands are
-// not directly recorded into a command buffer; rather, they must go through the additional level of
-// blit/compute encoders. IREE's HAL follows the flat Vulkan command buffer recording model, so we
-// have a mismatch here. Implementing IREE's HAL using Metal would require switching encoders for
-// interleaved memory and dispatch commands. Additionally, certain IREE HAL API features do not have
-// direct mapping in Metal APIs, e.g., various forms of IREE HAL execution/memory barriers.
-// Translating them would require looking at both previous and next commands to decide the proper
-// mapping.
+// This file implements IREE HAL command buffers using the Metal 4 API.
 //
-// Due to these reasons, it's beneficial to have a complete view of the full command buffer and
-// extra flexibility during recording, in order to fixup past commands, or inspect future commands.
+// Metal 4 uses a unified command encoder (MTL4ComputeCommandEncoder) that handles compute
+// dispatches, blit operations, and acceleration structures in a single encoder — no encoder
+// switching needed. Command buffers are created from the device, encoders use argument tables
+// instead of setBuffer/setBytes, and resource residency is managed explicitly via MTLResidencySet.
 //
-// Therefore, to implement IREE HAL command buffers using Metal, we perform two steps using a linked
-// list of command segments. First we create segments (iree_hal_metal_command_buffer_prepare_* and
-// iree_hal_metal_command_segment_create_*) to keep track of all IREE HAL commands and the
-// associated data, and then, when finalizing the command buffer, we iterate through all the
-// segments and record their contents (iree_hal_metal_command_segment_record_*) into a proper Metal
-// command buffer . A linked list gives us the flexibility to organize command sequence in low
-// overhead; and a deferred recording gives us the complete picture of the command buffer when
-// really started recording.
+// We still use a two-phase approach with a linked list of command segments. First we create
+// segments (iree_hal_metal_command_buffer_prepare_* and iree_hal_metal_command_segment_create_*)
+// to keep track of all IREE HAL commands and their data, and then, when finalizing the command
+// buffer, we iterate through all segments and record them (iree_hal_metal_command_segment_record_*)
+// into a proper Metal 4 command buffer via the unified encoder.
 
 // Command action kind of a command segment.
 typedef enum iree_hal_metal_command_segment_action_e {
@@ -165,8 +162,8 @@ typedef struct iree_hal_metal_command_buffer_t {
   // command buffer to allow access to shared resources.
   iree_hal_device_t* device;
 
-  // The Metal command queue owning this command buffer.
-  id<MTLCommandQueue> queue;
+  // The Metal 4 command queue owning this command buffer.
+  id<MTL4CommandQueue> queue;
 
   // For polyfilling fill/copy/update buffers that are not directly supported by Metal APIs.
   iree_hal_metal_builtin_executable_t* builtin_executable;
@@ -193,25 +190,23 @@ typedef struct iree_hal_metal_command_buffer_t {
   // Linked list of command segments to be recorded into a command buffer.
   iree_hal_metal_command_segment_list_t segments;
 
-  id<MTLCommandBuffer> command_buffer;
+  // The Metal 4 command buffer for recording commands.
+  id<MTL4CommandBuffer> command_buffer;
 
-  MTLDispatchType dispatch_type;
+  // The command allocator used for command buffer recording.
+  id<MTL4CommandAllocator> command_allocator;
 
-  struct {
-    // The current active compute/blit encoders for encoding compute for memory operations.
-    // Metal commands are encoded into the command buffer with such encoders, and each encoder can
-    // only encode the specific type of operations it supports.
-    id<MTLComputeCommandEncoder> compute_encoder;
-    id<MTLBlitCommandEncoder> blit_encoder;
+  // The unified compute command encoder. MTL4 uses a single encoder for compute dispatches,
+  // blit operations (copy/fill), and barriers — no encoder switching needed.
+  id<MTL4ComputeCommandEncoder> encoder;
 
-    // MTLEven used for synchronization when we switch between blit and compute encoders.
-    // Normally we would use MTLFence objects, but the difference between IREE HAL and Metal API
-    // means we may see many encoder switches. It would require creating a lot GPU objects. In order
-    // to avoid the cost, we just use one MTLEvent with different values for different switches.
-    id<MTLEvent> encoder_event;
-    // The next available encoder event value to signal/wait to/on.
-    uint64_t next_encoder_event_value;
-  } state;
+  // Argument table for binding buffer addresses to compute kernels.
+  // Created once and reused across dispatches (bindings are updated per-dispatch).
+  id<MTL4ArgumentTable> argument_table;
+
+  // Residency set for tracking which allocations must be resident during execution.
+  // All buffers used by dispatches are added here instead of per-encoder useResource: calls.
+  id<MTLResidencySet> residency_set;
 } iree_hal_metal_command_buffer_t;
 
 //===------------------------------------------------------------------------------------------===//
@@ -232,40 +227,31 @@ static const iree_hal_metal_command_buffer_t* iree_hal_metal_command_buffer_cons
   return (const iree_hal_metal_command_buffer_t*)base_value;
 }
 
-id<MTLCommandBuffer> iree_hal_metal_direct_command_buffer_handle(
+id<MTL4CommandBuffer> iree_hal_metal_direct_command_buffer_handle(
     const iree_hal_command_buffer_t* base_command_buffer) {
   const iree_hal_metal_command_buffer_t* command_buffer =
       iree_hal_metal_command_buffer_const_cast(base_command_buffer);
   return command_buffer->command_buffer;
 }
 
-static void iree_hal_metal_end_compute_encoder(iree_hal_metal_command_buffer_t* command_buffer) {
-  if (command_buffer->state.compute_encoder) {
-    [command_buffer->state.compute_encoder endEncoding];
-    [command_buffer->state.compute_encoder release];  // -1
-    command_buffer->state.compute_encoder = nil;
+static void iree_hal_metal_end_encoder(iree_hal_metal_command_buffer_t* command_buffer) {
+  if (command_buffer->encoder) {
+    [command_buffer->encoder endEncoding];
+    [command_buffer->encoder release];  // -1
+    command_buffer->encoder = nil;
   }
 }
 
-void iree_hal_metal_direct_command_buffer_end_compute_encoder(
+void iree_hal_metal_direct_command_buffer_end_encoder(
     iree_hal_command_buffer_t* base_command_buffer) {
   iree_hal_metal_command_buffer_t* command_buffer =
       iree_hal_metal_command_buffer_cast(base_command_buffer);
-  iree_hal_metal_end_compute_encoder(command_buffer);
-}
-
-static void iree_hal_metal_end_blit_encoder(iree_hal_metal_command_buffer_t* command_buffer) {
-  if (command_buffer->state.blit_encoder) {
-    [command_buffer->state.blit_encoder endEncoding];
-    [command_buffer->state.blit_encoder release];  // -1
-    command_buffer->state.blit_encoder = nil;
-  }
+  iree_hal_metal_end_encoder(command_buffer);
 }
 
 static void iree_hal_metal_command_buffer_reset(iree_hal_metal_command_buffer_t* command_buffer) {
   IREE_TRACE_ZONE_BEGIN(z0);
-  iree_hal_metal_end_blit_encoder(command_buffer);
-  iree_hal_metal_end_compute_encoder(command_buffer);
+  iree_hal_metal_end_encoder(command_buffer);
   iree_hal_metal_command_segment_list_reset(&command_buffer->segments);
   iree_arena_reset(&command_buffer->arena);
   // Release the indirect bindings buffer if present. We allocate a fresh one
@@ -281,61 +267,17 @@ static void iree_hal_metal_command_buffer_reset(iree_hal_metal_command_buffer_t*
   IREE_TRACE_ZONE_END(z0);
 }
 
-static id<MTLComputeCommandEncoder> iree_hal_metal_get_or_begin_compute_encoder(
+static id<MTL4ComputeCommandEncoder> iree_hal_metal_get_or_begin_encoder(
     iree_hal_metal_command_buffer_t* command_buffer) {
-  id<MTLCommandBuffer> metal_handle = command_buffer->command_buffer;
-
-  // If we are switching encoders, we would need to use a fence to synchronize "one or more
-  // resources across different passes within a command buffer."
-  // https://developer.apple.com/documentation/metal/resource_synchronization
-  uint64_t encoder_event_value = 0;
-  if (command_buffer->state.blit_encoder) {
-    iree_hal_metal_end_blit_encoder(command_buffer);
-    encoder_event_value = command_buffer->state.next_encoder_event_value++;
-    [metal_handle encodeSignalEvent:command_buffer->state.encoder_event value:encoder_event_value];
-  }
-
-  if (!command_buffer->state.compute_encoder) {
-    if (encoder_event_value != 0) {
-      [metal_handle encodeWaitForEvent:command_buffer->state.encoder_event
-                                 value:encoder_event_value];
-    }
-    @autoreleasepool {  // Use @autoreleasepool to trigger the autorelease within encoder creation.
-      // We manage commands dependencies and insert barriers explicitly in IREE; so use the
-      // concurrent dispatch type for compute encoders.
-      command_buffer->state.compute_encoder = [[metal_handle
-          computeCommandEncoderWithDispatchType:command_buffer->dispatch_type] retain];  // +1
+  if (!command_buffer->encoder) {
+    @autoreleasepool {
+      // MTL4 uses a unified encoder that handles compute dispatches, blit operations,
+      // and barriers. No dispatch type parameter — concurrency is managed via barriers.
+      command_buffer->encoder =
+          [[(id<MTL4CommandBuffer>)command_buffer->command_buffer computeCommandEncoder] retain];  // +1
     }
   }
-
-  return command_buffer->state.compute_encoder;
-}
-
-static id<MTLBlitCommandEncoder> iree_hal_metal_get_or_begin_blit_encoder(
-    iree_hal_metal_command_buffer_t* command_buffer) {
-  id<MTLCommandBuffer> metal_handle = command_buffer->command_buffer;
-
-  // If we are switching encoders, we would need to use a fence to synchronize "one or more
-  // resources across different passes within a command buffer."
-  // https://developer.apple.com/documentation/metal/resource_synchronization
-  uint64_t encoder_event_value = 0;
-  if (command_buffer->state.compute_encoder) {
-    iree_hal_metal_end_compute_encoder(command_buffer);
-    encoder_event_value = command_buffer->state.next_encoder_event_value++;
-    [metal_handle encodeSignalEvent:command_buffer->state.encoder_event value:encoder_event_value];
-  }
-
-  if (!command_buffer->state.blit_encoder) {
-    if (encoder_event_value != 0) {
-      [metal_handle encodeWaitForEvent:command_buffer->state.encoder_event
-                                 value:encoder_event_value];
-    }
-    @autoreleasepool {  // Use @autoreleasepool to trigger the autorelease within encoder creation.
-      command_buffer->state.blit_encoder = [[metal_handle blitCommandEncoder] retain];  // +1
-    }
-  }
-
-  return command_buffer->state.blit_encoder;
+  return command_buffer->encoder;
 }
 
 // Default initial capacity for the indirect bindings buffer (4KB should be plenty for most cases).
@@ -399,7 +341,7 @@ iree_status_t iree_hal_metal_direct_command_buffer_create(
     iree_hal_device_t* device, iree_hal_command_buffer_mode_t mode,
     iree_hal_command_category_t command_categories, iree_host_size_t binding_capacity,
     iree_hal_metal_command_buffer_resource_reference_mode_t resource_reference_mode,
-    id<MTLCommandQueue> queue, iree_arena_block_pool_t* block_pool,
+    id<MTL4CommandQueue> queue, iree_arena_block_pool_t* block_pool,
     iree_hal_metal_staging_buffer_t* staging_buffer,
     iree_hal_metal_builtin_executable_t* builtin_executable, iree_allocator_t host_allocator,
     iree_hal_command_buffer_t** out_command_buffer) {
@@ -439,26 +381,54 @@ iree_status_t iree_hal_metal_direct_command_buffer_create(
   }
   if (iree_status_is_ok(status)) {
     iree_hal_metal_command_segment_list_reset(&command_buffer->segments);
-    @autoreleasepool {  // Use @autoreleasepool to trigger the autorelease within encoder creation.
-      // We track resource lifetime by ourselves in IREE; so just do unretained references to
-      // resources in Metal command buffer, which avoids overhead and gives better performance.
-      MTLCommandBufferDescriptor* descriptor = [MTLCommandBufferDescriptor new];  // +1
-      descriptor.retainedReferences =
-          resource_reference_mode == IREE_HAL_METAL_COMMAND_BUFFER_RESOURCE_REFERENCE_MODE_RETAINED;
-      descriptor.errorOptions = MTLCommandBufferErrorOptionNone;
-      command_buffer->command_buffer =
-          [[queue commandBufferWithDescriptor:descriptor] retain];  // +1
-      [descriptor release];                                         // -1
+    @autoreleasepool {
+      id<MTLDevice> device_handle = queue.device;
+
+      // Create a command allocator for this command buffer.
+      NSError* alloc_error = nil;
+      MTL4CommandAllocatorDescriptor* alloc_desc = [MTL4CommandAllocatorDescriptor new];  // +1
+      command_buffer->command_allocator =
+          [device_handle newCommandAllocatorWithDescriptor:alloc_desc error:&alloc_error];  // +1
+      [alloc_desc release];                                              // -1
+      if (!command_buffer->command_allocator) {
+        status = iree_make_status(IREE_STATUS_INTERNAL,
+                                  "failed to create command allocator: %s",
+                                  alloc_error.localizedDescription.UTF8String);
+      }
+
+      // Create a Metal 4 command buffer from the device.
+      if (iree_status_is_ok(status)) {
+        command_buffer->command_buffer = [device_handle newCommandBuffer];  // +1
+      }
+
+      // Create the argument table for binding buffer addresses to kernels.
+      if (iree_status_is_ok(status)) {
+        NSError* arg_error = nil;
+        MTL4ArgumentTableDescriptor* arg_desc = [MTL4ArgumentTableDescriptor new];  // +1
+        arg_desc.maxBufferBindCount = 31;  // Max supported by Metal 4
+        command_buffer->argument_table =
+            [device_handle newArgumentTableWithDescriptor:arg_desc error:&arg_error];  // +1
+        [arg_desc release];                                            // -1
+        if (!command_buffer->argument_table) {
+          status = iree_make_status(IREE_STATUS_INTERNAL,
+                                    "failed to create argument table: %s",
+                                    arg_error.localizedDescription.UTF8String);
+        }
+      }
+
+      // Create a residency set for tracking buffer residency.
+      MTLResidencySetDescriptor* res_desc = [MTLResidencySetDescriptor new];  // +1
+      NSError* error = nil;
+      command_buffer->residency_set =
+          [device_handle newResidencySetWithDescriptor:res_desc error:&error];  // +1
+      [res_desc release];                                                       // -1
+      if (!command_buffer->residency_set) {
+        status = iree_make_status(IREE_STATUS_INTERNAL,
+                                  "failed to create residency set: %s",
+                                  error.localizedDescription.UTF8String);
+      }
     }
-    const iree_hal_metal_device_params_t* params = iree_hal_metal_device_params(device);
-    command_buffer->dispatch_type =
-        params->command_dispatch_type == IREE_HAL_METAL_COMMAND_DISPATCH_TYPE_CONCURRENT
-            ? MTLDispatchTypeConcurrent
-            : MTLDispatchTypeSerial;
-    command_buffer->state.compute_encoder = nil;
-    command_buffer->state.blit_encoder = nil;
-    command_buffer->state.encoder_event = [queue.device newEvent];  // +1
-    command_buffer->state.next_encoder_event_value = 1;
+    command_buffer->encoder = nil;
     // Initialize per-command-buffer indirect bindings buffer (allocated lazily on first use).
     command_buffer->indirect_bindings_buffer = nil;
     command_buffer->indirect_bindings_capacity = 0;
@@ -488,9 +458,16 @@ static void iree_hal_metal_command_buffer_destroy_internal(
       iree_hal_metal_command_buffer_cast(base_command_buffer);
 
   iree_hal_metal_command_buffer_reset(command_buffer);
-  [command_buffer->state.encoder_event release];  // -1
-  IREE_ASSERT_EQ(command_buffer->state.compute_encoder, nil);
-  IREE_ASSERT_EQ(command_buffer->state.blit_encoder, nil);
+  IREE_ASSERT_EQ(command_buffer->encoder, nil);
+  if (command_buffer->residency_set) {
+    [command_buffer->residency_set release];  // -1
+  }
+  if (command_buffer->argument_table) {
+    [command_buffer->argument_table release];  // -1
+  }
+  if (command_buffer->command_allocator) {
+    [command_buffer->command_allocator release];  // -1
+  }
   [command_buffer->command_buffer release];  // -1
   [command_buffer->queue release];           // -1
   // Release per-command-buffer indirect bindings buffer if allocated.
@@ -585,42 +562,27 @@ static iree_status_t iree_hal_metal_command_buffer_prepare_barrier(
 
 static iree_status_t iree_hal_metal_command_segment_record_barrier(
     iree_hal_metal_command_buffer_t* command_buffer, iree_hal_metal_barrier_segment_t* segment) {
-  // TODO(antiagainst): Analyze segments before and after to optimize barriers, e.g., switching
-  // encoders would require its own synchronization; so we don't need extract barriers in the
-  // middle.
+  // MTL4 uses unified barriers on the compute encoder. The barrier operates on encoder stages
+  // rather than requiring encoder switching.
+  id<MTL4ComputeCommandEncoder> encoder = iree_hal_metal_get_or_begin_encoder(command_buffer);
+
+  // All IREE compute dispatches and blit operations go through the unified encoder.
+  // Use MTLStageDispatch | MTLStageBlit to cover both.
+  MTLStages stages = MTLStageDispatch | MTLStageBlit;
+
   if (segment->memory_barrier_count == 0 && segment->buffer_barrier_count == 0) {
-    // There is no direct corresponding APIs for execution only barrier in Metal. We just signal and
-    // wait on the same value of a MTLEvent here.
-    iree_hal_metal_end_blit_encoder(command_buffer);
-    iree_hal_metal_end_compute_encoder(command_buffer);
-    id<MTLCommandBuffer> metal_handle = command_buffer->command_buffer;
-    uint64_t event_value = command_buffer->state.next_encoder_event_value++;
-    [metal_handle encodeSignalEvent:command_buffer->state.encoder_event value:event_value];
-    [metal_handle encodeWaitForEvent:command_buffer->state.encoder_event value:event_value];
+    // Execution-only barrier (no memory visibility needed).
+    [encoder barrierAfterEncoderStages:stages
+                   beforeEncoderStages:stages
+                     visibilityOptions:MTL4VisibilityOptionNone];
     return iree_ok_status();
   }
 
-  id<MTLComputeCommandEncoder> encoder =
-      iree_hal_metal_get_or_begin_compute_encoder(command_buffer);
-
-  if (segment->memory_barrier_count != 0) {
-    // If there is a memory barrier specified, we have to place a catch-all barrier for all buffers.
-    // Metal does not provide a more fine-grained control here.
-    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-    return iree_ok_status();
-  }
-
-  if (segment->buffer_barrier_count != 0) {
-    // But we do have the option to specify a list of buffers to synchronize if only buffer barriers
-    // are specified.
-    id<MTLResource>* resources =
-        (id<MTLResource>*)iree_alloca(sizeof(id<MTLResource>) * segment->buffer_barrier_count);
-    for (iree_host_size_t i = 0; i < segment->buffer_barrier_count; ++i) {
-      resources[i] = iree_hal_metal_buffer_handle(
-          iree_hal_buffer_allocated_buffer(segment->buffer_barriers[i].buffer_ref.buffer));
-    }
-    [encoder memoryBarrierWithResources:resources count:segment->buffer_barrier_count];
-  }
+  // Memory barrier — MTL4 does not support per-resource barriers, so we use a full device barrier.
+  // This covers both the memory_barrier and buffer_barrier cases.
+  [encoder barrierAfterEncoderStages:stages
+                 beforeEncoderStages:stages
+                   visibilityOptions:MTL4VisibilityOptionDevice];
   return iree_ok_status();
 }
 
@@ -774,21 +736,28 @@ static iree_status_t iree_hal_metal_command_segment_record_fill_buffer(
 #endif
 
   if (can_use_metal_api) {
-    id<MTLBlitCommandEncoder> encoder = iree_hal_metal_get_or_begin_blit_encoder(command_buffer);
+    // MTL4 unified encoder supports fillBuffer:range:value: directly.
+    id<MTL4ComputeCommandEncoder> encoder = iree_hal_metal_get_or_begin_encoder(command_buffer);
     [encoder fillBuffer:segment->target_buffer
                   range:NSMakeRange(segment->target_offset, segment->length)
                   value:pattern_1byte];
+    // Track residency for the target buffer.
+    [command_buffer->residency_set addAllocation:segment->target_buffer];
+    [command_buffer->residency_set commit];
+    [command_buffer->residency_set requestResidency];
+    [command_buffer->command_buffer useResidencySet:command_buffer->residency_set];
     IREE_TRACE_ZONE_END(z0);
     return iree_ok_status();
   }
 
-  id<MTLComputeCommandEncoder> compute_encoder =
-      iree_hal_metal_get_or_begin_compute_encoder(command_buffer);
+  id<MTL4ComputeCommandEncoder> encoder = iree_hal_metal_get_or_begin_encoder(command_buffer);
   uint32_t pattern_4byte =
       iree_hal_metal_duplicate_to_four_byte_value(segment->pattern, segment->pattern_length);
   iree_status_t status = iree_hal_metal_builtin_executable_fill_buffer(
-      command_buffer->builtin_executable, compute_encoder, segment->target_buffer,
-      segment->target_offset, segment->length, pattern_4byte);
+      command_buffer->builtin_executable, encoder, segment->target_buffer,
+      segment->target_offset, segment->length, pattern_4byte,
+      command_buffer->argument_table, command_buffer->staging_buffer,
+      command_buffer->residency_set);
 
   IREE_TRACE_ZONE_END(z0);
   return status;
@@ -837,18 +806,26 @@ static iree_status_t iree_hal_metal_command_segment_record_copy_buffer(
 
   iree_status_t status = iree_ok_status();
   if (can_use_metal_api) {
-    id<MTLBlitCommandEncoder> encoder = iree_hal_metal_get_or_begin_blit_encoder(command_buffer);
+    // MTL4 unified encoder supports copyFromBuffer: directly.
+    id<MTL4ComputeCommandEncoder> encoder = iree_hal_metal_get_or_begin_encoder(command_buffer);
     [encoder copyFromBuffer:segment->source_buffer
                sourceOffset:segment->source_offset
                    toBuffer:segment->target_buffer
           destinationOffset:segment->target_offset
                        size:segment->length];
+    // Track residency for source and target buffers.
+    [command_buffer->residency_set addAllocation:segment->source_buffer];
+    [command_buffer->residency_set addAllocation:segment->target_buffer];
+    [command_buffer->residency_set commit];
+    [command_buffer->residency_set requestResidency];
+    [command_buffer->command_buffer useResidencySet:command_buffer->residency_set];
   } else {
-    id<MTLComputeCommandEncoder> encoder =
-        iree_hal_metal_get_or_begin_compute_encoder(command_buffer);
+    id<MTL4ComputeCommandEncoder> encoder = iree_hal_metal_get_or_begin_encoder(command_buffer);
     status = iree_hal_metal_builtin_executable_copy_buffer(
         command_buffer->builtin_executable, encoder, segment->source_buffer, segment->source_offset,
-        segment->target_buffer, segment->target_offset, segment->length);
+        segment->target_buffer, segment->target_offset, segment->length,
+        command_buffer->argument_table, command_buffer->staging_buffer,
+        command_buffer->residency_set);
   }
 
   IREE_TRACE_ZONE_END(z0);
@@ -1021,20 +998,15 @@ static iree_status_t iree_hal_metal_command_segment_record_dispatch(
     iree_hal_metal_command_buffer_t* command_buffer, iree_hal_metal_dispatch_segment_t* segment) {
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  // Get or create the unified encoder.
+  id<MTL4ComputeCommandEncoder> encoder = iree_hal_metal_get_or_begin_encoder(command_buffer);
+
   // Set the compute kernel to dispatch.
-  id<MTLComputeCommandEncoder> compute_encoder =
-      iree_hal_metal_get_or_begin_compute_encoder(command_buffer);
-  [compute_encoder setComputePipelineState:segment->pipeline->pipeline_state];
+  [encoder setComputePipelineState:segment->pipeline->pipeline_state];
 
-  // Record push constants.
-  if (segment->constant_count != 0) {
-    [compute_encoder setBytes:(void*)segment->constants
-                       length:segment->constant_count * sizeof(int32_t)
-                      atIndex:IREE_HAL_METAL_PUSH_CONSTANT_BUFFER_INDEX];
-  }
-
-  // Record argument buffers for all descriptors and record buffer usages.
+  // Record argument buffers for all descriptors via the argument table.
   iree_hal_metal_descriptor_t* descriptors = segment->descriptors;
+  id<MTL4ArgumentTable> arg_table = command_buffer->argument_table;
 
   if (segment->pipeline->uses_indirect_bindings) {
     // For indirect bindings (PhysicalStorageBuffer), build a two-level pointer structure.
@@ -1042,9 +1014,6 @@ static iree_status_t iree_hal_metal_command_segment_record_dispatch(
     //   struct _6 { device T* _m0; device T* _m1; ... };  // inner: actual buffer pointers
     //   struct spvDescriptorSetBuffer3 { device _6* _resource_var_indirect_0_; };  // outer
     // Buffer(3) must contain spvDescriptorSetBuffer3, which points to _6.
-    //
-    // We use a per-command-buffer dedicated buffer to avoid race conditions where the GPU
-    // reads stale data while another command buffer overwrites shared staging buffer data.
 
     // Determine the maximum binding index to size the inner struct.
     uint32_t max_binding = 0;
@@ -1063,7 +1032,7 @@ static iree_status_t iree_hal_metal_command_segment_record_dispatch(
                 command_buffer, inner_struct_size,
                 /*alignment=*/sizeof(uint64_t), &inner_host_ptr, &inner_offset));
 
-    // Fill the inner struct with GPU addresses.
+    // Fill the inner struct with GPU addresses and add buffers to residency set.
     uint64_t* address_table = (uint64_t*)inner_host_ptr;
     memset(address_table, 0, inner_struct_size);
     for (iree_host_size_t i = 0; i < segment->descriptor_count; ++i) {
@@ -1074,7 +1043,7 @@ static iree_status_t iree_hal_metal_command_segment_record_dispatch(
           iree_hal_buffer_byte_offset(descriptors[i].buffer) + descriptors[i].offset;
 
       address_table[current_binding] = current_buffer.gpuAddress + offset;
-      [compute_encoder useResource:current_buffer usage:descriptors[i].usage];
+      [command_buffer->residency_set addAllocation:current_buffer];
     }
 
     // Reserve space for outer struct (contains pointer to inner struct).
@@ -1086,69 +1055,109 @@ static iree_status_t iree_hal_metal_command_segment_record_dispatch(
                 /*alignment=*/sizeof(uint64_t), &outer_host_ptr, &outer_offset));
 
     // Fill the outer struct with pointer to inner struct.
-    // Use the dedicated buffer's GPU address for the inner struct pointer.
     id<MTLBuffer> indirect_buffer = command_buffer->indirect_bindings_buffer;
     uint64_t* outer_ptr = (uint64_t*)outer_host_ptr;
     *outer_ptr = indirect_buffer.gpuAddress + inner_offset;
 
     // Ensure CPU writes to the dedicated buffer are visible to GPU.
-    // Use ARM64-specific data memory barrier for store completion.
 #if defined(__aarch64__)
-    __asm__ __volatile__("dmb ishst" ::: "memory");  // Store barrier
-    __asm__ __volatile__("dsb sy" ::: "memory");     // Full sync
+    __asm__ __volatile__("dmb ishst" ::: "memory");
+    __asm__ __volatile__("dsb sy" ::: "memory");
 #else
     __sync_synchronize();
 #endif
 
-    // Pass the outer struct at buffer index 3.
-    [compute_encoder setBuffer:indirect_buffer offset:outer_offset atIndex:3];
+    // Bind the outer struct address via the argument table at index 3.
+    [arg_table setAddress:(indirect_buffer.gpuAddress + outer_offset) atIndex:3];
+    [command_buffer->residency_set addAllocation:indirect_buffer];
   } else {
-    // Standard path: use argument encoders for descriptor sets.
-    // Build argument encoder and argument buffer for the current descriptor set.
-    // TODO(antiagainst): Use a cache layer to cache and reuse argument buffers with the same
-    // content, to avoid duplicating overhead.
-    id<MTLBuffer> argument_buffer = command_buffer->staging_buffer->metal_buffer;
-    id<MTLArgumentEncoder> argument_encoder =
-        [segment->pipeline->function newArgumentEncoderWithBufferIndex:0];  // +1
-    IREE_ASSERT(argument_encoder != nil);
+    // Standard path: build an argument buffer at [[buffer(0)]] containing GPU addresses.
+    // SPIRV-Cross generates MSL that uses argument buffers:
+    //   constant spvDescriptorSetBuffer0& descriptorSet [[buffer(0)]]
+    //   with members: device T* [[id(N)]] at position N * sizeof(uint64_t).
+    // In Metal 3, MTLArgumentEncoder handled this layout. In Metal 4, we build
+    // the argument buffer manually and bind its address at argument table index 0.
 
-    // Reserve space for the argument buffer from shared staging buffer.
-    iree_byte_span_t reservation = iree_byte_span_empty();
-    uint32_t argument_buffer_offset = 0;
+    // Determine the maximum binding index to size the argument buffer.
+    uint32_t max_binding = 0;
+    for (iree_host_size_t i = 0; i < segment->descriptor_count; ++i) {
+      if (descriptors[i].binding > max_binding) {
+        max_binding = descriptors[i].binding;
+      }
+    }
+    size_t arg_buffer_size = (max_binding + 1) * sizeof(uint64_t);
+
+    // Reserve space for the argument buffer (array of GPU addresses).
+    uint8_t* arg_host_ptr = NULL;
+    uint32_t arg_offset = 0;
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
-        z0, iree_hal_metal_staging_buffer_reserve(
-                command_buffer->staging_buffer, argument_encoder.encodedLength,
-                argument_encoder.alignment, &reservation, &argument_buffer_offset));
-    [argument_encoder setArgumentBuffer:argument_buffer offset:argument_buffer_offset];
+        z0, iree_hal_metal_indirect_bindings_buffer_reserve(
+                command_buffer, arg_buffer_size,
+                /*alignment=*/sizeof(uint64_t), &arg_host_ptr, &arg_offset));
 
-    // Now record all bound buffers belonging to the current set into the argument buffer.
+    // Fill the argument buffer with GPU addresses for each binding.
+    uint64_t* address_table = (uint64_t*)arg_host_ptr;
+    memset(address_table, 0, arg_buffer_size);
     for (iree_host_size_t i = 0; i < segment->descriptor_count; ++i) {
       uint32_t current_binding = descriptors[i].binding;
       id<MTLBuffer> current_buffer =
           iree_hal_metal_buffer_handle(iree_hal_buffer_allocated_buffer(descriptors[i].buffer));
       iree_host_size_t offset =
           iree_hal_buffer_byte_offset(descriptors[i].buffer) + descriptors[i].offset;
-      [argument_encoder setBuffer:current_buffer offset:offset atIndex:current_binding];
 
-      // Also record buffer usages.
-      [compute_encoder useResource:current_buffer usage:descriptors[i].usage];
+      address_table[current_binding] = current_buffer.gpuAddress + offset;
+      [command_buffer->residency_set addAllocation:current_buffer];
     }
-    // Record the argument buffer.
-    [compute_encoder setBuffer:argument_buffer offset:argument_buffer_offset atIndex:0];
 
-    [argument_encoder release];  // -1
+    // Ensure CPU writes to the argument buffer are visible to GPU.
+#if defined(__aarch64__)
+    __asm__ __volatile__("dmb ishst" ::: "memory");
+    __asm__ __volatile__("dsb sy" ::: "memory");
+#else
+    __sync_synchronize();
+#endif
+
+    // Bind the argument buffer at index 0 (matching [[buffer(0)]] in the shader).
+    id<MTLBuffer> indirect_buffer = command_buffer->indirect_bindings_buffer;
+    [arg_table setAddress:(indirect_buffer.gpuAddress + arg_offset) atIndex:0];
+    [command_buffer->residency_set addAllocation:indirect_buffer];
   }
+
+  // Record push constants — MTL4 has no inline setBytes, so write to staging buffer
+  // and bind via argument table.
+  if (segment->constant_count != 0) {
+    iree_const_byte_span_t constants_span = iree_make_const_byte_span(
+        (const uint8_t*)segment->constants, segment->constant_count * sizeof(int32_t));
+    uint32_t constants_offset = 0;
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_metal_staging_buffer_append(
+                command_buffer->staging_buffer, constants_span,
+                /*alignment=*/sizeof(int32_t), &constants_offset));
+    id<MTLBuffer> staging_metal = command_buffer->staging_buffer->metal_buffer;
+    [arg_table setAddress:(staging_metal.gpuAddress + constants_offset)
+                  atIndex:IREE_HAL_METAL_PUSH_CONSTANT_BUFFER_INDEX];
+    [command_buffer->residency_set addAllocation:staging_metal];
+  }
+
+  // Commit residency changes and attach to command buffer.
+  [command_buffer->residency_set commit];
+  [command_buffer->residency_set requestResidency];
+  [command_buffer->command_buffer useResidencySet:command_buffer->residency_set];
+
+  // Set the argument table on the encoder.
+  [encoder setArgumentTable:arg_table];
 
   // Record the dispatch, either direct or indirect.
   if (segment->workgroups_buffer == nil) {
     // Direct dispatch of a fixed workgroup count.
-    [compute_encoder dispatchThreadgroups:segment->workgroup_count
-                    threadsPerThreadgroup:segment->threadgroup_size];
+    [encoder dispatchThreadgroups:segment->workgroup_count
+            threadsPerThreadgroup:segment->threadgroup_size];
   } else {
-    // Indirect dispatch using a workgroup count from buffers.
-    [compute_encoder dispatchThreadgroupsWithIndirectBuffer:segment->workgroups_buffer
-                                       indirectBufferOffset:segment->workgroups_offset
-                                      threadsPerThreadgroup:segment->threadgroup_size];
+    // Indirect dispatch using a GPU address for the workgroup count buffer.
+    MTLGPUAddress indirect_addr =
+        segment->workgroups_buffer.gpuAddress + segment->workgroups_offset;
+    [encoder dispatchThreadgroupsWithIndirectBuffer:indirect_addr
+                              threadsPerThreadgroup:segment->threadgroup_size];
   }
 
   IREE_TRACE_ZONE_END(z0);
@@ -1203,9 +1212,14 @@ static iree_status_t iree_hal_metal_command_buffer_end(
       iree_hal_metal_command_buffer_cast(base_command_buffer);
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  // Begin the command buffer with the allocator before recording.
+  [command_buffer->command_buffer beginCommandBufferWithAllocator:command_buffer->command_allocator];
+
   IREE_RETURN_AND_END_ZONE_IF_ERROR(z0, iree_hal_metal_command_segment_record(command_buffer));
-  iree_hal_metal_end_blit_encoder(command_buffer);
-  iree_hal_metal_end_compute_encoder(command_buffer);
+  iree_hal_metal_end_encoder(command_buffer);
+
+  // End the command buffer (required before queue commit).
+  [command_buffer->command_buffer endCommandBuffer];
 
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();

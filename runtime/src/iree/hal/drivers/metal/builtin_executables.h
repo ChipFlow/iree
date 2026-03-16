@@ -8,10 +8,13 @@
 #define IREE_HAL_DRIVERS_METAL_BUILTIN_EXECUTABLES_H_
 
 #import <Metal/Metal.h>
+#import <Metal/MTL4ComputeCommandEncoder.h>
+#import <Metal/MTL4ArgumentTable.h>
 
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
 #include "iree/hal/drivers/metal/executable.h"
+#include "iree/hal/drivers/metal/staging_buffer.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,25 +48,35 @@ iree_status_t iree_hal_metal_builtin_executable_create(
 void iree_hal_metal_builtin_executable_destroy(iree_hal_metal_builtin_executable_t* executable);
 
 // Fills the |target_buffer| at the given |target_offset| of |length| with
-// |pattern| using builtin executables dispatched via |encoder|.
+// |pattern| using builtin executables dispatched via the MTL4 |encoder|.
 //
-// Under the hood, this will record all necessary commands to bind kernel
-// objects and buffer resources, and the perform dispatch.
+// Uses the |argument_table| for binding buffer addresses to kernel parameters,
+// the |staging_buffer| for push-constant-like data, and adds allocations to
+// the |residency_set|.
 iree_status_t iree_hal_metal_builtin_executable_fill_buffer(
-    const iree_hal_metal_builtin_executable_t* executable, id<MTLComputeCommandEncoder> encoder,
+    const iree_hal_metal_builtin_executable_t* executable,
+    id<MTL4ComputeCommandEncoder> encoder,
     id<MTLBuffer> target_buffer, iree_device_size_t target_offset, iree_device_size_t length,
-    uint32_t pattern);
+    uint32_t pattern,
+    id<MTL4ArgumentTable> argument_table,
+    iree_hal_metal_staging_buffer_t* staging_buffer,
+    id<MTLResidencySet> residency_set);
 
 // Copies the |source_buffer| at |source_offset| to the |target_buffer| at
-// |target_offset| of |length| using builtin executables dispatched via
-// |encoder|.
+// |target_offset| of |length| using builtin executables dispatched via the
+// MTL4 |encoder|.
 //
-// Under the hood, this will record all necessary commands to bind kernel
-// objects and buffer resources, and the perform dispatch.
+// Uses the |argument_table| for binding buffer addresses to kernel parameters,
+// the |staging_buffer| for push-constant-like data, and adds allocations to
+// the |residency_set|.
 iree_status_t iree_hal_metal_builtin_executable_copy_buffer(
-    const iree_hal_metal_builtin_executable_t* executable, id<MTLComputeCommandEncoder> encoder,
+    const iree_hal_metal_builtin_executable_t* executable,
+    id<MTL4ComputeCommandEncoder> encoder,
     id<MTLBuffer> source_buffer, iree_device_size_t source_offset, id<MTLBuffer> target_buffer,
-    iree_device_size_t target_offset, iree_device_size_t length);
+    iree_device_size_t target_offset, iree_device_size_t length,
+    id<MTL4ArgumentTable> argument_table,
+    iree_hal_metal_staging_buffer_t* staging_buffer,
+    id<MTLResidencySet> residency_set);
 
 #ifdef __cplusplus
 }  // extern "C"

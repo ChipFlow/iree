@@ -6,6 +6,13 @@
 
 #include "iree/hal/drivers/metal/metal_device.h"
 
+#import <Metal/MTL4CommandBuffer.h>
+#import <Metal/MTL4ComputeCommandEncoder.h>
+#import <Metal/MTL4CommandAllocator.h>
+#import <Metal/MTL4CommandQueue.h>
+#import <Metal/MTL4ArgumentTable.h>
+#import <Metal/MTL4CommitFeedback.h>
+
 #include "iree/base/api.h"
 #include "iree/base/tracing.h"
 #include "iree/hal/api.h"
@@ -80,9 +87,9 @@ typedef struct iree_hal_metal_device_t {
   id<MTLDevice> device;
   // We only expose one single command queue for now. This simplifies synchronization.
   // We can relax this to support multiple queues when needed later.
-  id<MTLCommandQueue> queue;
-  // A command buffer descriptor used for creating command buffers to signal/wait MTLSharedEvent.
-  MTLCommandBufferDescriptor* command_buffer_descriptor;
+  id<MTL4CommandQueue> queue;
+  // A shared command allocator for creating lightweight command buffers (barrier-only, etc.).
+  id<MTL4CommandAllocator> command_allocator;
 
   iree_hal_metal_command_buffer_resource_reference_mode_t command_buffer_resource_reference_mode;
 
@@ -147,15 +154,14 @@ static iree_status_t iree_hal_metal_device_create_internal(
   device->params = *params;
   device->host_allocator = host_allocator;
 
-  device->device = [metal_device retain];                            // +1
-  id<MTLCommandQueue> metal_queue = [metal_device newCommandQueue];  // +1
+  device->device = [metal_device retain];                             // +1
+  id<MTL4CommandQueue> metal_queue = [metal_device newMTL4CommandQueue];  // +1
   device->queue = metal_queue;
 
-  MTLCommandBufferDescriptor* descriptor = [MTLCommandBufferDescriptor new];  // +1
-  descriptor.retainedReferences = params->command_buffer_resource_reference_mode ==
-                                  IREE_HAL_METAL_COMMAND_BUFFER_RESOURCE_REFERENCE_MODE_RETAINED;
-  descriptor.errorOptions = MTLCommandBufferErrorOptionNone;
-  device->command_buffer_descriptor = descriptor;
+  @autoreleasepool {
+    // Use the simple allocator creation — descriptor version is only needed for custom config.
+    device->command_allocator = [metal_device newCommandAllocator];  // +1
+  }
 
   device->command_buffer_resource_reference_mode = params->command_buffer_resource_reference_mode;
   dispatch_queue_attr_t queue_attr = dispatch_queue_attr_make_with_qos_class(
@@ -165,12 +171,15 @@ static iree_status_t iree_hal_metal_device_create_internal(
       initWithDispatchQueue:device->semaphore_notification_queue];  // +1
   device->capture_manager = NULL;
 
-  iree_status_t status = iree_hal_metal_allocator_create((iree_hal_device_t*)device, metal_device,
+  // The allocator takes a Metal 3 command queue for managed buffer flushing on macOS.
+  // On Apple Silicon (unified memory), this queue is never actually used by the allocator
+  // (it's stored but never assigned in create — nil). Pass nil explicitly.
+  iree_status_t status = iree_hal_metal_allocator_create(
+      (iree_hal_device_t*)device, metal_device,
 #if defined(IREE_PLATFORM_MACOS)
-                                                         metal_queue,
+      nil,
 #endif  // IREE_PLATFORM_MACOS
-                                                         params->resource_hazard_tracking_mode,
-                                                         host_allocator, &device->device_allocator);
+      params->resource_hazard_tracking_mode, host_allocator, &device->device_allocator);
 
   if (iree_status_is_ok(status)) {
     status = iree_hal_metal_builtin_executable_create(metal_device, host_allocator,
@@ -215,8 +224,8 @@ static void iree_hal_metal_device_destroy(iree_hal_device_t* base_device) {
   iree_hal_metal_builtin_executable_destroy(device->builtin_executable);
 
   iree_hal_allocator_release(device->device_allocator);
-  [device->command_buffer_descriptor release];  // -1
-  [device->queue release];                      // -1
+  [device->command_allocator release];  // -1
+  [device->queue release];              // -1
   [device->device release];                     // -1
 
   iree_hal_metal_staging_buffer_deinitialize(&device->staging_buffer);
@@ -546,62 +555,17 @@ static iree_status_t iree_hal_metal_device_queue_execute(
   }
 
   // Translate deferred command buffers into real Metal command buffers.
-  // For deferred CBs with pending waits, we encode waits on the same
-  // MTLCommandBuffer before replaying compute work — producing a single CB
-  // (waits → compute → signals) instead of two (wait CB + compute CB).
-  // Metal API allows encodeWaitForEvent before the first command encoder.
-  // NOTE: iree_hal_deferred_command_buffer_apply calls begin() → reset() on
-  // the direct CB. reset() resets segments/arena/bindings but does NOT touch
-  // the underlying MTLCommandBuffer, so waits encoded before apply() survive.
   iree_hal_command_buffer_t* direct_command_buffer = NULL;
   if (iree_status_is_ok(status) && command_buffer) {
     if (iree_hal_deferred_command_buffer_isa(command_buffer)) {
-      if (needs_gpu_wait) {
-        IREE_PJRT_TRACE("queue_execute.merged_wait_replay",
-                         "encoding %zu waits + replay on single CB",
-                         (size_t)wait_semaphore_list.count);
-        // Create the direct CB (allocates an empty MTLCommandBuffer).
-        @autoreleasepool {
-          status = iree_hal_metal_direct_command_buffer_create(
-              base_device, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
-              iree_hal_command_buffer_allowed_categories(command_buffer),
-              /*binding_capacity=*/0, device->command_buffer_resource_reference_mode,
-              device->queue, &device->block_pool, &device->staging_buffer,
-              device->builtin_executable, device->host_allocator, &direct_command_buffer);
-        }
-        // Encode waits on the MTLCommandBuffer before any command encoders.
-        if (iree_status_is_ok(status)) {
-          id<MTLCommandBuffer> metal_cb =
-              iree_hal_metal_direct_command_buffer_handle(direct_command_buffer);
-          for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
-            id<MTLSharedEvent> handle =
-                iree_hal_metal_shared_event_handle(wait_semaphore_list.semaphores[i]);
-            [metal_cb encodeWaitForEvent:handle
-                                   value:wait_semaphore_list.payload_values[i]];
-          }
-          // Replay the deferred CB onto the same direct CB.
-          status = iree_hal_deferred_command_buffer_apply(
-              command_buffer, direct_command_buffer, binding_table);
-        }
-        if (!iree_status_is_ok(status) && direct_command_buffer) {
-          iree_hal_command_buffer_release(direct_command_buffer);
-          direct_command_buffer = NULL;
-        }
-        // Waits are already encoded on the compute CB — don't create a separate wait CB.
-        needs_gpu_wait = false;
-        IREE_PJRT_TRACE0("queue_execute.merged_replay_done");
-      } else {
-        IREE_PJRT_TRACE0("queue_execute.replay_deferred");
-        // No waits needed: replay as before.
-        @autoreleasepool {
-          status = iree_hal_metal_replay_command_buffer(device, command_buffer, binding_table,
-                                                        &direct_command_buffer);
-        }
-        IREE_PJRT_TRACE0("queue_execute.replay_done");
+      IREE_PJRT_TRACE0("queue_execute.replay_deferred");
+      @autoreleasepool {
+        status = iree_hal_metal_replay_command_buffer(device, command_buffer, binding_table,
+                                                      &direct_command_buffer);
       }
+      IREE_PJRT_TRACE0("queue_execute.replay_done");
     } else {
       IREE_PJRT_TRACE0("queue_execute.direct_cb");
-      // Retain the command buffer until the submission has completed.
       iree_hal_command_buffer_retain(command_buffer);
       direct_command_buffer = command_buffer;
     }
@@ -613,65 +577,63 @@ static iree_status_t iree_hal_metal_device_queue_execute(
 
   if (iree_status_is_ok(status)) {
     @autoreleasepool {
-      // Create a separate wait CB only for non-deferred command buffers with
-      // unsatisfied waits (the deferred path above merges waits into the
-      // compute CB). This also handles the barrier-only case (NULL command_buffer).
+      id<MTL4CommandQueue> mtl4_queue = device->queue;
+
+      // Encode queue-level waits for all unsatisfied wait semaphores.
+      // MTL4 uses queue-level wait/signal — no stages parameter needed.
       if (needs_gpu_wait) {
-        IREE_PJRT_TRACE("queue_execute.wait_cb", "creating wait CB for %zu sems",
+        IREE_PJRT_TRACE("queue_execute.queue_waits", "encoding %zu queue-level waits",
                          (size_t)wait_semaphore_list.count);
-        id<MTLCommandBuffer> wait_command_buffer = [device->queue
-            commandBufferWithDescriptor:device->command_buffer_descriptor];  // autoreleased
         for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
           id<MTLSharedEvent> handle =
               iree_hal_metal_shared_event_handle(wait_semaphore_list.semaphores[i]);
-          [wait_command_buffer encodeWaitForEvent:handle
-                                            value:wait_semaphore_list.payload_values[i]];
+          [mtl4_queue waitForEvent:handle
+                             value:wait_semaphore_list.payload_values[i]];
         }
-        [wait_command_buffer commit];
-        IREE_PJRT_TRACE0("queue_execute.wait_cb_committed");
       }
 
-      // Get or create the command buffer for signal encoding.
-      id<MTLCommandBuffer> signal_command_buffer = nil;
+      // Get or create the command buffer for submission.
+      id<MTL4CommandBuffer> submit_cb = nil;
       if (direct_command_buffer) {
-        // NOTE: translation happens above such that we always know these are direct command
-        // buffers.
-        //
-        // TODO(indirect-cmd): support indirect command buffers and switch here, or only use
-        // indirect command buffers and assume that instead.
-        id<MTLCommandBuffer> handle =
-            iree_hal_metal_direct_command_buffer_handle(direct_command_buffer);
-        signal_command_buffer = handle;
+        submit_cb = iree_hal_metal_direct_command_buffer_handle(direct_command_buffer);
       }
-      if (signal_command_buffer == nil) {
-        signal_command_buffer = [device->queue
-            commandBufferWithDescriptor:device->command_buffer_descriptor];  // autoreleased
+      if (submit_cb == nil) {
+        // Barrier-only case: create a trivial CB for the completion handler.
+        submit_cb = [device->device newCommandBuffer];  // +1
+        [submit_cb beginCommandBufferWithAllocator:device->command_allocator];
+        [submit_cb endCommandBuffer];
       }
 
-      // Finally encode signal commands for all signal semaphores.
+      // Use MTL4CommitOptions with feedback handler for completion notification.
+      // MTL4CommandBuffer has no addCompletedHandler — use commit options instead.
+      MTL4CommitOptions* commit_options = [[MTL4CommitOptions alloc] init];  // +1
+      iree_hal_device_retain(base_device);
+      [commit_options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        IREE_PJRT_TRACE0("queue_execute.gpu_completed");
+        if (feedback.error) {
+          IREE_TRACE_ZONE_BEGIN(z_error);
+          IREE_TRACE_ZONE_APPEND_TEXT(z_error,
+              feedback.error.localizedDescription.UTF8String);
+          IREE_TRACE_ZONE_END(z_error);
+        }
+        iree_hal_resource_set_free(resource_set);
+        iree_hal_device_release(base_device);
+      }];
+
+      // Commit the command buffer via the queue with feedback options.
+      [mtl4_queue commit:&submit_cb count:1 options:commit_options];
+      [commit_options release];  // -1
+      IREE_PJRT_TRACE0("queue_execute.committed");
+
+      // Encode queue-level signals for all signal semaphores (ordered after committed work).
       IREE_PJRT_TRACE("queue_execute.signal", "encoding %zu signal events",
                        (size_t)signal_semaphore_list.count);
       for (iree_host_size_t i = 0; i < signal_semaphore_list.count; ++i) {
         id<MTLSharedEvent> handle =
             iree_hal_metal_shared_event_handle(signal_semaphore_list.semaphores[i]);
-        [signal_command_buffer encodeSignalEvent:handle
-                                           value:signal_semaphore_list.payload_values[i]];
+        [mtl4_queue signalEvent:handle
+                          value:signal_semaphore_list.payload_values[i]];
       }
-
-      // We use a resource set to keep track of resources in the above. So here we need to retain
-      // the device to make sure the block pool behind outlives the resource set.
-      iree_hal_device_retain(base_device);
-      [signal_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-        IREE_PJRT_TRACE0("queue_execute.gpu_completed");
-        // Now we can release all retained resources.
-        iree_hal_resource_set_free(resource_set);
-        // And then release the device handle. Note that this must happen separately--if we put the
-        // device itself in the resource set, we can destroy the block pool data structure inside
-        // the device prematurely, before the resource set free procedure done scanning it.
-        iree_hal_device_release(base_device);
-      }];
-      [signal_command_buffer commit];
-      IREE_PJRT_TRACE0("queue_execute.committed");
     }
   } else {
     iree_hal_resource_set_free(resource_set);

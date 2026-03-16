@@ -224,11 +224,14 @@ void iree_hal_metal_builtin_executable_destroy(iree_hal_metal_builtin_executable
 }
 
 iree_status_t iree_hal_metal_builtin_executable_fill_buffer(
-    const iree_hal_metal_builtin_executable_t* executable, id<MTLComputeCommandEncoder> encoder,
+    const iree_hal_metal_builtin_executable_t* executable,
+    id<MTL4ComputeCommandEncoder> encoder,
     id<MTLBuffer> target_buffer, iree_device_size_t target_offset, iree_device_size_t length,
-    uint32_t pattern) {
+    uint32_t pattern,
+    id<MTL4ArgumentTable> argument_table,
+    iree_hal_metal_staging_buffer_t* staging_buffer,
+    id<MTLResidencySet> residency_set) {
   id<MTLComputePipelineState> pipeline_state = nil;
-  MTLResourceUsage usage = MTLResourceUsageWrite;
   const iree_device_size_t workgroup_size = 32;
   iree_device_size_t workgroup_count = 0;
   if (target_offset % 16 == 0 && length % 16 == 0) {  // 16-byte aligned case
@@ -239,34 +242,40 @@ iree_status_t iree_hal_metal_builtin_executable_fill_buffer(
     workgroup_count = iree_device_size_ceil_div(length, workgroup_size * 4);
   } else {  // 1-byte aligned case
     pipeline_state = executable->pipelines[2].pipeline_state;
-    // We may potentially need to read some 32-bit scalars at unaligned addresses.
-    usage |= MTLResourceUsageRead;
     // Calculate unaligned partial prefix/suffix byte count, and then get the middle aligned byte
     // count for distributing threads. This logic MUST be consistent with the MSL source code.
     iree_device_size_t left_byte_count = target_offset % 4;
     iree_device_size_t right_byte_count = (target_offset + length) % 4;
     int64_t middle_byte_count = length - left_byte_count - right_byte_count;
-    // Note that in the extreme case, we don't have aligned bytes in the middle (0), or actually
-    // prefix and suffix partial bytes are the same (< 0). We'd need one thread to handle the
-    // partial bytes at least.
     if (middle_byte_count <= 0) middle_byte_count = 1;
     workgroup_count = iree_device_size_ceil_div(middle_byte_count, workgroup_size * 4);
   }
   [encoder setComputePipelineState:pipeline_state];
 
-  // The following MUST exactly match the pipeline layout from MSL source code.
-  // buffer(0) is the target buffer to fill. Note that we MUST set 0 as offset here--the offset
-  // is to be handled directly in the kernels!
-  [encoder setBuffer:target_buffer offset:0 atIndex:0];
-  [encoder useResource:target_buffer usage:usage];
+  // buffer(0) is the target buffer to fill (GPU address with offset 0; offset handled in kernel).
+  [argument_table setAddress:target_buffer.gpuAddress atIndex:0];
+  [residency_set addAllocation:target_buffer];
 
-  // buffer(1) is the buffer fill spec.
+  // buffer(1) is the buffer fill spec — written to staging buffer and bound via address.
   iree_hal_metal_buffer_fill_spec_t spec = {
       .buffer_offset = target_offset,
       .buffer_length = length,
       .pattern = pattern,
   };
-  [encoder setBytes:&spec length:sizeof(spec) atIndex:1];
+  iree_const_byte_span_t spec_span = iree_make_const_byte_span((const uint8_t*)&spec, sizeof(spec));
+  uint32_t spec_offset = 0;
+  iree_status_t status = iree_hal_metal_staging_buffer_append(
+      staging_buffer, spec_span, /*alignment=*/sizeof(uint64_t), &spec_offset);
+  if (!iree_status_is_ok(status)) return status;
+
+  id<MTLBuffer> staging_metal = staging_buffer->metal_buffer;
+  [argument_table setAddress:(staging_metal.gpuAddress + spec_offset) atIndex:1];
+  [residency_set addAllocation:staging_metal];
+
+  // Commit residency and set argument table.
+  [residency_set commit];
+  [residency_set requestResidency];
+  [encoder setArgumentTable:argument_table];
 
   // Encode the dispatch.
   [encoder dispatchThreadgroups:MTLSizeMake(workgroup_count, 1, 1)
@@ -276,30 +285,44 @@ iree_status_t iree_hal_metal_builtin_executable_fill_buffer(
 }
 
 iree_status_t iree_hal_metal_builtin_executable_copy_buffer(
-    const iree_hal_metal_builtin_executable_t* executable, id<MTLComputeCommandEncoder> encoder,
+    const iree_hal_metal_builtin_executable_t* executable,
+    id<MTL4ComputeCommandEncoder> encoder,
     id<MTLBuffer> source_buffer, iree_device_size_t source_offset, id<MTLBuffer> target_buffer,
-    iree_device_size_t target_offset, iree_device_size_t length) {
+    iree_device_size_t target_offset, iree_device_size_t length,
+    id<MTL4ArgumentTable> argument_table,
+    iree_hal_metal_staging_buffer_t* staging_buffer,
+    id<MTLResidencySet> residency_set) {
   id<MTLComputePipelineState> pipeline_state = executable->pipelines[3].pipeline_state;
   [encoder setComputePipelineState:pipeline_state];
 
-  // The following MUST exactly match the pipeline layout from MSL source code.
-  // buffer(0) is the source buffer. Note that we MUST set 0 as offset here--the offset is to be
-  // handled directly in the kernels!
-  [encoder setBuffer:source_buffer offset:0 atIndex:0];
-  [encoder useResource:source_buffer usage:MTLResourceUsageRead];
+  // buffer(0) is the source buffer (GPU address with offset 0; offset handled in kernel).
+  [argument_table setAddress:source_buffer.gpuAddress atIndex:0];
+  [residency_set addAllocation:source_buffer];
 
-  // buffer(0) is the target buffer. Note that we MUST set 0 as offset here--the offset is to be
-  // handled directly in the kernels!
-  [encoder setBuffer:target_buffer offset:0 atIndex:1];
-  [encoder useResource:target_buffer usage:MTLResourceUsageWrite];
+  // buffer(1) is the target buffer (GPU address with offset 0; offset handled in kernel).
+  [argument_table setAddress:target_buffer.gpuAddress atIndex:1];
+  [residency_set addAllocation:target_buffer];
 
-  // buffer(1) is the buffer copy spec.
+  // buffer(2) is the buffer copy spec — written to staging buffer and bound via address.
   iree_hal_metal_buffer_copy_spec_t spec = {
       .src_buffer_offset = source_offset,
       .dst_buffer_offset = target_offset,
       .length = length,
   };
-  [encoder setBytes:&spec length:sizeof(spec) atIndex:2];
+  iree_const_byte_span_t spec_span = iree_make_const_byte_span((const uint8_t*)&spec, sizeof(spec));
+  uint32_t spec_offset = 0;
+  iree_status_t status = iree_hal_metal_staging_buffer_append(
+      staging_buffer, spec_span, /*alignment=*/sizeof(uint64_t), &spec_offset);
+  if (!iree_status_is_ok(status)) return status;
+
+  id<MTLBuffer> staging_metal = staging_buffer->metal_buffer;
+  [argument_table setAddress:(staging_metal.gpuAddress + spec_offset) atIndex:2];
+  [residency_set addAllocation:staging_metal];
+
+  // Commit residency and set argument table.
+  [residency_set commit];
+  [residency_set requestResidency];
+  [encoder setArgumentTable:argument_table];
 
   // Encode the dispatch.
   const iree_device_size_t workgroup_size = 32;
