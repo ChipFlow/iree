@@ -252,6 +252,10 @@ int baspacho_analyze(baspacho_handle_t h, int64_t n, int64_t nnz,
     settings.addFillPolicy = BaSpaCho::AddFillComplete;
     // Enable sparse elimination for both CPU and Metal backends
     settings.findSparseEliminationRanges = true;
+    // Skip maxAbsDiag CPU data read during factorization — this reads buffer
+    // contents which aren't populated yet in IREE's streamable recording
+    // pipeline, causing SIGBUS on unified memory.
+    settings.staticPivotThreshold = -1.0;
 
     // Create solver (performs symbolic analysis)
     h->solver = BaSpaCho::createSolver(settings, h->block_sizes, ss);
