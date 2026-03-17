@@ -10,12 +10,8 @@
 #include "compiler/plugins/input/StableHLO/Conversion/Passes.h"
 #include "compiler/plugins/input/StableHLO/Conversion/Preprocessing/Rewriters.h"
 #include "compiler/plugins/input/StableHLO/Conversion/Rewriters.h"
-#include "iree/compiler/Dialect/Flow/IR/FlowDialect.h"
-#include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/SparseSolver/IR/SparseSolverDialect.h"
 #include "iree/compiler/Dialect/SparseSolver/IR/SparseSolverOps.h"
-#include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
-#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -719,23 +715,10 @@ struct LapackTrsmFfiRewriter final
 // Handles JAX's experimental sparse solve for IREE backends.
 //
 // Routes to the sparse_solver module which uses BaSpaCho for GPU-accelerated
-// sparse direct solving. BaSpaCho supports:
-// - Metal (Apple GPUs)
-// - CUDA (NVIDIA GPUs)
-// - OpenCL (generic GPU fallback)
-// - CPU (reference implementation)
-//
-// Streamable integration path (GPU):
-// StableHLO custom_call("iree_spsolve")
-//   → flow.call @sparse_solver.spsolve_gpu (this rewriter)
-//   → stream.async.call (FlowToStream conversion)
-//   → stream.cmd.call (inside stream.cmd.execute, ScheduleExecution)
-//   → util.call @sparse_solver.spsolve_gpu (StreamToHAL, CmdCallOpPattern)
-//   → vm.call @sparse_solver.spsolve_gpu (HAL→VM, ExternalFuncOpConversion)
-//
-// The flow.call route makes the solve streamable: it records GPU dispatches
-// into IREE's in-flight command buffer, enabling FuseLoopIterationExecution
-// to fuse the NR loop body into a single execute region.
+// sparse direct solving. Emits sparse_solver.spsolve dialect op which flows
+// through the standard conversion pipeline:
+//   sparse_solver.spsolve (tensor) → HAL conversion → VM conversion
+//   → vm.call @sparse_solver.spsolve_complete
 //
 // See: iree/modules/sparse_solver/ for runtime implementation
 
@@ -778,55 +761,14 @@ struct IreeSpsolveRewriter final
     }
 
     auto loc = op.getLoc();
-    auto moduleOp = op->getParentOfType<ModuleOp>();
-    if (!moduleOp) {
-      return rewriter.notifyMatchFailure(op, "no parent module");
-    }
-
-    // Build dynamic tensor types for the function signature.
-    // flow.call requires exact type match with flow.func declaration.
-    auto f32Ty = rewriter.getF32Type();
-    auto i32Ty = rewriter.getI32Type();
-    auto dynF32Ty = RankedTensorType::get({ShapedType::kDynamic}, f32Ty);
-    auto dynI32Ty = RankedTensorType::get({ShapedType::kDynamic}, i32Ty);
-
-    // Find or create the flow.func declaration (once per module).
-    StringRef funcName = "sparse_solver.spsolve_gpu";
-    auto funcOp = moduleOp.lookupSymbol<IREE::Flow::FuncOp>(funcName);
-    if (!funcOp) {
-      auto funcType = rewriter.getFunctionType(
-          {dynF32Ty, dynI32Ty, dynI32Ty, dynF32Ty}, {dynF32Ty});
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToEnd(moduleOp.getBody());
-      funcOp = rewriter.create<IREE::Flow::FuncOp>(
-          loc, funcName, funcType);
-      funcOp.setVisibility(SymbolTable::Visibility::Private);
-    }
-
-    // Cast operands to dynamic shapes to match the flow.func signature.
-    Value dataDyn = rewriter.create<tensor::CastOp>(loc, dynF32Ty, data);
-    Value indicesDyn = rewriter.create<tensor::CastOp>(loc, dynI32Ty, indices);
-    Value indptrDyn = rewriter.create<tensor::CastOp>(loc, dynI32Ty, indptr);
-    Value rhsDyn = rewriter.create<tensor::CastOp>(loc, dynF32Ty, rhs);
-
-    // Result dimension = n (same as rhs).
-    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value nDim = rewriter.create<tensor::DimOp>(loc, rhs, c0);
-
-    // Create flow.call — routes through stream pipeline for GPU recording.
-    // The simpler builder auto-computes argument_dims from the operands.
-    auto calleeAttr = SymbolRefAttr::get(rewriter.getContext(), funcName);
-    auto callOp = rewriter.create<IREE::Flow::CallOp>(
-        loc, calleeAttr,
-        TypeRange{dynF32Ty}, ValueRange{nDim},
-        ValueRange{dataDyn, indicesDyn, indptrDyn, rhsDyn},
-        /*tiedOperands=*/rewriter.getArrayAttr({}));
-
-    // Cast result back to the expected static type.
     auto resultTy = op.getResult(0).getType();
-    Value result = rewriter.create<tensor::CastOp>(
-        loc, resultTy, callOp.getResult(0));
-    rewriter.replaceOp(op, result);
+
+    // Emit sparse_solver.spsolve dialect op. This flows through the
+    // standard conversion pipeline (HAL → VM) to reach
+    // vm.call @sparse_solver.spsolve_complete at runtime.
+    auto spsolveOp = rewriter.create<IREE::SparseSolver::SpsolveOp>(
+        loc, resultTy, data, indices, indptr, rhs);
+    rewriter.replaceOp(op, spsolveOp.getResult());
     return success();
   }
 };
@@ -836,17 +778,10 @@ struct IreeSpsolveRewriter final
 //===----------------------------------------------------------------------===//
 // Handles JAX's dense solve custom call for IREE backends.
 //
-// Routes to the sparse_solver module's dense_solve_gpu function via the
-// streamable flow.call pipeline. On Metal, this uses BaSpaCho's GPU LU
-// path, recording dispatches into IREE's command buffer.
-//
-// Streamable integration path (GPU):
-// StableHLO custom_call("iree_dense_solve")
-//   → flow.call @sparse_solver.dense_solve_gpu (this rewriter)
-//   → stream.async.call (FlowToStream conversion)
-//   → stream.cmd.call (inside stream.cmd.execute, ScheduleExecution)
-//   → util.call @sparse_solver.dense_solve_gpu (StreamToHAL, CmdCallOpPattern)
-//   → vm.call @sparse_solver.dense_solve_gpu (HAL→VM, ExternalFuncOpConversion)
+// Emits sparse_solver.dense_solve dialect op which flows through the
+// standard conversion pipeline:
+//   sparse_solver.dense_solve (tensor) → HAL conversion → VM conversion
+//   → vm.call @sparse_solver.dense_solve_complete
 
 struct IreeDenseSolveRewriter final
     : OpRewritePattern<mlir::stablehlo::CustomCallOp> {
@@ -867,51 +802,15 @@ struct IreeDenseSolveRewriter final
     Value a = op.getOperand(0);  // Matrix A
     Value b = op.getOperand(1);  // RHS vector b
 
-    auto moduleOp = op->getParentOfType<ModuleOp>();
-    if (!moduleOp) {
-      return rewriter.notifyMatchFailure(op, "no parent module");
-    }
-
     auto loc = op.getLoc();
-    auto f32Ty = rewriter.getF32Type();
-    auto dynMatTy = RankedTensorType::get(
-        {ShapedType::kDynamic, ShapedType::kDynamic}, f32Ty);
-    auto dynVecTy = RankedTensorType::get({ShapedType::kDynamic}, f32Ty);
-
-    // Find or create the flow.func declaration (once per module).
-    StringRef funcName = "sparse_solver.dense_solve_gpu";
-    auto flowFuncOp = moduleOp.lookupSymbol<IREE::Flow::FuncOp>(funcName);
-    if (!flowFuncOp) {
-      auto funcType = rewriter.getFunctionType(
-          {dynMatTy, dynVecTy}, {dynVecTy});
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToEnd(moduleOp.getBody());
-      flowFuncOp = rewriter.create<IREE::Flow::FuncOp>(
-          loc, funcName, funcType);
-      flowFuncOp.setVisibility(SymbolTable::Visibility::Private);
-    }
-
-    // Cast operands to dynamic shapes to match the flow.func signature.
-    Value aDyn = rewriter.create<tensor::CastOp>(loc, dynMatTy, a);
-    Value bDyn = rewriter.create<tensor::CastOp>(loc, dynVecTy, b);
-
-    // Result dimension = n (same as rhs).
-    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value nDim = rewriter.create<tensor::DimOp>(loc, b, c0);
-
-    // Create flow.call — routes through stream pipeline for GPU recording.
-    auto calleeAttr = SymbolRefAttr::get(rewriter.getContext(), funcName);
-    auto callOp = rewriter.create<IREE::Flow::CallOp>(
-        loc, calleeAttr,
-        TypeRange{dynVecTy}, ValueRange{nDim},
-        ValueRange{aDyn, bDyn},
-        /*tiedOperands=*/rewriter.getArrayAttr({}));
-
-    // Cast result back to the expected static type.
     auto resultTy = op.getResult(0).getType();
-    Value result = rewriter.create<tensor::CastOp>(
-        loc, resultTy, callOp.getResult(0));
-    rewriter.replaceOp(op, result);
+
+    // Emit sparse_solver.dense_solve dialect op. This flows through the
+    // standard conversion pipeline (HAL → VM) to reach
+    // vm.call @sparse_solver.dense_solve_complete at runtime.
+    auto denseSolveOp = rewriter.create<IREE::SparseSolver::DenseSolveOp>(
+        loc, resultTy, a, b);
+    rewriter.replaceOp(op, denseSolveOp.getResult());
     return success();
   }
 };
@@ -925,9 +824,7 @@ struct LegalizeStableHLOCustomCalls final
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, linalg::LinalgDialect, scf::SCFDialect,
                     mlir::stablehlo::StablehloDialect, tensor::TensorDialect,
-                    IREE::Flow::FlowDialect,
-                    IREE::SparseSolver::SparseSolverDialect,
-                    IREE::Util::UtilDialect>();
+                    IREE::SparseSolver::SparseSolverDialect>();
   }
 
   void runOnOperation() override {
@@ -936,9 +833,7 @@ struct LegalizeStableHLOCustomCalls final
 
     // Ensure dialects are loaded in this context.
     // getDependentDialects may not be sufficient for nested interface passes.
-    ctx->loadDialect<IREE::Flow::FlowDialect,
-                      IREE::SparseSolver::SparseSolverDialect,
-                      IREE::Util::UtilDialect>();
+    ctx->loadDialect<IREE::SparseSolver::SparseSolverDialect>();
 
     RewritePatternSet patterns(ctx);
     patterns.add<HouseholderReflectorRewriter, ShapeAssertionDrop,

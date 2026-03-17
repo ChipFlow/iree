@@ -1421,98 +1421,6 @@ IREE_VM_ABI_EXPORT(iree_sparse_solver_dense_solve_complete,
 }
 
 //===----------------------------------------------------------------------===//
-// Streamable GPU Solve (spsolve_gpu, dense_solve_gpu)
-//===----------------------------------------------------------------------===//
-// These exports receive hal.command_buffer as the first arg, enabling the
-// solve to be recorded into the same command buffer as surrounding dispatches.
-// This enables loop fusion (FuseLoopIterationExecution) by keeping the solve
-// inside a single stream.cmd.execute region.
-//
-// ABI: For each resource operand, CmdCallOpPattern produces
-// (binding_idx, buffer, byte_offset, byte_length).
-
-// spsolve_gpu: rIrIIIrIIIrIIIrIIIrII -> v
-// Args: cmd_buf, data{idx,buf,off,len}, indices{...}, indptr{...},
-//       rhs{...}, solution{...}
-IREE_VM_ABI_EXPORT(iree_sparse_solver_spsolve_gpu,
-                   iree_sparse_solver_module_state_t,
-                   rIrIIIrIIIrIIIrIIIrII, v) {
-#if defined(IREE_HAL_HAVE_METAL_DRIVER)
-  // Extract command buffer.
-  iree_hal_command_buffer_t* cmd_buf = NULL;
-  IREE_RETURN_IF_ERROR(
-      iree_hal_command_buffer_check_deref(args->r0, &cmd_buf));
-
-  // Extract data buffer (CSR values f32).
-  iree_hal_buffer_t* data_buf = NULL;
-  IREE_RETURN_IF_ERROR(iree_hal_buffer_check_deref(args->r2, &data_buf));
-
-  // Extract indices buffer (CSR column indices i32).
-  iree_hal_buffer_t* indices_buf = NULL;
-  IREE_RETURN_IF_ERROR(iree_hal_buffer_check_deref(args->r6, &indices_buf));
-
-  // Extract indptr buffer (CSR row pointers i32).
-  iree_hal_buffer_t* indptr_buf = NULL;
-  IREE_RETURN_IF_ERROR(iree_hal_buffer_check_deref(args->r10, &indptr_buf));
-
-  // Extract rhs buffer (f32).
-  iree_hal_buffer_t* rhs_buf = NULL;
-  IREE_RETURN_IF_ERROR(iree_hal_buffer_check_deref(args->r14, &rhs_buf));
-
-  // Extract solution buffer (f32, result-as-input).
-  iree_hal_buffer_t* solution_buf = NULL;
-  IREE_RETURN_IF_ERROR(iree_hal_buffer_check_deref(args->r18, &solution_buf));
-
-  return iree_sparse_solver_metal_spsolve_gpu(
-      cmd_buf,
-      data_buf, args->i3, args->i4,
-      indices_buf, args->i7, args->i8,
-      indptr_buf, args->i11, args->i12,
-      rhs_buf, args->i15, args->i16,
-      solution_buf, args->i19, args->i20,
-      state->host_allocator);
-#else
-  return iree_make_status(IREE_STATUS_UNAVAILABLE,
-                          "spsolve_gpu requires Metal backend");
-#endif
-}
-
-// dense_solve_gpu: rIrIIIrIIIrII -> v
-// Args: cmd_buf, matrix{idx,buf,off,len}, rhs{...}, solution{...}
-IREE_VM_ABI_EXPORT(iree_sparse_solver_dense_solve_gpu,
-                   iree_sparse_solver_module_state_t,
-                   rIrIIIrIIIrII, v) {
-#if defined(IREE_HAL_HAVE_METAL_DRIVER)
-  // Extract command buffer.
-  iree_hal_command_buffer_t* cmd_buf = NULL;
-  IREE_RETURN_IF_ERROR(
-      iree_hal_command_buffer_check_deref(args->r0, &cmd_buf));
-
-  // Extract matrix buffer (f32, n*n elements).
-  iree_hal_buffer_t* matrix_buf = NULL;
-  IREE_RETURN_IF_ERROR(iree_hal_buffer_check_deref(args->r2, &matrix_buf));
-
-  // Extract rhs buffer (f32, n elements).
-  iree_hal_buffer_t* rhs_buf = NULL;
-  IREE_RETURN_IF_ERROR(iree_hal_buffer_check_deref(args->r6, &rhs_buf));
-
-  // Extract solution buffer (f32, result-as-input).
-  iree_hal_buffer_t* solution_buf = NULL;
-  IREE_RETURN_IF_ERROR(iree_hal_buffer_check_deref(args->r10, &solution_buf));
-
-  return iree_sparse_solver_metal_dense_solve_gpu(
-      cmd_buf,
-      matrix_buf, args->i3, args->i4,
-      rhs_buf, args->i7, args->i8,
-      solution_buf, args->i11, args->i12,
-      state->host_allocator);
-#else
-  return iree_make_status(IREE_STATUS_UNAVAILABLE,
-                          "dense_solve_gpu requires Metal backend");
-#endif
-}
-
-//===----------------------------------------------------------------------===//
 // VM Module Interface
 //===----------------------------------------------------------------------===//
 
@@ -1524,8 +1432,6 @@ IREE_VM_ABI_DEFINE_SHIM(rrr, i);     // factor.lu, factor.lu.f64
 IREE_VM_ABI_DEFINE_SHIM(rrrr, v);    // solve.lu, solve.lu.f64
 IREE_VM_ABI_DEFINE_SHIM(IIrrrrr, v); // spsolve_complete, spsolve_complete.f64
 IREE_VM_ABI_DEFINE_SHIM(Irrr, v);    // dense_solve_complete
-IREE_VM_ABI_DEFINE_SHIM(rIrIIIrIIIrIIIrIIIrII, v);  // spsolve_gpu
-IREE_VM_ABI_DEFINE_SHIM(rIrIIIrIIIrII, v);            // dense_solve_gpu
 
 // Module function table.
 // NOTE: Must be sorted alphabetically by export name (binary search lookup).
@@ -1542,13 +1448,6 @@ static const iree_vm_native_function_ptr_t iree_sparse_solver_module_funcs_[] =
             .shim = (iree_vm_native_function_shim_t)iree_vm_shim_Irrr_v,
             .target = (iree_vm_native_function_target_t)
                 iree_sparse_solver_dense_solve_complete,
-        },
-        // dense_solve_gpu
-        {
-            .shim = (iree_vm_native_function_shim_t)
-                iree_vm_shim_rIrIIIrIIIrII_v,
-            .target = (iree_vm_native_function_target_t)
-                iree_sparse_solver_dense_solve_gpu,
         },
         // factor
         {
@@ -1640,13 +1539,6 @@ static const iree_vm_native_function_ptr_t iree_sparse_solver_module_funcs_[] =
             .target = (iree_vm_native_function_target_t)
                 iree_sparse_solver_spsolve_complete_f64,
         },
-        // spsolve_gpu
-        {
-            .shim = (iree_vm_native_function_shim_t)
-                iree_vm_shim_rIrIIIrIIIrIIIrIIIrII_v,
-            .target = (iree_vm_native_function_target_t)
-                iree_sparse_solver_spsolve_gpu,
-        },
 };
 
 // Module exports.
@@ -1662,13 +1554,6 @@ static const iree_vm_native_export_descriptor_t
         {
             .local_name = iree_string_view_literal("dense_solve_complete"),
             .calling_convention = iree_string_view_literal("0Irrr_v"),
-            .attr_count = 0,
-            .attrs = NULL,
-        },
-        {
-            .local_name = iree_string_view_literal("dense_solve_gpu"),
-            .calling_convention =
-                iree_string_view_literal("0rIrIIIrIIIrII_v"),
             .attr_count = 0,
             .attrs = NULL,
         },
@@ -1759,13 +1644,6 @@ static const iree_vm_native_export_descriptor_t
         {
             .local_name = iree_string_view_literal("spsolve_complete.f64"),
             .calling_convention = iree_string_view_literal("0IIrrrrr_v"),
-            .attr_count = 0,
-            .attrs = NULL,
-        },
-        {
-            .local_name = iree_string_view_literal("spsolve_gpu"),
-            .calling_convention =
-                iree_string_view_literal("0rIrIIIrIIIrIIIrIIIrII_v"),
             .attr_count = 0,
             .attrs = NULL,
         },
